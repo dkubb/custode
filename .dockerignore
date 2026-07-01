@@ -1,0 +1,11 @@
+*
+.*
+
+!.cargo/
+!.cargo/clippy.toml
+!.cargo/config.toml
+!Cargo.lock
+!Cargo.toml
+!rust-toolchain.toml
+!src/
+!src/**

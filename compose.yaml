@@ -1,0 +1,80 @@
+services:
+  proxy:
+    build:
+      context: .
+      target: proxy
+    image: custode-proxy:local
+    command: ["serve"]
+    environment:
+      CUSTODE_AUDIT_LOG: /var/log/custode/proxy.ndjson
+      CUSTODE_ALLOWED_OPERATIONS: "${CUSTODE_ALLOWED_OPERATIONS-GET:exact:/v1/models,POST:prefix:/v1/responses,POST:prefix:/v1/chat/completions}"
+      CUSTODE_AUTHORIZATION_BEARER_FILE: "${CUSTODE_AUTHORIZATION_BEARER_FILE-/run/secrets/provider_token}"
+      CUSTODE_AUTHORIZATION_X_API_KEY_FILE: "${CUSTODE_AUTHORIZATION_X_API_KEY_FILE-}"
+      CUSTODE_BIND: 0.0.0.0:8080
+      CUSTODE_MAX_AUDIT_EVENT_BYTES: "16384"
+      CUSTODE_MAX_CONCURRENT_REQUESTS: "8"
+      CUSTODE_MAX_REQUEST_BYTES: "10485760"
+      CUSTODE_MAX_REQUEST_HEADER_BYTES: "32768"
+      CUSTODE_MAX_RESPONSE_BYTES: "104857600"
+      CUSTODE_MAX_RESPONSE_HEADER_BYTES: "65536"
+      CUSTODE_REQUEST_TIMEOUT_SECS: "120"
+      CUSTODE_UPSTREAM_ORIGIN: "${CUSTODE_UPSTREAM_ORIGIN-https://api.openai.com}"
+    networks:
+      - internal
+      - egress
+    secrets:
+      - provider_token
+    volumes:
+      - proxy-logs:/var/log/custode
+    read_only: true
+    tmpfs:
+      - /tmp:mode=1777,uid=65532,gid=65532
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    pids_limit: 128
+    mem_limit: 256m
+
+  harness:
+    build:
+      context: .
+      target: harness
+      args:
+        HARNESS_NPM_PACKAGES: "${CUSTODE_HARNESS_NPM_PACKAGES-}"
+    image: custode-harness:local
+    command: ["bash", "-c", "${CUSTODE_HARNESS_COMMAND-sleep infinity}"]
+    environment:
+      ANTHROPIC_BASE_URL: http://proxy:8080
+      OPENAI_BASE_URL: http://proxy:8080
+    networks:
+      - internal
+    depends_on:
+      proxy:
+        condition: service_healthy
+    volumes:
+      - ./workspace:/workspace
+    read_only: true
+    tmpfs:
+      - /home/harness:mode=700,uid=1000,gid=1000
+      - /tmp:mode=1777,uid=1000,gid=1000
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    init: true
+    pids_limit: 256
+    mem_limit: 1g
+
+networks:
+  internal:
+    internal: true
+  egress: {}
+
+secrets:
+  provider_token:
+    file: "${CUSTODE_PROVIDER_TOKEN_FILE-./secrets/provider_token.example}"
+
+volumes:
+  proxy-logs: {}
