@@ -1,0 +1,36 @@
+[alias]
+clippy-all = ["clippy", "--all-features", "--all-targets", "--tests", "--workspace"]
+fmt-all = ["fmt", "--all"]
+test-all = [
+  "nextest",
+  "run",
+  "--all-features",
+  "--workspace",
+  "--cargo-quiet",
+  "--show-progress",
+  "none",
+  "--status-level",
+  "fail",
+  "--final-status-level",
+  "fail",
+  "--success-output",
+  "never",
+]
+test-doc = ["test", "--doc", "--all-features", "--workspace"]
+
+[build]
+rustflags = [
+  "--deny",
+  "unsafe_code",
+  "--deny",
+  "warnings",
+]
+
+[deny]
+config = ".cargo/deny.toml"
+
+[env]
+CLIPPY_CONF_DIR = { value = ".cargo", relative = true }
+LLVM_COV = "/opt/homebrew/opt/llvm/bin/llvm-cov"
+LLVM_PROFDATA = "/opt/homebrew/opt/llvm/bin/llvm-profdata"
+MACOSX_DEPLOYMENT_TARGET = "26.0"
