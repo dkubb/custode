@@ -1,0 +1,7 @@
+all_features = true
+cap_lints = false
+copy_target = true
+minimum_test_timeout = 10.0
+output = "target/cargo-mutants"
+test_workspace = true
+timeout_multiplier = 4.0
