@@ -85,7 +85,7 @@ pub(crate) struct AuditEvent {
     /// Response status returned to the harness, when one exists.
     status: Option<u16>,
     /// RFC 3339 UTC timestamp.
-    timestamp: String,
+    timestamp: AuditTimestamp,
     /// Configured upstream origin.
     upstream_origin: String,
     /// Upstream path, when an upstream request was attempted.
@@ -149,6 +149,11 @@ pub(crate) struct AuditWriter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct RequestId(String);
 
+/// RFC 3339 UTC audit timestamp.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AuditTimestamp(String);
+
 impl AuditTarget {
     /// Creates an audit target from raw request URI parts.
     #[must_use]
@@ -189,6 +194,12 @@ impl AuditEvent {
     /// Creates an audit event for a request decision.
     #[must_use]
     pub(crate) fn new(input: AuditEventInput) -> Self {
+        Self::new_at(input, AuditTimestamp::now())
+    }
+
+    /// Creates an audit event for a request decision at a supplied timestamp.
+    #[must_use]
+    pub(crate) fn new_at(input: AuditEventInput, timestamp: AuditTimestamp) -> Self {
         Self {
             decision: input.decision,
             error_class: input.error_class,
@@ -201,7 +212,7 @@ impl AuditEvent {
             response_body_blake3: input.response_body_blake3,
             response_bytes: input.response_bytes,
             status: input.status,
-            timestamp: rfc3339_timestamp(),
+            timestamp,
             upstream_origin: input.upstream_origin,
             upstream_path: input.upstream_path,
             upstream_query: input.upstream_query,
@@ -280,17 +291,27 @@ impl RequestId {
     }
 }
 
-/// Returns the current RFC 3339 UTC timestamp for audit events.
-fn rfc3339_timestamp() -> String {
-    humantime::format_rfc3339_nanos(SystemTime::now()).to_string()
+impl AuditTimestamp {
+    /// Returns the timestamp string.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns the current RFC 3339 UTC timestamp for audit events.
+    #[must_use]
+    pub(crate) fn now() -> Self {
+        Self(humantime::format_rfc3339_nanos(SystemTime::now()).to_string())
+    }
 }
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditWriter,
-        RequestId, rfc3339_timestamp,
+        AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditTimestamp,
+        AuditWriter, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::config::GatewayConfig;
@@ -471,11 +492,12 @@ mod tests {
 
     #[test]
     fn rfc3339_timestamp_produces_a_parsable_instant() {
-        let timestamp = rfc3339_timestamp();
+        let timestamp = AuditTimestamp::now();
 
         assert!(
-            humantime::parse_rfc3339(&timestamp).is_ok(),
-            "timestamp {timestamp:?} should parse as RFC 3339"
+            humantime::parse_rfc3339(timestamp.as_str()).is_ok(),
+            "timestamp {:?} should parse as RFC 3339",
+            timestamp.as_str()
         );
     }
 
