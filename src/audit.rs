@@ -555,6 +555,10 @@ impl AuditTimestamp {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditOutcome,
@@ -873,6 +877,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline proptests keep file-local coverage ownership explicit"
+)]
 mod proptests {
     use super::{
         AuditBodySummary, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,

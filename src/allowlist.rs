@@ -276,6 +276,10 @@ const fn hex_value(byte: u8) -> Option<u8> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{AcceptedTarget, DotSegmentState, RejectionReason, is_allowed, rejection_for};
     use crate::config::{AllowedPath, GatewayConfig};
@@ -494,6 +498,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline proptests keep file-local coverage ownership explicit"
+)]
 mod proptests {
     use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::GatewayConfig;

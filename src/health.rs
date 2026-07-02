@@ -36,6 +36,10 @@ pub(crate) async fn check(args: HealthcheckArgs) -> Result<(), HealthcheckError>
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{HealthcheckArgs, HealthcheckError, check};
     use clap::Parser;

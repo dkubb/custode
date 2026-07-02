@@ -258,6 +258,10 @@ fn response_body_summary(response_account: &ResponseAccount) -> AuditBodySummary
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};

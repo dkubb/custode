@@ -321,6 +321,10 @@ fn wait_for_failure(mut child: Child) -> bool {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline integration tests keep shared fixtures local"
+)]
 mod tests {
     use super::{
         Command, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio, free_local_addr,

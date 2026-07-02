@@ -149,6 +149,10 @@ fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderNa
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
     use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};
@@ -300,6 +304,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline proptests keep file-local coverage ownership explicit"
+)]
 mod proptests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
     use ::http::header::{CONNECTION, HOST};

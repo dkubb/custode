@@ -224,6 +224,10 @@ impl fmt::Debug for UpstreamResponse {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::UpstreamResponse;
     use futures_util::{StreamExt as _, stream};
@@ -247,6 +251,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline proptests keep file-local coverage ownership explicit"
+)]
 mod proptests {
     use super::UpstreamRequest;
     use crate::allowlist::{AcceptedTarget, allow_target};

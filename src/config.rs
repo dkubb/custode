@@ -553,6 +553,10 @@ fn parse_allowed_path(path: &str) -> Result<String, ConfigError> {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{
         AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,
@@ -826,6 +830,10 @@ mod tests {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline proptests keep file-local coverage ownership explicit"
+)]
 mod proptests {
     use super::{
         AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,

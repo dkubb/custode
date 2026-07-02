@@ -167,6 +167,10 @@ pub(crate) enum BodyError {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{AccountedBody, BodyError, RequestBodyError, ResponseAccount};
     use axum::body::Body;

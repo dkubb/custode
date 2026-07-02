@@ -181,6 +181,10 @@ fn upstream_error_kind_from_reqwest(error: &impl ReqwestErrorView) -> UpstreamEr
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{
         ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_client_build_error,

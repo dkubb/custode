@@ -635,6 +635,10 @@ const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
 
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep file-local coverage ownership explicit"
+)]
 mod tests {
     use super::{
         AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, production_gateway,
