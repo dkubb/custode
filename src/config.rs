@@ -7,7 +7,7 @@ use clap::{Args, Parser, Subcommand};
 use core::net::SocketAddr;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use thiserror::Error;
 use url::Url;
 
@@ -39,32 +39,6 @@ enum AllowedPathKind {
     Prefix,
 }
 
-/// Gateway authorization source.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuthorizationSource {
-    /// Provider authorization header source.
-    header: Option<AuthorizationHeaderSource>,
-}
-
-/// Provider authorization header source.
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct AuthorizationHeaderSource {
-    /// Provider authorization header kind.
-    kind: AuthorizationHeaderKind,
-    /// Token file path.
-    path: PathBuf,
-}
-
-/// Provider authorization header kind.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AuthorizationHeaderKind {
-    /// HTTP `Authorization: Bearer ...`.
-    Bearer,
-
-    /// HTTP `x-api-key`.
-    XApiKey,
-}
-
 /// Custode command-line interface.
 #[derive(Debug, Parser)]
 #[command(name = "custode-proxy")]
@@ -88,10 +62,6 @@ enum Command {
 /// Configuration parsing error.
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
-    /// More than one provider authorization source was configured.
-    #[error("configure only one provider authorization source")]
-    ConflictingAuthorizationSources,
-
     /// No operations were configured.
     #[error("at least one allowed operation is required")]
     EmptyOperations,
@@ -169,8 +139,6 @@ pub(crate) struct GatewayConfig {
     allowed_operations: Vec<AllowedOperation>,
     /// Newline-delimited audit log path.
     audit_log: PathBuf,
-    /// Provider authorization source.
-    authorization: AuthorizationSource,
     /// Gateway bind address.
     bind: SocketAddr,
     /// Maximum serialized audit event bytes.
@@ -210,14 +178,6 @@ struct ServeArgs {
         default_value = "/var/log/custode/proxy.ndjson"
     )]
     audit_log: PathBuf,
-
-    /// File containing the provider bearer token.
-    #[arg(long, env = "CUSTODE_AUTHORIZATION_BEARER_FILE", default_value = "")]
-    authorization_bearer_file: String,
-
-    /// File containing the provider x-api-key token.
-    #[arg(long, env = "CUSTODE_AUTHORIZATION_X_API_KEY_FILE", default_value = "")]
-    authorization_x_api_key_file: String,
 
     /// Address the gateway listens on.
     #[arg(long, env = "CUSTODE_BIND", default_value = "0.0.0.0:8080")]
@@ -365,67 +325,6 @@ impl AllowedPath {
     }
 }
 
-impl AuthorizationSource {
-    /// Creates a source from a bearer token file path.
-    #[must_use]
-    pub(crate) const fn bearer_file(path: PathBuf) -> Self {
-        Self {
-            header: Some(AuthorizationHeaderSource::new(
-                AuthorizationHeaderKind::Bearer,
-                path,
-            )),
-        }
-    }
-
-    /// Returns the bearer token file path.
-    #[must_use]
-    pub(crate) fn bearer_file_path(&self) -> Option<&Path> {
-        self.header_path(AuthorizationHeaderKind::Bearer)
-    }
-
-    /// Returns the token file path for a matching header kind.
-    fn header_path(&self, kind: AuthorizationHeaderKind) -> Option<&Path> {
-        let header = self.header.as_ref()?;
-        header.path_for(kind)
-    }
-
-    /// Creates a source that does not inject authorization.
-    #[must_use]
-    pub(crate) const fn none() -> Self {
-        Self { header: None }
-    }
-
-    /// Creates a source from an `x-api-key` token file path.
-    #[must_use]
-    pub(crate) const fn x_api_key_file(path: PathBuf) -> Self {
-        Self {
-            header: Some(AuthorizationHeaderSource::new(
-                AuthorizationHeaderKind::XApiKey,
-                path,
-            )),
-        }
-    }
-
-    /// Returns the `x-api-key` token file path.
-    #[must_use]
-    pub(crate) fn x_api_key_file_path(&self) -> Option<&Path> {
-        self.header_path(AuthorizationHeaderKind::XApiKey)
-    }
-}
-
-impl AuthorizationHeaderSource {
-    /// Creates a provider authorization header source.
-    #[must_use]
-    const fn new(kind: AuthorizationHeaderKind, path: PathBuf) -> Self {
-        Self { kind, path }
-    }
-
-    /// Returns the token file path for a matching header kind.
-    fn path_for(&self, kind: AuthorizationHeaderKind) -> Option<&Path> {
-        (self.kind == kind).then_some(self.path.as_path())
-    }
-}
-
 impl Cli {
     /// Runs the selected command.
     ///
@@ -455,12 +354,6 @@ impl GatewayConfig {
         &self.audit_log
     }
 
-    /// Returns the provider authorization source.
-    #[must_use]
-    pub(crate) const fn authorization(&self) -> &AuthorizationSource {
-        &self.authorization
-    }
-
     /// Returns the gateway bind address.
     #[must_use]
     pub(crate) const fn bind(&self) -> SocketAddr {
@@ -476,7 +369,6 @@ impl GatewayConfig {
                 AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse"),
             ],
             audit_log,
-            authorization: AuthorizationSource::none(),
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
             max_audit_event_bytes,
             max_concurrent_requests: NonZeroUsize::new(1).expect("limit should be non-zero"),
@@ -551,10 +443,6 @@ impl TryFrom<ServeArgs> for GatewayConfig {
         Ok(Self {
             allowed_operations,
             audit_log: args.audit_log,
-            authorization: parse_authorization_source(
-                args.authorization_bearer_file,
-                args.authorization_x_api_key_file,
-            )?,
             bind: args.bind,
             max_audit_event_bytes: non_zero_usize(
                 "CUSTODE_MAX_AUDIT_EVENT_BYTES",
@@ -638,29 +526,6 @@ fn non_zero_u64(name: &'static str, value: u64) -> Result<NonZeroU64, ConfigErro
 /// Returns a non-zero `usize` or the matching configuration error.
 fn non_zero_usize(name: &'static str, value: usize) -> Result<NonZeroUsize, ConfigError> {
     NonZeroUsize::new(value).ok_or(ConfigError::ZeroBound { name })
-}
-
-/// Parses provider authorization source configuration.
-fn parse_authorization_source(
-    raw_bearer_file: String,
-    raw_x_api_key_file: String,
-) -> Result<AuthorizationSource, ConfigError> {
-    let bearer_file = non_empty_path(raw_bearer_file);
-    let x_api_key_file = non_empty_path(raw_x_api_key_file);
-
-    match (bearer_file, x_api_key_file) {
-        (None, None) => Ok(AuthorizationSource::none()),
-        (None, Some(path)) => Ok(AuthorizationSource::x_api_key_file(path)),
-        (Some(path), None) => Ok(AuthorizationSource::bearer_file(path)),
-        (Some(_bearer_path), Some(_x_api_key_path)) => {
-            Err(ConfigError::ConflictingAuthorizationSources)
-        }
-    }
-}
-
-/// Converts an empty path value to absent configuration.
-fn non_empty_path(path: String) -> Option<PathBuf> {
-    (!path.is_empty()).then_some(PathBuf::from(path))
 }
 
 /// Parses allowed operation strings and rejects an empty operation set.

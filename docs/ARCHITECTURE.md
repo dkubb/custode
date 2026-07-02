@@ -25,10 +25,10 @@ a Debian-based Rust builder target, and a `scratch` provider gateway target.
 Compose attaches the harness only to an internal network and attaches the
 gateway to both the internal network and an egress network. The gateway is an
 origin-form HTTP gateway, not an `HTTPS_PROXY` tunnel: it denies `CONNECT`,
-allows only configured provider API methods and paths, injects provider
-credentials from gateway-only secrets, forwards to exactly one configured
-upstream provider origin, and writes newline-delimited JSON audit events for
-every decision.
+allows only configured provider API methods and paths, forwards end-to-end
+provider headers without interpreting authentication, forwards to exactly one
+configured upstream provider origin, and writes newline-delimited JSON audit
+events for every decision.
 
 Table of Contents
 
@@ -244,8 +244,7 @@ HTTP `CONNECT` are not part of the gateway protocol.
 
 ## 9. Gateway Configuration
 
-The initial gateway configuration comes from environment variables and Docker
-secrets:
+The initial gateway configuration comes from environment variables:
 
 ```text
 CUSTODE_BIND=0.0.0.0:8080
@@ -259,8 +258,6 @@ CUSTODE_MAX_RESPONSE_HEADER_BYTES=65536
 CUSTODE_MAX_RESPONSE_BYTES=104857600
 CUSTODE_MAX_CONCURRENT_REQUESTS=8
 CUSTODE_MAX_AUDIT_EVENT_BYTES=16384
-CUSTODE_AUTHORIZATION_BEARER_FILE=/run/secrets/provider_token
-CUSTODE_AUTHORIZATION_X_API_KEY_FILE=
 ```
 
 Configuration parsing is fail-closed:
@@ -278,10 +275,6 @@ Configuration parsing is fail-closed:
   segments, because the allowlist and upstream URL builder MUST operate on the
   same path representation.
 - Size, concurrency, and duration bounds MUST be positive.
-- Authorization configuration MAY use either `CUSTODE_AUTHORIZATION_BEARER_FILE`
-  or `CUSTODE_AUTHORIZATION_X_API_KEY_FILE`, but MUST NOT use both.
-- Authorization configuration MAY be absent only when the operator intentionally
-  runs against an upstream that does not need gateway-injected credentials.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.
@@ -294,9 +287,7 @@ For each request, the gateway performs these steps in order:
 1. Parse and validate the method and origin-form target, rejecting literal or
    percent-encoded dot segments.
 1. Check the method-path operation allowlist.
-1. Copy end-to-end headers, excluding hop-by-hop headers and redacted
-   credential headers.
-1. Inject provider authorization if configured.
+1. Copy end-to-end headers, excluding hop-by-hop headers and `Host`.
 1. Read the request body up to the configured maximum.
 1. Compute the request body byte count and digest.
 1. Build the upstream URL from the configured origin plus accepted path and
@@ -355,7 +346,8 @@ An audit write failure cannot be represented as an `audit_error` event in the
 required audit log because the failure mode is the inability to write that log.
 The process fails closed instead.
 
-Authorization, cookie, and proxy authorization headers MUST NOT be logged.
+Authorization, cookie, and proxy authorization header values MUST NOT be
+logged.
 
 Request and response bodies are not logged by default. Body digests and byte
 counts are logged.
@@ -418,7 +410,7 @@ The `harness` service depends on the `proxy` service healthcheck.
 
 The `harness` service mounts the operator workspace at `/workspace`.
 
-The checked-in `harness` service environment contains only explicit non-secret
+The checked-in `harness` service environment contains only explicit base URL
 defaults and one explicit harness environment file. The file defaults to
 `./secrets/env.example`; operators can set `CUSTODE_HARNESS_ENV_FILE` to point
 at a real ignored harness-local environment file such as `./secrets/env`.
@@ -431,13 +423,12 @@ not make shell commands inherit the values.
 The `harness` service MUST NOT import the host environment wholesale through
 bare variable interpolation or unscoped environment pass-through. Values in
 the harness environment file are readable by the untrusted harness. Provider
-credentials, Docker credentials, and broad host ambient secrets MUST NOT be
-placed there.
+credentials that the harness needs MAY be placed there. Docker credentials and
+broad host ambient secrets MUST NOT be placed there unless the operator
+intentionally wants the harness to read them.
 
-The `proxy` service mounts an audit log volume at `/var/log/custode` and a
-provider token secret at `/run/secrets/provider_token`. The Compose secret file
-defaults to `./secrets/provider_token.example`; operators can set
-`CUSTODE_PROVIDER_TOKEN_FILE` to point at a real ignored secret file.
+The `proxy` service mounts an audit log volume at `/var/log/custode`. It does
+not mount provider credentials.
 
 The `proxy` service does not publish port `8080` to the host by default. The
 gateway is for the harness container, not for host traffic.
@@ -509,29 +500,23 @@ For Anthropic-compatible clients, the expected non-secret setting is:
 ANTHROPIC_BASE_URL=http://proxy:8080
 ```
 
-Anthropic API-key mode uses `x-api-key` rather than bearer authorization. The
-operator should configure the proxy with:
+Anthropic API-key mode uses `ANTHROPIC_API_KEY` in the harness environment.
+The operator should configure the upstream and allowlist with:
 
 ```text
-CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com
 CUSTODE_ALLOWED_OPERATIONS=POST:prefix:/v1/messages,GET:prefix:/v1/models
-CUSTODE_AUTHORIZATION_BEARER_FILE=
-CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token
 ```
 
-Claude Code may still require a non-secret placeholder `ANTHROPIC_API_KEY` in
-the harness environment so the client chooses API-key mode. That placeholder
-belongs in the harness environment file. The gateway strips the
-harness-supplied `x-api-key` and injects the secret-backed provider key.
+Claude Code may require `ANTHROPIC_API_KEY` in the harness environment so the
+client chooses API-key mode. That value belongs in the harness environment
+file. The gateway forwards the resulting provider request headers without
+knowing which ones carry credentials.
 
 The operator can run a non-interactive Claude Code prompt through the gateway:
 
 ```sh
 CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code' \
-CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token \
-CUSTODE_AUTHORIZATION_BEARER_FILE= \
-CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token \
 CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com \
 CUSTODE_ALLOWED_OPERATIONS='POST:prefix:/v1/messages,GET:prefix:/v1/models' \
 CUSTODE_HARNESS_ENV_FILE=./secrets/env \
@@ -540,13 +525,9 @@ CUSTODE_HARNESS_COMMAND='claude --bare -p "what is 2+2?" \
 docker compose up --abort-on-container-exit --exit-code-from harness
 ```
 
-The placeholder key in `./secrets/env` is not a provider secret. It only keeps
-the client in API-key mode; the gateway removes the harness credential header
-and injects the real key from `CUSTODE_PROVIDER_TOKEN_FILE`.
-
-Real provider API keys MUST NOT be set in the harness environment for the
-initial product. The gateway injects provider authorization from its own
-secret.
+The provider API key in `./secrets/env` is visible to the harness by design.
+Custode constrains where the harness can send HTTP, not how the harness
+authenticates to the provider.
 
 Harnesses that cannot set a provider base URL are not compatible with the
 initial architecture.
@@ -560,7 +541,7 @@ Unit tests cover:
 - path exact-match and prefix-match decisions;
 - upstream URL construction;
 - hop-by-hop header stripping;
-- credential header redaction;
+- provider authorization header pass-through;
 - audit event serialization.
 
 Integration tests cover:
@@ -569,8 +550,8 @@ Integration tests cover:
 - allowed request reaches only the configured upstream origin;
 - denied method does not reach a local test upstream;
 - denied path does not reach a local test upstream;
-- gateway-injected authorization reaches the local test upstream;
-- harness-supplied authorization is stripped or overwritten;
+- harness-supplied authorization reaches the local test upstream for allowed
+  requests;
 - every allowed and denied request produces an audit event;
 - audit log write failure fails closed.
 
@@ -613,10 +594,9 @@ The gateway cannot inspect traffic that bypasses its provider-shaped HTTP
 contract. `CONNECT`, WebSockets, raw TCP, and DNS forwarding are therefore
 denied instead of partially supported.
 
-The gateway owns credentials so the harness can be denied direct access to
-provider secrets. Compatibility changes that put provider API keys back into
-the harness container weaken the boundary and are not part of this
-architecture.
+The gateway does not own provider credentials. Authentication is harness-local
+provider configuration. This avoids coupling Custode to every provider's auth
+scheme and keeps the proxy focused on egress control, allowlisting, and audit.
 
 The audit log is useful only if it is complete. The gateway fails closed on log
 write errors even though that can reduce availability.

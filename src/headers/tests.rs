@@ -1,8 +1,6 @@
-use super::{
-    HeaderError, ProviderAuthorization, forward_request_headers, forward_response_headers,
-};
-use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE};
-use ::http::{HeaderMap, HeaderName, HeaderValue};
+use super::{HeaderError, forward_request_headers, forward_response_headers};
+use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};
+use ::http::{HeaderMap, HeaderValue};
 use core::num::NonZeroUsize;
 
 #[test]
@@ -14,7 +12,6 @@ fn request_headers_strip_connection_named_headers() {
     let forwarded = forward_request_headers(
         &headers,
         NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        None,
     )
     .expect("headers should fit");
 
@@ -22,51 +19,51 @@ fn request_headers_strip_connection_named_headers() {
 }
 
 #[test]
-fn request_headers_strip_harness_credentials() {
+fn request_headers_forward_provider_authorization() {
     let mut headers = HeaderMap::new();
     headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer harness"));
     headers.insert("x-api-key", HeaderValue::from_static("harness-key"));
     headers.insert(COOKIE, HeaderValue::from_static("session=bad"));
-    let authorization =
-        ProviderAuthorization::new(AUTHORIZATION, HeaderValue::from_static("Bearer gateway"));
 
     let forwarded = forward_request_headers(
         &headers,
         NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        Some(&authorization),
     )
     .expect("headers should fit");
 
     assert_eq!(
         forwarded.get(AUTHORIZATION),
-        Some(&HeaderValue::from_static("Bearer gateway")),
+        Some(&HeaderValue::from_static("Bearer harness")),
     );
-    assert_eq!(forwarded.get("x-api-key"), None);
-    assert_eq!(forwarded.get(COOKIE), None);
+    assert_eq!(
+        forwarded.get("x-api-key"),
+        Some(&HeaderValue::from_static("harness-key")),
+    );
+    assert_eq!(
+        forwarded.get(COOKIE),
+        Some(&HeaderValue::from_static("session=bad")),
+    );
 }
 
 #[test]
-fn request_headers_inject_gateway_x_api_key() {
+fn request_headers_strip_routing_and_proxy_headers() {
     let mut headers = HeaderMap::new();
-    headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer harness"));
-    headers.insert("x-api-key", HeaderValue::from_static("harness-key"));
-    let authorization = ProviderAuthorization::new(
-        HeaderName::from_static("x-api-key"),
-        HeaderValue::from_static("gateway-key"),
-    );
+    headers.insert(HOST, HeaderValue::from_static("proxy:8080"));
+    headers.insert(PROXY_AUTHORIZATION, HeaderValue::from_static("Basic bad"));
+    headers.insert("x-visible", HeaderValue::from_static("ok"));
 
     let forwarded = forward_request_headers(
         &headers,
         NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        Some(&authorization),
     )
     .expect("headers should fit");
 
-    assert_eq!(forwarded.get(AUTHORIZATION), None);
     assert_eq!(
-        forwarded.get("x-api-key"),
-        Some(&HeaderValue::from_static("gateway-key")),
+        forwarded.get("x-visible"),
+        Some(&HeaderValue::from_static("ok")),
     );
+    assert_eq!(forwarded.get(HOST), None);
+    assert_eq!(forwarded.get(PROXY_AUTHORIZATION), None);
 }
 
 #[test]

@@ -230,27 +230,24 @@ async fn handle_request(
         Err(response) => return Ok(response),
     };
 
-    let request_headers = match forward_request_headers(
-        &headers,
-        gateway.config().max_request_header_bytes(),
-        gateway.authorization(),
-    ) {
-        Ok(request_headers) => request_headers,
-        Err(error) => {
-            let status = request_header_error_status(error);
-            gateway
-                .audit_denial(
-                    request_id,
-                    &method,
-                    target.into(),
-                    None,
-                    request_header_error_class(error),
-                    status.as_u16(),
-                )
-                .await?;
-            return Ok(status_response(status));
-        }
-    };
+    let request_headers =
+        match forward_request_headers(&headers, gateway.config().max_request_header_bytes()) {
+            Ok(request_headers) => request_headers,
+            Err(error) => {
+                let status = request_header_error_status(error);
+                gateway
+                    .audit_denial(
+                        request_id,
+                        &method,
+                        target.into(),
+                        None,
+                        request_header_error_class(error),
+                        status.as_u16(),
+                    )
+                    .await?;
+                return Ok(status_response(status));
+            }
+        };
 
     let request_body =
         match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {

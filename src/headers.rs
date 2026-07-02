@@ -1,18 +1,9 @@
 //! Header filtering and redaction.
 
-use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};
-use ::http::{HeaderMap, HeaderName, HeaderValue};
+use ::http::header::{CONNECTION, HOST};
+use ::http::{HeaderMap, HeaderName};
 use core::num::NonZeroUsize;
 use thiserror::Error;
-
-/// Gateway-owned provider authorization header.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderAuthorization {
-    /// Header name.
-    name: HeaderName,
-    /// Header value.
-    value: HeaderValue,
-}
 
 /// Header handling error.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -24,26 +15,6 @@ pub(crate) enum HeaderError {
     /// Headers exceeded the configured maximum.
     #[error("headers exceeded configured maximum")]
     TooLarge,
-}
-
-impl ProviderAuthorization {
-    /// Returns the provider authorization header name.
-    #[must_use]
-    pub(crate) const fn name(&self) -> &HeaderName {
-        &self.name
-    }
-
-    /// Creates gateway-owned provider authorization.
-    #[must_use]
-    pub(crate) const fn new(name: HeaderName, value: HeaderValue) -> Self {
-        Self { name, value }
-    }
-
-    /// Returns the provider authorization header value.
-    #[must_use]
-    pub(crate) const fn value(&self) -> &HeaderValue {
-        &self.value
-    }
 }
 
 /// Returns the dynamic header names listed by `Connection`.
@@ -93,7 +64,6 @@ fn enforce_header_limit(
 pub(crate) fn forward_request_headers(
     incoming: &HeaderMap,
     max_header_bytes: NonZeroUsize,
-    authorization: Option<&ProviderAuthorization>,
 ) -> Result<HeaderMap, HeaderError> {
     enforce_header_limit(incoming, max_header_bytes)?;
     let connection_headers = connection_header_names(incoming)?;
@@ -103,10 +73,6 @@ pub(crate) fn forward_request_headers(
         if request_header_is_forwarded(name, &connection_headers) {
             outgoing.append(name, value.clone());
         }
-    }
-
-    if let Some(value) = authorization {
-        outgoing.insert(value.name().clone(), value.value().clone());
     }
 
     Ok(outgoing)
@@ -156,12 +122,7 @@ fn is_standard_hop_by_hop(name: &HeaderName) -> bool {
 
 /// Returns true when a request header is safe to forward upstream.
 fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderName]) -> bool {
-    !is_hop_by_hop(name, connection_headers)
-        && *name != AUTHORIZATION
-        && *name != COOKIE
-        && *name != PROXY_AUTHORIZATION
-        && *name != HOST
-        && name.as_str() != "x-api-key"
+    !is_hop_by_hop(name, connection_headers) && *name != HOST
 }
 
 #[cfg(test)]

@@ -4,56 +4,48 @@ Custode runs an untrusted coding harness behind a small Rust provider proxy.
 
 The harness container has only the internal Docker network. It can read and
 write `./workspace` and can reach only `http://proxy:8080`. The proxy
-container has the provider credential, an egress network, a method/path
-allowlist, and an NDJSON audit log.
+container has an egress network, a method/path allowlist, and an NDJSON audit
+log.
 
 ## Security Model
 
 Custode is meant to make hidden outbound traffic easier to block and inspect.
-It assumes Docker, the host kernel, the provider, and the configured upstream
-TLS endpoint are trusted. It does not claim to survive a Docker/container
-escape.
+It trusts the operator, not the harness's external communications. It assumes
+Docker, the host kernel, the provider, and the configured upstream TLS endpoint
+are trusted. It does not claim to survive a Docker/container escape.
 
-Keep provider secrets out of the harness. If a harness insists on a syntactic
-API key, use a non-secret placeholder and let the proxy inject the real
-provider credential from the Docker secret.
+The harness owns its provider credentials and configuration through
+`secrets/env`. Custode does not interpret provider authentication schemes.
+Instead, it denies direct egress and forwards only inspectable HTTP requests
+that pass the configured method/path allowlist.
 
 ## Requirements
 
 - Docker with Compose v2.
-- A provider API token in `secrets/provider_token`.
-- Optional harness-local settings in `secrets/env`.
+- Harness-local settings and credentials in `secrets/env`.
 - Rust and Cargo for local development gates.
 - `cargo-deny`, `cargo-mutants`, and `mado` for the optional full gate set.
 
-## Create Local Secrets
+## Create Harness Env
 
-Create the local provider secret, harness environment file, and workspace
-directories:
+Create the harness environment file and workspace directory:
 
 ```sh
 mkdir -p secrets workspace
-${EDITOR:-vi} secrets/provider_token
-chmod 600 secrets/provider_token
 cp secrets/env.example secrets/env
 chmod 600 secrets/env
 ```
 
-The token file may contain one trailing newline. `secrets/provider_token` is
-ignored by Git.
-
-`secrets/env` is also ignored by Git. It is loaded into the harness process
+`secrets/env` is ignored by Git. It is loaded into the harness process
 environment and mounted read-only at `/etc/environment` inside the harness
-container. Values in that file are visible to the untrusted harness. Do not put
-provider credentials there; provider credentials belong in
-`secrets/provider_token`.
+container. Values in that file are visible to the untrusted harness by design.
+Put only credentials and config that the harness is intended to use there.
 
 ## Build
 
-Build both images with the local provider token:
+Build both images:
 
 ```sh
-export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 docker compose build proxy harness
 ```
@@ -72,7 +64,6 @@ already supports npm package injection.
 First build and smoke-test the CLI:
 
 ```sh
-export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 docker compose build harness
@@ -83,22 +74,19 @@ docker compose run --rm harness
 
 Then run Claude through the proxy:
 
-Add or uncomment this non-secret Claude placeholder in `secrets/env`:
+Add or uncomment the Claude API key in `secrets/env`:
 
 ```text
-ANTHROPIC_API_KEY=sk-ant-api03-placeholder
+ANTHROPIC_API_KEY=sk-ant-api03-...
 ```
 
 ```sh
 anthropic_ops='POST:prefix:/v1/messages'
 anthropic_ops="${anthropic_ops},GET:prefix:/v1/models"
 
-export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com
 export CUSTODE_ALLOWED_OPERATIONS="${anthropic_ops}"
-export CUSTODE_AUTHORIZATION_BEARER_FILE=
-export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token
 export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 
 claude_cmd="claude --bare -p 'what is 2+2?'"
@@ -107,8 +95,9 @@ export CUSTODE_HARNESS_COMMAND="${claude_cmd}"
 docker compose up --abort-on-container-exit --exit-code-from harness
 ```
 
-The placeholder key is not the provider credential. The proxy strips harness
-credentials and injects the Docker secret as `x-api-key` upstream.
+The proxy forwards provider authorization headers from the harness request. It
+does not know whether the provider uses bearer tokens, `x-api-key`, cookies,
+or another scheme.
 
 ## Codex Harness
 
@@ -119,7 +108,6 @@ uses the npm path for the same reason as Claude Code.
 Build and smoke-test the CLI:
 
 ```sh
-export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
 docker compose build harness
@@ -128,30 +116,26 @@ export CUSTODE_HARNESS_COMMAND='codex --version'
 docker compose run --rm harness
 ```
 
-For model calls, route Codex to the proxy and keep the real API key out of the
-harness. The compose file exports `OPENAI_BASE_URL=http://proxy:8080` for
-clients that honor it. Current Codex CLI docs also support one-off config
-overrides with `-c`, and the OpenAI provider base URL key is
-`openai_base_url`.
+For model calls, route Codex to the proxy. The compose file exports
+`OPENAI_BASE_URL=http://proxy:8080` for clients that honor it. Current Codex
+CLI docs also support one-off config overrides with `-c`, and the OpenAI
+provider base URL key is `openai_base_url`.
 
 A non-interactive command should use the proxy URL as the OpenAI API base URL:
 
-Add or uncomment this non-secret OpenAI placeholder in `secrets/env`:
+Add or uncomment the OpenAI API key in `secrets/env`:
 
 ```text
-OPENAI_API_KEY=sk-placeholder
+OPENAI_API_KEY=sk-...
 ```
 
 ```sh
 openai_ops='GET:exact:/v1/models,POST:prefix:/v1/responses'
 openai_ops="${openai_ops},POST:prefix:/v1/chat/completions"
 
-export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
 export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_UPSTREAM_ORIGIN=https://api.openai.com
 export CUSTODE_ALLOWED_OPERATIONS="${openai_ops}"
-export CUSTODE_AUTHORIZATION_BEARER_FILE=/run/secrets/provider_token
-export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=
 export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
 
 codex_cmd='codex exec'

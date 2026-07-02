@@ -22,10 +22,9 @@ environment access and no direct internet egress. The harness container can
 edit only explicitly mounted files and can reach the outside world only through
 a separate Rust provider gateway container. The gateway container is the only
 container with external network egress, allows only configured provider API
-requests, owns provider credentials, and writes structured request logs for
-offline review. This document intentionally avoids concrete implementation
-choices except where they are necessary to state the required isolation and
-audit properties.
+requests, and writes structured request logs for offline review. This document
+intentionally avoids concrete implementation choices except where they are
+necessary to state the required isolation and audit properties.
 
 Table of Contents
 
@@ -87,8 +86,8 @@ environment, and make arbitrary network requests to any address reachable from
 the harness container network namespace.
 
 The provider gateway is trusted but intentionally small. The gateway is part of
-the trusted computing base because it owns provider credentials, enforces the
-provider allowlist, and writes the audit log.
+the trusted computing base because it enforces the provider allowlist, bounds
+traffic, controls upstream egress, and writes the audit log.
 
 The host kernel, Docker daemon, container runtime, Docker network isolation,
 and configured provider are part of the trusted computing base. Custode does
@@ -100,8 +99,10 @@ harness to respect environment variables. Provider base URL environment
 variables MAY be provided for harness compatibility, but they MUST point at the
 gateway and MUST NOT be the enforcement boundary.
 
-Provider credentials MUST NOT be mounted into the harness container. Provider
-credentials MUST be available only to the gateway container.
+Harness-specific credentials MAY be mounted into the harness container when
+the operator intentionally wants the harness to use them. Credential secrecy is
+not the primary boundary. The primary boundary is that the harness cannot send
+network traffic except through inspectable gateway requests.
 
 The initial product supports harnesses that can be configured with a provider
 base URL pointing at the gateway. Harnesses that require direct TLS to the
@@ -147,8 +148,10 @@ The product model contains these concepts:
 The model intentionally distinguishes:
 
 - network containment, which is enforced by Docker networks;
-- provider authorization, which is enforced by the gateway;
-- provider authentication, which is owned by the gateway;
+- provider authorization, which is emitted by the harness and forwarded as
+  end-to-end HTTP request data;
+- provider authentication, which is owned by the harness/provider SDK
+  configuration;
 - file mutation, which is controlled by explicit volume mounts;
 - request observation, which is recorded by gateway audit events.
 
@@ -165,7 +168,7 @@ Custode MUST run the harness and provider gateway as separate containers.
 
 The harness container MUST NOT share the provider gateway process namespace,
 filesystem root, writable layers, Docker socket, host network namespace, host
-PID namespace, host IPC namespace, or provider credentials.
+PID namespace, host IPC namespace, or host credentials.
 
 The provider gateway container MUST NOT mount the workspace volume. The gateway
 has no need to read or write the files the harness is editing.
@@ -220,35 +223,36 @@ The gateway MUST allow exactly one configured upstream scheme, host, and port
 per gateway instance. Wildcard provider hosts are invalid.
 
 The gateway MUST strip hop-by-hop headers before sending an upstream request.
-The gateway MUST strip or overwrite harness-supplied `Authorization`, `Cookie`,
-and `Proxy-Authorization` headers before sending an upstream request.
+The gateway MUST strip the incoming `Host` header and HTTP proxy credentials
+before sending an upstream request.
 
-The gateway MUST inject provider authentication from gateway-owned secrets when
-configured to do so. The harness MUST NOT be required to hold the provider API
-key for the initial product.
+The gateway MUST forward end-to-end provider request headers without knowing
+which headers are credentials. This includes provider-specific authorization
+headers such as `Authorization`, `x-api-key`, `Cookie`, or custom headers. The
+gateway MUST NOT synthesize provider authentication headers in the initial
+product.
 
 The gateway MUST preserve streaming responses well enough for model clients
 that use server-sent events or chunked response bodies.
 
-### 5.4. Secret Boundary
+### 5.4. Harness Environment Boundary
 
-Provider credentials MUST be supplied only to the gateway container through a
-Docker secret or mounted file. Environment variables MAY point to gateway-only
-credential files, but MUST NOT contain raw provider credentials.
+The default composition MAY load one explicit operator-selected harness
+environment file. Every value in that file MUST be treated as readable by the
+untrusted harness.
 
 The default Compose file MUST NOT pass host environment variables wholesale
-into the harness container. It MAY load one explicit operator-selected harness
-environment file for harness-local settings. Every value in that file MUST be
-treated as readable by the untrusted harness.
+into the harness container.
 
-The harness container MAY receive non-secret configuration such as provider
-base URLs that point at the gateway. It MAY also receive harness-local secrets
-only when the operator intentionally accepts that the untrusted harness can
-read them. Provider credentials, Docker credentials, and broad host ambient
-secrets MUST NOT be placed in the harness environment file.
+The harness container MAY receive provider credentials and provider base URL
+configuration through the harness environment file. The provider base URLs MUST
+point at the gateway. Docker credentials, host API tokens, and broad host
+ambient secrets MUST NOT be placed in the harness environment file unless the
+operator intentionally wants the harness to read them.
 
-The audit log MUST NOT include provider credentials. Authorization and cookie
-headers MUST be redacted or omitted.
+The audit log MUST NOT include provider credential header values. If request
+header logging is added later, authorization and cookie-like headers MUST be
+redacted by default.
 
 ### 5.5. Audit Logging
 
@@ -325,8 +329,6 @@ Gateway configuration MUST include:
 - allowed API operations, each binding one method to one exact path or
   segment-bounded path prefix;
 - log sink;
-- provider authorization source, optional only when the configured upstream
-  intentionally requires no gateway-injected credential;
 - request timeout;
 - maximum request body size;
 - maximum response bytes forwarded or read before aborting.
@@ -363,8 +365,8 @@ Custode MUST include tests that prove:
 - denied methods do not reach the upstream provider;
 - denied paths do not reach the upstream provider;
 - allowed requests reach only the configured upstream provider;
-- provider credentials are injected by the gateway and not required in the
-  harness environment;
+- provider authorization headers supplied by the harness reach only allowed
+  upstream requests;
 - every allowed and denied request produces an audit event;
 - audit log write failure fails closed;
 - the gateway binary used in the scratch image is statically linked;
@@ -408,9 +410,11 @@ The third most important failure mode is a gateway that cannot log but
 continues forwarding. The gateway MUST fail closed when it cannot write a
 required audit event.
 
-The fourth most important failure mode is giving provider credentials to the
-harness for compatibility. That weakens the trust boundary and is not part of
-the initial product.
+The fourth most important failure mode is coupling the gateway to provider
+authentication schemes. That would require provider-specific credential logic
+for every harness and provider. The gateway MUST instead treat authentication
+as end-to-end provider request data while it enforces egress, allowlists, and
+audit.
 
 ## 8. References
 

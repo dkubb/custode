@@ -5,25 +5,20 @@ use crate::audit::{
     AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditWriter, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
-use crate::config::{AuthorizationSource, ConfigError, GatewayConfig};
-use crate::headers::{HeaderError, ProviderAuthorization};
-use ::http::header::{AUTHORIZATION, InvalidHeaderValue};
-use ::http::{Error as HttpError, HeaderName, HeaderValue, Method};
+use crate::config::{ConfigError, GatewayConfig};
+use crate::headers::HeaderError;
+use ::http::{Error as HttpError, Method};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Client;
 use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::fs;
 
 /// Shared gateway state.
 #[derive(Clone, Debug)]
 pub(crate) struct Gateway {
     /// Audit log writer.
     audit: AuditWriter,
-    /// Provider authorization header.
-    authorization: Option<ProviderAuthorization>,
     /// Upstream HTTP client.
     client: Client,
     /// Parsed gateway configuration.
@@ -38,19 +33,6 @@ pub(crate) enum GatewayError {
     /// Audit log failed.
     #[error("{0}")]
     Audit(#[from] AuditError),
-
-    /// Provider authorization header could not be built.
-    #[error("failed to build authorization header: {0}")]
-    AuthorizationHeader(InvalidHeaderValue),
-
-    /// Provider authorization token file could not be read.
-    #[error("failed to read authorization file {path}: {source}")]
-    AuthorizationRead {
-        /// Token file path.
-        path: PathBuf,
-        /// Source error.
-        source: io::Error,
-    },
 
     /// Body accounting failed.
     #[error("{0}")]
@@ -168,12 +150,6 @@ impl Gateway {
         Ok(())
     }
 
-    /// Returns the configured upstream authorization header.
-    #[must_use]
-    pub(crate) const fn authorization(&self) -> Option<&ProviderAuthorization> {
-        self.authorization.as_ref()
-    }
-
     /// Returns the upstream HTTP client.
     #[must_use]
     pub(crate) const fn client(&self) -> &Client {
@@ -190,17 +166,15 @@ impl Gateway {
     ///
     /// # Errors
     ///
-    /// Returns an error when audit log or authorization setup fails.
+    /// Returns an error when audit log or upstream client setup fails.
     pub(crate) async fn new(config: GatewayConfig) -> Result<Self, GatewayError> {
         let audit = AuditWriter::open(&config).await?;
-        let authorization = read_authorization(config.authorization()).await?;
         let client = Client::builder()
             .timeout(config.request_timeout())
             .build()
             .map_err(GatewayError::Client)?;
         Ok(Self {
             audit,
-            authorization,
             client,
             config: Arc::new(config),
             request_sequence: Arc::new(AtomicU64::new(1)),
@@ -213,41 +187,4 @@ impl Gateway {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
         RequestId::from_sequence(sequence)
     }
-}
-
-/// Reads the configured provider authorization header.
-async fn read_authorization(
-    authorization: &AuthorizationSource,
-) -> Result<Option<ProviderAuthorization>, GatewayError> {
-    if let Some(path) = authorization.bearer_file_path() {
-        let token = read_authorization_token(path).await?;
-        let value = format!("Bearer {}", token.trim());
-        return HeaderValue::from_str(&value)
-            .map(|header_value| Some(ProviderAuthorization::new(AUTHORIZATION, header_value)))
-            .map_err(GatewayError::AuthorizationHeader);
-    }
-
-    if let Some(path) = authorization.x_api_key_file_path() {
-        let token = read_authorization_token(path).await?;
-        return HeaderValue::from_str(token.trim())
-            .map(|header_value| {
-                Some(ProviderAuthorization::new(
-                    HeaderName::from_static("x-api-key"),
-                    header_value,
-                ))
-            })
-            .map_err(GatewayError::AuthorizationHeader);
-    }
-
-    Ok(None)
-}
-
-/// Reads a provider authorization token file.
-async fn read_authorization_token(path: &Path) -> Result<String, GatewayError> {
-    fs::read_to_string(path)
-        .await
-        .map_err(|read_error| GatewayError::AuthorizationRead {
-            path: path.to_owned(),
-            source: read_error,
-        })
 }

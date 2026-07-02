@@ -8,8 +8,6 @@ services:
     environment:
       CUSTODE_AUDIT_LOG: /var/log/custode/proxy.ndjson
       CUSTODE_ALLOWED_OPERATIONS: "${CUSTODE_ALLOWED_OPERATIONS-GET:exact:/v1/models,POST:prefix:/v1/responses,POST:prefix:/v1/chat/completions}"
-      CUSTODE_AUTHORIZATION_BEARER_FILE: "${CUSTODE_AUTHORIZATION_BEARER_FILE-/run/secrets/provider_token}"
-      CUSTODE_AUTHORIZATION_X_API_KEY_FILE: "${CUSTODE_AUTHORIZATION_X_API_KEY_FILE-}"
       CUSTODE_BIND: 0.0.0.0:8080
       CUSTODE_MAX_AUDIT_EVENT_BYTES: "16384"
       CUSTODE_MAX_CONCURRENT_REQUESTS: "8"
@@ -22,8 +20,6 @@ services:
     networks:
       - internal
       - egress
-    secrets:
-      - provider_token
     volumes:
       - proxy-logs:/var/log/custode
     read_only: true
@@ -77,10 +73,6 @@ networks:
   internal:
     internal: true
   egress: {}
-
-secrets:
-  provider_token:
-    file: "${CUSTODE_PROVIDER_TOKEN_FILE-./secrets/provider_token.example}"
 
 volumes:
   proxy-logs: {}
