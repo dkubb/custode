@@ -617,19 +617,947 @@ fn upstream_error_status(error: &reqwest::Error) -> StatusCode {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{ResponseAuditContext, ServeError, run_until_server_stops};
+    use super::{
+        AppState, ResponseAuditContext, ServeError, proxy, report_fatal_error,
+        request_body_error_status, request_header_error_class, request_header_error_status,
+        response_header_error_class, run_until_server_stops, send_stream_error, serve,
+        synthetic_target, upstream_error_class, upstream_error_status,
+    };
     use crate::allowlist::AcceptedTarget;
     use crate::audit::{AuditDecision, AuditError, RequestId};
-    use crate::body::{AccountedBody, ResponseAccount};
-    use crate::config::GatewayConfig;
+    use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
+    use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
-    use ::http::Method;
-    use axum::body::Body;
-    use core::future;
+    use crate::headers::HeaderError;
+    use ::http::{Method, Uri};
+    use axum::body::{Body, Bytes, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::{
+        Router,
+        routing::{any, get},
+    };
+    use clap::Parser;
+    use core::future::{self, IntoFuture as _};
+    use core::iter;
     use core::num::{NonZeroU64, NonZeroUsize};
+    use core::time::Duration;
+    use futures_util::StreamExt as _;
+    use futures_util::stream;
+    use pretty_assertions::assert_eq;
+    use reqwest::Client;
     use std::io;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use tempfile::tempdir;
-    use tokio::sync::mpsc;
+    use tokio::fs::read_to_string;
+    use tokio::io::AsyncWriteExt as _;
+    use tokio::net::TcpListener;
+    use tokio::sync::{Semaphore, mpsc};
+    use tokio::time::sleep;
+    use tower::ServiceExt as _;
+
+    /// Test wrapper that parses serve arguments.
+    #[derive(Debug, Parser)]
+    struct ServeCommand {
+        /// Parsed serve arguments.
+        #[command(flatten)]
+        args: ServeArgs,
+    }
+
+    /// Reads and parses every event in the audit log.
+    async fn audit_events(path: &Path) -> Vec<serde_json::Value> {
+        read_to_string(path)
+            .await
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit events should be JSON"))
+            .collect()
+    }
+
+    /// Returns the audit log path inside the directory and its UTF-8 form.
+    fn audit_paths(directory: &Path) -> (PathBuf, String) {
+        let audit_log = directory.join("audit.ndjson");
+        let text = audit_log
+            .to_str()
+            .expect("temporary path should be UTF-8")
+            .to_owned();
+        (audit_log, text)
+    }
+
+    /// Builds an empty-body request for the supplied method and target.
+    fn build_request(method: Method, target: &str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(target)
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    /// Returns the origin of a bound-then-released local port.
+    async fn closed_origin() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose its address");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// Parses a gateway configuration from serve-style command-line arguments.
+    fn config_from_args(arguments: &[&str]) -> GatewayConfig {
+        let command =
+            ServeCommand::try_parse_from(iter::once("serve").chain(arguments.iter().copied()))
+                .expect("serve arguments should parse");
+        GatewayConfig::try_from(command.args).expect("serve arguments should form a valid config")
+    }
+
+    /// Builds an upstream router answering the models route with `hello`.
+    fn hello_upstream_router() -> Router {
+        Router::new().route("/v1/models", get(|| async { "hello" }))
+    }
+
+    /// Builds the proxy router and fatal error channel around a configuration.
+    async fn proxy_router(
+        config: GatewayConfig,
+        permits: usize,
+    ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
+        let client = Client::builder()
+            .timeout(config.request_timeout())
+            .build()
+            .expect("upstream client should build");
+        let gateway = Gateway::new(config)
+            .await
+            .expect("gateway should initialize");
+        let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client,
+            concurrency: Arc::new(Semaphore::new(permits)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        (router, fatal_receiver)
+    }
+
+    /// Builds an upstream router that streams two chunks with a delay between.
+    fn slow_upstream_router() -> Router {
+        Router::new().route(
+            "/v1/models",
+            get(|| async {
+                Body::from_stream(
+                    stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"first")) })
+                        .chain(stream::once(async {
+                            sleep(Duration::from_millis(200)).await;
+                            Ok::<Bytes, io::Error>(Bytes::from_static(b"second"))
+                        })),
+                )
+            }),
+        )
+    }
+
+    /// Serves a router on an ephemeral local port and returns its origin.
+    async fn spawn_upstream(router: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("upstream listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("upstream listener should expose its address");
+        drop(tokio::spawn(axum::serve(listener, router).into_future()));
+        format!("http://{addr}")
+    }
+
+    /// Builds a tiny-bound config and its audit log path.
+    fn tiny_config(directory: &Path, max_audit_event_bytes: usize) -> (GatewayConfig, PathBuf) {
+        let audit_log = directory.join("audit.ndjson");
+        let config = GatewayConfig::for_test(
+            audit_log.clone(),
+            NonZeroUsize::new(max_audit_event_bytes).expect("limit should be non-zero"),
+        );
+        (config, audit_log)
+    }
+
+    /// Builds a roomy runtime config and its audit log path.
+    fn runtime_config(directory: &Path, upstream_origin: &str) -> (GatewayConfig, PathBuf) {
+        let audit_log = directory.join("audit.ndjson");
+        let config = GatewayConfig::for_runtime_test(audit_log.clone(), upstream_origin);
+        (config, audit_log)
+    }
+
+    /// Polls the audit log until it holds at least the expected event count.
+    async fn wait_for_audit_events(path: &Path, expected: usize) -> Vec<serde_json::Value> {
+        for _attempt in 0_u8..100 {
+            if audit_events(path).await.len() >= expected {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        audit_events(path).await
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_connect_requests() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::CONNECT, "example.com:443"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "connect_unsupported");
+        assert_eq!(event["path"], "/");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_absolute_form_targets() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "http://example.com/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "absolute_form_unsupported");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_dot_segment_targets() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/../models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "dot_segment");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_operations_outside_the_allowlist() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::DELETE, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "method_denied");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_oversized_request_headers() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = tiny_config(directory.path(), 0x4000);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let oversized = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .header("x-test", "value")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = router
+            .oneshot(oversized)
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "request_headers_too_large");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_oversized_request_bodies() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = tiny_config(directory.path(), 0x4000);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let oversized = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .body(Body::from("ab"))
+            .expect("request should build");
+
+        let response = router
+            .oneshot(oversized)
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "request_body_too_large");
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_unreadable_request_bodies() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = tiny_config(directory.path(), 0x4000);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let unreadable = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .body(Body::from_stream(stream::iter([Err::<Bytes, io::Error>(
+                io::Error::other("read failed"),
+            )])))
+            .expect("request should build");
+
+        let response = router
+            .oneshot(unreadable)
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "request_body_read_failed");
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_bad_gateway_when_upstream_is_unreachable() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let origin = closed_origin().await;
+        let (config, audit_log) = runtime_config(directory.path(), &origin);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("failure should be audited");
+        assert_eq!(event["decision"], "upstream_error");
+        assert_eq!(event["error_class"], "upstream_connect_failed");
+    }
+
+    #[tokio::test]
+    async fn proxy_returns_bad_gateway_for_oversized_response_headers() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(hello_upstream_router()).await;
+        let (audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-response-header-bytes",
+            "1",
+        ]);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("failure should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "response_headers_too_large");
+        assert_eq!(
+            event["status"], 502_u64,
+            "the audited status is what the harness receives"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_allowed_responses() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(hello_upstream_router()).await;
+        let (config, audit_log) = runtime_config(directory.path(), &upstream);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should stream");
+        assert_eq!(body, Bytes::from_static(b"hello"));
+        let events = wait_for_audit_events(&audit_log, 1).await;
+        let event = events.first().expect("completion should be audited");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["status"], 200_u16);
+        assert_eq!(event["response_bytes"], 5_u64);
+        assert_eq!(event["upstream_path"], "/v1/models");
+    }
+
+    #[tokio::test]
+    async fn proxy_terminates_oversized_response_bodies() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream =
+            spawn_upstream(Router::new().route("/v1/models", get(|| async { "0123456789abcdef" })))
+                .await;
+        let (audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-response-bytes",
+            "8",
+        ]);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let result = to_bytes(response.into_body(), 1_024).await;
+        assert!(result.is_err(), "oversized response should end in an error");
+        let events = wait_for_audit_events(&audit_log, 1).await;
+        let event = events.first().expect("failure should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "response_body_too_large");
+    }
+
+    #[tokio::test]
+    async fn proxy_reports_upstream_stream_failures() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(Router::new().route(
+            "/v1/models",
+            get(|| async {
+                Body::from_stream(
+                    stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"partial")) })
+                        .chain(stream::once(async {
+                            sleep(Duration::from_millis(100)).await;
+                            Err::<Bytes, io::Error>(io::Error::other("upstream stream failed"))
+                        })),
+                )
+            }),
+        ))
+        .await;
+        let (config, audit_log) = runtime_config(directory.path(), &upstream);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        let result = to_bytes(response.into_body(), 1_024).await;
+        assert!(
+            result.is_err(),
+            "failed upstream stream should end in an error"
+        );
+        let events = wait_for_audit_events(&audit_log, 1).await;
+        let event = events.first().expect("failure should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_stream_failed");
+    }
+
+    #[tokio::test]
+    async fn proxy_audits_downstream_disconnects() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(slow_upstream_router()).await;
+        let (config, audit_log) = runtime_config(directory.path(), &upstream);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+        drop(response);
+
+        let events = wait_for_audit_events(&audit_log, 1).await;
+        let event = events.first().expect("disconnect should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "downstream_closed");
+    }
+
+    #[tokio::test]
+    async fn proxy_reports_a_fatal_error_when_the_completion_audit_fails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(hello_upstream_router()).await;
+        let (_audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-audit-event-bytes",
+            "1",
+        ]);
+        let (router, mut fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should stream");
+        assert_eq!(body, Bytes::from_static(b"hello"));
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("fatal error should be reported");
+        assert!(
+            matches!(fatal, GatewayError::Audit(AuditError::EventTooLarge { .. })),
+            "completion audit failure should be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_reports_a_fatal_error_when_the_disconnect_audit_fails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(slow_upstream_router()).await;
+        let (_audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-audit-event-bytes",
+            "1",
+        ]);
+        let (router, mut fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+        drop(response);
+
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("fatal error should be reported");
+        assert!(
+            matches!(fatal, GatewayError::Audit(AuditError::EventTooLarge { .. })),
+            "disconnect audit failure should be fatal"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_requests_when_no_permits_are_available() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 0).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "too_many_requests");
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_the_permit_denial_audit_fails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, _audit_log) = tiny_config(directory.path(), 1);
+        let (router, _fatal_receiver) = proxy_router(config, 0).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_the_denial_audit_fails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, _audit_log) = tiny_config(directory.path(), 1);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::CONNECT, "example.com:443"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn serve_handles_requests_until_aborted() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(hello_upstream_router()).await;
+        let (_audit_log, audit_text) = audit_paths(directory.path());
+        let port_listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let bind = port_listener
+            .local_addr()
+            .expect("listener should expose its address")
+            .to_string();
+        drop(port_listener);
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            &bind,
+        ]);
+        let server = tokio::spawn(serve(config));
+        let client = Client::builder()
+            .no_proxy()
+            .build()
+            .expect("probe client should build");
+        let url = format!("http://{bind}/v1/models");
+
+        let mut status = None;
+        for _attempt in 0_u8..100 {
+            if let Ok(response) = client.get(&url).send().await {
+                status = Some(response.status());
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        server.abort();
+
+        assert_eq!(
+            status,
+            Some(StatusCode::OK),
+            "gateway should proxy an allowed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_when_audit_log_is_a_directory() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let config = GatewayConfig::for_runtime_test(
+            directory.path().to_path_buf(),
+            "https://api.openai.com",
+        );
+
+        let result = serve(config).await;
+
+        assert!(
+            matches!(result, Err(ServeError::Gateway(_))),
+            "a directory audit log should fail serving"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_fails_when_the_bind_address_is_taken() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let bind = listener
+            .local_addr()
+            .expect("listener should expose its address")
+            .to_string();
+        let (_audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            "https://api.openai.com",
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            &bind,
+        ]);
+
+        let result = serve(config).await;
+
+        assert!(
+            matches!(result, Err(ServeError::ServerBind(_))),
+            "an occupied bind address should fail serving"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_server_stops_returns_server_success() {
+        let (_fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
+
+        let result =
+            run_until_server_stops(future::ready(Ok::<(), io::Error>(())), fatal_receiver).await;
+
+        assert!(result.is_ok(), "a finished server should stop serving");
+    }
+
+    #[tokio::test]
+    async fn run_until_server_stops_returns_server_error() {
+        let (_fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
+
+        let result = run_until_server_stops(
+            future::ready(Err::<(), io::Error>(io::Error::other("boom"))),
+            fatal_receiver,
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ServeError::Server(_))),
+            "a failed server should surface its error"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_until_server_stops_returns_ok_when_fatal_channel_closes() {
+        let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
+        drop(fatal_errors);
+
+        let result =
+            run_until_server_stops(future::pending::<Result<(), io::Error>>(), fatal_receiver)
+                .await;
+
+        assert!(
+            result.is_ok(),
+            "a closed fatal channel should not stop the server with an error"
+        );
+    }
+
+    #[test]
+    fn request_body_error_status_maps_read_failures_to_bad_request() {
+        let error = RequestBodyError::Read {
+            source: axum::Error::new(io::Error::other("read failed")),
+        };
+
+        assert_eq!(request_body_error_status(&error), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn request_body_error_status_maps_oversize_to_payload_too_large() {
+        assert_eq!(
+            request_body_error_status(&RequestBodyError::TooLarge),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn request_header_error_mappings_cover_every_variant() {
+        assert_eq!(
+            request_header_error_class(HeaderError::InvalidConnectionHeader),
+            "invalid_request_connection_header"
+        );
+        assert_eq!(
+            request_header_error_class(HeaderError::TooLarge),
+            "request_headers_too_large"
+        );
+        assert_eq!(
+            request_header_error_status(HeaderError::InvalidConnectionHeader),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            request_header_error_status(HeaderError::TooLarge),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+    }
+
+    #[test]
+    fn response_header_error_class_covers_every_variant() {
+        assert_eq!(
+            response_header_error_class(HeaderError::InvalidConnectionHeader),
+            "invalid_response_connection_header"
+        );
+        assert_eq!(
+            response_header_error_class(HeaderError::TooLarge),
+            "response_headers_too_large"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_mappings_classify_connect_failures() {
+        let origin = closed_origin().await;
+        let client = Client::builder()
+            .no_proxy()
+            .build()
+            .expect("probe client should build");
+
+        let error = client
+            .get(format!("{origin}/v1/models"))
+            .send()
+            .await
+            .expect_err("closed port should fail");
+
+        assert_eq!(upstream_error_class(&error), "upstream_connect_failed");
+        assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_mappings_classify_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose its address");
+        let client = Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(50))
+            .build()
+            .expect("probe client should build");
+
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a silent upstream should time out");
+
+        assert_eq!(upstream_error_class(&error), "upstream_timeout");
+        assert_eq!(upstream_error_status(&error), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_mappings_classify_protocol_failures() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let addr = listener
+            .local_addr()
+            .expect("listener should expose its address");
+        drop(tokio::spawn(async move {
+            let (mut socket, _peer) = listener
+                .accept()
+                .await
+                .expect("garbage upstream should accept");
+            socket
+                .write_all(b"garbage\r\n\r\n")
+                .await
+                .expect("garbage upstream should write");
+        }));
+        let client = Client::builder()
+            .no_proxy()
+            .build()
+            .expect("probe client should build");
+
+        let error = client
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("a garbage response should fail");
+
+        assert_eq!(upstream_error_class(&error), "upstream_request_failed");
+        assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn synthetic_target_defaults_empty_paths_to_root() {
+        let uri = Uri::from_static("example.com:443");
+
+        let target = synthetic_target(&uri);
+
+        assert_eq!(target.path(), "/");
+        assert_eq!(target.query(), None);
+    }
+
+    #[test]
+    fn synthetic_target_preserves_path_and_query() {
+        let uri = Uri::from_static("/v1/models?limit=1");
+
+        let target = synthetic_target(&uri);
+
+        assert_eq!(target.path(), "/v1/models");
+        assert_eq!(target.query(), Some("limit=1"));
+    }
+
+    #[tokio::test]
+    async fn send_stream_error_prefers_audit_failures() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        send_stream_error(
+            &sender,
+            Err("audit failed".to_owned()),
+            "stream failed".to_owned(),
+        )
+        .await;
+
+        let outcome = receiver
+            .recv()
+            .await
+            .expect("terminal error should be sent");
+        let error = outcome.expect_err("terminal item should be an error");
+        assert_eq!(error.to_string(), "audit failed");
+    }
+
+    #[tokio::test]
+    async fn send_stream_error_sends_the_stream_error_when_audit_succeeds() {
+        let (sender, mut receiver) = mpsc::channel(1);
+
+        send_stream_error(&sender, Ok(()), "stream failed".to_owned()).await;
+
+        let outcome = receiver
+            .recv()
+            .await
+            .expect("terminal error should be sent");
+        let error = outcome.expect_err("terminal item should be an error");
+        assert_eq!(error.to_string(), "stream failed");
+    }
+
+    #[tokio::test]
+    async fn send_stream_error_tolerates_a_closed_receiver() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+
+        send_stream_error(&sender, Ok(()), "stream failed".to_owned()).await;
+
+        assert!(sender.is_closed(), "receiver should be gone");
+    }
+
+    #[test]
+    fn report_fatal_error_tolerates_a_closed_channel() {
+        let (fatal_errors, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+
+        report_fatal_error(
+            &fatal_errors,
+            GatewayError::Audit(AuditError::EventTooLarge { bytes: 2, max: 1 }),
+        );
+
+        assert!(fatal_errors.is_closed(), "receiver should be gone");
+    }
 
     #[tokio::test]
     async fn audit_after_response_started_reports_fatal_error() {

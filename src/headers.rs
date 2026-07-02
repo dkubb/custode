@@ -198,6 +198,52 @@ mod tests {
     }
 
     #[test]
+    fn request_headers_reject_empty_connection_tokens() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("a,,b"));
+
+        let result = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(1024).expect("literal should be non-zero"),
+        );
+        let expected = Err(HeaderError::InvalidConnectionHeader);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn request_headers_accept_sets_exactly_at_the_byte_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-wide", HeaderValue::from_static("0123456789"));
+
+        // The only header contributes 6 name bytes and 10 value bytes.
+        let forwarded = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(16).expect("literal should be non-zero"),
+        )
+        .expect("headers at the exact limit should fit");
+
+        assert_eq!(
+            forwarded.get("x-wide"),
+            Some(&HeaderValue::from_static("0123456789")),
+        );
+    }
+
+    #[test]
+    fn request_headers_reject_sets_over_the_byte_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-wide", HeaderValue::from_static("0123456789"));
+
+        let result = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(1).expect("literal should be non-zero"),
+        );
+        let expected = Err(HeaderError::TooLarge);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn response_headers_reject_invalid_connection_tokens() {
         let mut headers = HeaderMap::new();
         headers.insert(CONNECTION, HeaderValue::from_static("x trace"));

@@ -115,7 +115,7 @@ pub(crate) struct AuditEventInput {
     pub response_body_blake3: Option<String>,
     /// Response body byte count.
     pub response_bytes: u64,
-    /// Response status returned to the harness, when one exists.
+    /// Response status, when one exists.
     pub status: Option<u16>,
     /// Accepted or raw audit target.
     pub target: AuditTarget,
@@ -247,6 +247,9 @@ impl AuditWriter {
     ///
     /// Returns an error when serialization or writing fails.
     pub(crate) async fn write_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
+        // `AuditEvent` is a plain struct of strings and integers, so
+        // serialization cannot fail in practice; the `Serialize` arm exists
+        // to keep the audit path fail-closed if the schema ever changes.
         let mut serialized = serde_json::to_vec(event).map_err(AuditError::Serialize)?;
         if serialized.len() > self.max_event_bytes {
             return Err(AuditError::EventTooLarge {
@@ -285,10 +288,43 @@ fn rfc3339_timestamp() -> String {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{AuditDecision, AuditEvent, AuditEventInput, AuditTarget, RequestId};
+    use super::{
+        AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditWriter,
+        RequestId, rfc3339_timestamp,
+    };
+    use crate::allowlist::AcceptedTarget;
+    use crate::config::GatewayConfig;
+    use core::num::NonZeroUsize;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::time::UNIX_EPOCH;
+    use tempfile::tempdir;
+
+    /// Builds a denied-decision event for writer tests.
+    fn denied_event() -> AuditEvent {
+        AuditEvent::new(AuditEventInput {
+            decision: AuditDecision::Denied,
+            error_class: Some("method_denied".to_owned()),
+            method: "DELETE".to_owned(),
+            request_body_blake3: None,
+            request_bytes: 0,
+            request_id: RequestId::from_parts("run", 1),
+            response_body_blake3: None,
+            response_bytes: 0,
+            status: Some(403),
+            target: AuditTarget::from_uri_parts("/v1/models", None),
+            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_path: None,
+            upstream_query: None,
+        })
+    }
+
+    /// A roomy audit event limit for tests that should not hit the bound.
+    fn roomy_event_limit() -> NonZeroUsize {
+        NonZeroUsize::new(0x4000).expect("limit should be non-zero")
+    }
 
     #[test]
     fn new_preserves_status() {
@@ -341,6 +377,76 @@ mod tests {
     }
 
     #[test]
+    fn decisions_serialize_as_snake_case_strings() {
+        let decisions = [
+            (AuditDecision::Allowed, "allowed"),
+            (AuditDecision::Denied, "denied"),
+            (AuditDecision::ResponseError, "response_error"),
+            (AuditDecision::UpstreamError, "upstream_error"),
+        ];
+
+        for (decision, expected) in decisions {
+            let value = serde_json::to_value(decision).expect("decision should serialize");
+            assert_eq!(value, expected);
+        }
+    }
+
+    #[test]
+    fn event_serializes_documented_fields_and_null_semantics() {
+        let target = AuditTarget::from_uri_parts("/v1/models", None);
+        let input = AuditEventInput {
+            request_id: RequestId::from_parts("run", 1),
+            decision: AuditDecision::Denied,
+            method: "DELETE".to_owned(),
+            target,
+            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_path: None,
+            upstream_query: None,
+            status: Some(403),
+            request_bytes: 0,
+            response_bytes: 0,
+            request_body_blake3: None,
+            response_body_blake3: None,
+            error_class: Some("method_not_allowed".to_owned()),
+        };
+
+        let value = serde_json::to_value(AuditEvent::new(input)).expect("event should serialize");
+
+        let object = value.as_object().expect("event should be a JSON object");
+        let expected_fields = [
+            "decision",
+            "error_class",
+            "method",
+            "path",
+            "query",
+            "request_body_blake3",
+            "request_bytes",
+            "request_id",
+            "response_body_blake3",
+            "response_bytes",
+            "status",
+            "timestamp",
+            "upstream_origin",
+            "upstream_path",
+            "upstream_query",
+            "version",
+        ];
+        for field in expected_fields {
+            assert!(object.contains_key(field), "missing field {field}");
+        }
+        assert_eq!(object.len(), expected_fields.len());
+        assert_eq!(object["version"], 1_u64);
+        assert_eq!(object["decision"], "denied");
+        assert_eq!(object["request_id"], "req-run-0000000000000001");
+        assert!(object["upstream_path"].is_null());
+        assert!(object["upstream_query"].is_null());
+        assert!(object["query"].is_null());
+        assert!(object["request_body_blake3"].is_null());
+        assert!(object["response_body_blake3"].is_null());
+        assert_eq!(object["status"], 403_u64);
+    }
+
+    #[test]
     fn timestamp_formatting_matches_known_boundary_instants() {
         let vectors = [
             (0, 0, "1970-01-01T00:00:00.000000000Z"),
@@ -361,5 +467,152 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn rfc3339_timestamp_produces_a_parsable_instant() {
+        let timestamp = rfc3339_timestamp();
+
+        assert!(
+            humantime::parse_rfc3339(&timestamp).is_ok(),
+            "timestamp {timestamp:?} should parse as RFC 3339"
+        );
+    }
+
+    #[test]
+    fn from_uri_parts_replaces_empty_paths_with_root() {
+        let target = AuditTarget::from_uri_parts("", None);
+
+        assert_eq!(target.path(), "/");
+        assert_eq!(target.query(), None);
+    }
+
+    #[test]
+    fn accepted_targets_convert_losslessly() {
+        let accepted = AcceptedTarget::new("/v1/models", Some("limit=1"))
+            .expect("origin-form path should be accepted");
+
+        let target = AuditTarget::from(accepted);
+
+        assert_eq!(target.path(), "/v1/models");
+        assert_eq!(target.query(), Some("limit=1"));
+    }
+
+    #[tokio::test]
+    async fn open_creates_missing_parent_directories() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("nested/logs/audit.ndjson");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("open should create the parent directories");
+
+        drop(writer);
+        assert!(audit_log.exists());
+    }
+
+    #[tokio::test]
+    async fn open_handles_parentless_audit_paths() {
+        let config = GatewayConfig::for_test(PathBuf::from("/"), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(matches!(result, Err(AuditError::Open { path, .. }) if path == Path::new("/")));
+    }
+
+    #[tokio::test]
+    async fn open_fails_when_the_audit_path_is_a_directory() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let config = GatewayConfig::for_test(directory.path().to_owned(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(matches!(result, Err(AuditError::Open { .. })));
+    }
+
+    #[tokio::test]
+    async fn open_fails_when_the_parent_is_a_file() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let blocking_file = directory.path().join("occupied");
+        fs::write(&blocking_file, b"not a directory").expect("blocking file should be written");
+        let config =
+            GatewayConfig::for_test(blocking_file.join("audit.ndjson"), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(matches!(result, Err(AuditError::Open { path, .. }) if path == blocking_file));
+    }
+
+    #[tokio::test]
+    async fn write_event_appends_one_ndjson_line() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("audit writer should open");
+
+        writer
+            .write_event(&denied_event())
+            .await
+            .expect("event should be written");
+
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        assert!(contents.ends_with('\n'));
+        assert_eq!(contents.lines().count(), 1);
+        let line = contents.lines().next().expect("one line should exist");
+        let value: serde_json::Value =
+            serde_json::from_str(line).expect("line should be valid JSON");
+        let object = value.as_object().expect("event should be a JSON object");
+        assert_eq!(object["decision"], "denied");
+        assert_eq!(object["path"], "/v1/models");
+    }
+
+    #[tokio::test]
+    async fn write_event_accepts_events_exactly_at_the_maximum() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let event = denied_event();
+        let exact_size = serde_json::to_vec(&event)
+            .expect("event should serialize")
+            .len();
+        let config = GatewayConfig::for_test(
+            audit_log.clone(),
+            NonZeroUsize::new(exact_size).expect("serialized events are non-empty"),
+        );
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("audit writer should open");
+
+        writer
+            .write_event(&event)
+            .await
+            .expect("an event exactly at the limit should be written");
+
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_event_rejects_events_over_the_configured_maximum() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let config = GatewayConfig::for_test(
+            audit_log.clone(),
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        );
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("audit writer should open");
+
+        let result = writer.write_event(&denied_event()).await;
+
+        assert!(matches!(
+            result,
+            Err(AuditError::EventTooLarge { max: 1, .. }),
+        ));
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        assert_eq!(contents, "");
     }
 }

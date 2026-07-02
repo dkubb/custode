@@ -324,6 +324,29 @@ impl GatewayConfig {
         self.bind
     }
 
+    /// Builds a valid config with roomy bounds for runtime tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_runtime_test(audit_log: PathBuf, upstream_origin: &str) -> Self {
+        Self {
+            allowed_operations: vec![
+                AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse"),
+                AllowedOperation::parse("POST:prefix:/v1/responses")
+                    .expect("operation should parse"),
+            ],
+            audit_log,
+            bind: "127.0.0.1:0".parse().expect("bind address should parse"),
+            max_audit_event_bytes: NonZeroUsize::new(0x4000).expect("limit should be non-zero"),
+            max_concurrent_requests: NonZeroUsize::new(8).expect("limit should be non-zero"),
+            max_request_bytes: NonZeroUsize::new(0x0010_0000).expect("limit should be non-zero"),
+            max_request_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
+            max_response_bytes: NonZeroU64::new(0x0010_0000).expect("limit should be non-zero"),
+            max_response_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
+            request_timeout: Duration::from_secs(5),
+            upstream_origin: UpstreamOrigin::parse(upstream_origin).expect("origin should parse"),
+        }
+    }
+
     /// Builds a minimal valid config for focused runtime tests.
     #[cfg(test)]
     #[must_use]
@@ -470,6 +493,11 @@ impl UpstreamOrigin {
             });
         }
         let Some(host) = url.host_str() else {
+            // Unreachable today: `Url::parse` guarantees a host for the
+            // special `http` and `https` schemes (hostless spellings such as
+            // `http://` fail to parse first), so this guard only fires if
+            // scheme support ever widens. It stays to keep parsing
+            // fail-closed.
             return Err(ConfigError::MissingUpstreamHost);
         };
         if host.contains('*') {
@@ -527,8 +555,33 @@ fn parse_allowed_path(path: &str) -> Result<String, ConfigError> {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, UpstreamOrigin, parse_allowed_operations,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,
+        non_zero_usize, parse_allowed_operations,
     };
+    use core::net::SocketAddr;
+    use core::time::Duration;
+    use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
+
+    /// A mutation that zeroes one serve argument bound.
+    type ZeroOneBound = fn(&mut ServeArgs);
+
+    /// Builds valid serve args mirroring the documented defaults.
+    pub(super) fn serve_args() -> ServeArgs {
+        ServeArgs {
+            allowed_operations: vec!["GET:exact:/v1/models".to_owned()],
+            audit_log: PathBuf::from("/var/log/custode/proxy.ndjson"),
+            bind: "127.0.0.1:8080".parse().expect("bind address should parse"),
+            max_audit_event_bytes: 0x4000,
+            max_concurrent_requests: 8,
+            max_request_bytes: 10_485_760,
+            max_request_header_bytes: 0x8000,
+            max_response_bytes: 104_857_600,
+            max_response_header_bytes: 0x0001_0000,
+            request_timeout_secs: 120,
+            upstream_origin: "https://api.openai.com".to_owned(),
+        }
+    }
 
     #[test]
     fn allowed_path_requires_leading_slash() {
@@ -569,6 +622,39 @@ mod tests {
     }
 
     #[test]
+    fn upstream_origin_rejects_credentials() {
+        assert!(matches!(
+            UpstreamOrigin::parse("https://user:secret@api.openai.com"),
+            Err(ConfigError::UpstreamOriginHasCredentials),
+        ));
+    }
+
+    #[test]
+    fn upstream_origin_joins_path_and_query() {
+        let origin =
+            UpstreamOrigin::parse("https://api.example.com:8443").expect("origin should parse");
+
+        let with_query = origin.join_path_query("/v1/models", Some("limit=1"));
+        let without_query = origin.join_path_query("/v1/models", None);
+
+        assert_eq!(
+            with_query.as_str(),
+            "https://api.example.com:8443/v1/models?limit=1"
+        );
+        assert_eq!(
+            without_query.as_str(),
+            "https://api.example.com:8443/v1/models"
+        );
+    }
+
+    #[test]
+    fn upstream_origin_as_str_has_no_trailing_slash() {
+        let origin = UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse");
+
+        assert_eq!(origin.as_str(), "https://api.openai.com");
+    }
+
+    #[test]
     fn empty_operations_fail_closed() {
         for operations in [Vec::new(), vec![String::new()]] {
             assert!(matches!(
@@ -586,5 +672,154 @@ mod tests {
             parse_allowed_operations(operations),
             Err(ConfigError::InvalidAllowedOperation { .. }),
         ));
+    }
+
+    #[test]
+    fn operation_rejects_unknown_kind() {
+        assert!(matches!(
+            AllowedOperation::parse("GET:glob:/v1/models"),
+            Err(ConfigError::InvalidOperationKind { .. }),
+        ));
+    }
+
+    #[test]
+    fn operation_rejects_invalid_method() {
+        assert!(matches!(
+            AllowedOperation::parse("B@D:exact:/v1/models"),
+            Err(ConfigError::InvalidMethod { .. }),
+        ));
+    }
+
+    #[test]
+    fn zero_bounds_fail_closed() {
+        assert!(matches!(
+            non_zero_usize("CUSTODE_MAX_REQUEST_BYTES", 0),
+            Err(ConfigError::ZeroBound {
+                name: "CUSTODE_MAX_REQUEST_BYTES",
+            }),
+        ));
+    }
+
+    #[test]
+    fn serve_args_convert_into_a_full_config() {
+        let config = GatewayConfig::try_from(serve_args()).expect("valid args should convert");
+
+        let operation = config
+            .allowed_operations()
+            .first()
+            .expect("one operation should be configured");
+        assert_eq!(config.allowed_operations().len(), 1);
+        assert!(operation.matches(&http::Method::GET, "/v1/models"));
+        assert_eq!(
+            config.audit_log(),
+            &PathBuf::from("/var/log/custode/proxy.ndjson")
+        );
+        assert_eq!(
+            config.bind(),
+            "127.0.0.1:8080"
+                .parse::<SocketAddr>()
+                .expect("bind address should parse")
+        );
+        assert_eq!(config.max_audit_event_bytes().get(), 0x4000);
+        assert_eq!(config.max_concurrent_requests().get(), 8);
+        assert_eq!(config.max_request_bytes().get(), 10_485_760);
+        assert_eq!(config.max_request_header_bytes().get(), 0x8000);
+        assert_eq!(config.max_response_bytes().get(), 104_857_600);
+        assert_eq!(config.max_response_header_bytes().get(), 0x0001_0000);
+        assert_eq!(config.request_timeout(), Duration::from_secs(120));
+        assert_eq!(config.upstream_origin().as_str(), "https://api.openai.com");
+    }
+
+    #[test]
+    fn zero_serve_args_fail_closed_with_the_env_name() {
+        let cases: [(&str, ZeroOneBound); 7] = [
+            ("CUSTODE_MAX_AUDIT_EVENT_BYTES", |args| {
+                args.max_audit_event_bytes = 0;
+            }),
+            ("CUSTODE_MAX_CONCURRENT_REQUESTS", |args| {
+                args.max_concurrent_requests = 0;
+            }),
+            ("CUSTODE_MAX_REQUEST_BYTES", |args| {
+                args.max_request_bytes = 0;
+            }),
+            ("CUSTODE_MAX_REQUEST_HEADER_BYTES", |args| {
+                args.max_request_header_bytes = 0;
+            }),
+            ("CUSTODE_MAX_RESPONSE_BYTES", |args| {
+                args.max_response_bytes = 0;
+            }),
+            ("CUSTODE_MAX_RESPONSE_HEADER_BYTES", |args| {
+                args.max_response_header_bytes = 0;
+            }),
+            ("CUSTODE_REQUEST_TIMEOUT_SECS", |args| {
+                args.request_timeout_secs = 0;
+            }),
+        ];
+
+        for (name, zero_one_bound) in cases {
+            let mut args = serve_args();
+            zero_one_bound(&mut args);
+
+            let error = GatewayConfig::try_from(args).expect_err("zero bound should fail");
+
+            assert!(
+                matches!(error, ConfigError::ZeroBound { name: actual } if actual == name),
+                "bound {name} should fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_has_method_ignores_path() {
+        let operation =
+            AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse");
+
+        assert!(operation.has_method(&http::Method::GET));
+        assert!(!operation.has_method(&http::Method::POST));
+    }
+
+    #[test]
+    fn operation_requires_method_kind_and_path() {
+        for raw in ["", "GET", "GET:exact", "GET::/v1", ":exact:/v1"] {
+            assert!(
+                matches!(
+                    AllowedOperation::parse(raw),
+                    Err(ConfigError::InvalidAllowedOperation { .. }),
+                ),
+                "operation {raw:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_origin_rejects_unparsable_urls() {
+        assert!(matches!(
+            UpstreamOrigin::parse("http://"),
+            Err(ConfigError::InvalidUpstreamOrigin { .. }),
+        ));
+    }
+
+    #[test]
+    fn upstream_origin_rejects_unsupported_schemes() {
+        assert!(matches!(
+            UpstreamOrigin::parse("ftp://example.com"),
+            Err(ConfigError::UnsupportedUpstreamScheme { scheme }) if scheme == "ftp",
+        ));
+    }
+
+    #[test]
+    fn upstream_origin_rejects_query_and_fragment() {
+        for origin in [
+            "https://api.openai.com?limit=1",
+            "https://api.openai.com#section",
+        ] {
+            assert!(
+                matches!(
+                    UpstreamOrigin::parse(origin),
+                    Err(ConfigError::UpstreamOriginHasComponents),
+                ),
+                "origin {origin} should be rejected"
+            );
+        }
     }
 }

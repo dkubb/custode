@@ -164,3 +164,136 @@ pub(crate) enum BodyError {
     #[error("response body exceeded configured maximum")]
     ResponseTooLarge,
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{AccountedBody, BodyError, RequestBodyError, ResponseAccount};
+    use axum::body::Body;
+    use core::num::{NonZeroU64, NonZeroUsize};
+    use futures_util::stream;
+    use pretty_assertions::assert_eq;
+    use std::io;
+
+    /// BLAKE3 digest of `hello`, computed independently with `b3sum`.
+    const HELLO_DIGEST: &str = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+
+    /// A roomy body limit for tests that should not hit the bound.
+    fn roomy_limit() -> NonZeroUsize {
+        NonZeroUsize::new(1_024).expect("limit should be non-zero")
+    }
+
+    #[tokio::test]
+    async fn read_request_accounts_bytes_count_and_digest() {
+        let accounted = AccountedBody::read_request(Body::from("hello"), roomy_limit())
+            .await
+            .expect("body should fit within the limit");
+
+        assert_eq!(accounted.bytes(), b"hello");
+        assert_eq!(accounted.byte_count(), 5);
+        assert_eq!(accounted.digest(), Some(HELLO_DIGEST));
+    }
+
+    #[tokio::test]
+    async fn read_request_gives_empty_bodies_no_digest() {
+        let accounted = AccountedBody::read_request(Body::empty(), roomy_limit())
+            .await
+            .expect("empty body should fit within the limit");
+
+        assert_eq!(accounted.bytes(), b"");
+        assert_eq!(accounted.byte_count(), 0);
+        assert_eq!(accounted.digest(), None);
+    }
+
+    #[tokio::test]
+    async fn read_request_rejects_bodies_over_the_limit() {
+        let result = AccountedBody::read_request(
+            Body::from("ab"),
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        )
+        .await;
+
+        assert!(matches!(result, Err(RequestBodyError::TooLarge)));
+    }
+
+    #[tokio::test]
+    async fn read_request_reports_stream_read_failures() {
+        let body = Body::from_stream(stream::iter([Err::<Vec<u8>, io::Error>(io::Error::other(
+            "connection reset",
+        ))]));
+
+        let result = AccountedBody::read_request(body, roomy_limit()).await;
+
+        assert!(matches!(result, Err(RequestBodyError::Read { .. })));
+    }
+
+    #[test]
+    fn error_class_is_stable_for_read_failures() {
+        let error = RequestBodyError::Read {
+            source: axum::Error::new(io::Error::other("connection reset")),
+        };
+
+        assert_eq!(error.error_class(), "request_body_read_failed");
+    }
+
+    #[test]
+    fn error_class_is_stable_for_oversized_bodies() {
+        assert_eq!(
+            RequestBodyError::TooLarge.error_class(),
+            "request_body_too_large"
+        );
+    }
+
+    #[test]
+    fn add_chunk_accepts_chunks_up_to_the_limit() {
+        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+
+        let result = account.add_chunk(b"hello");
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(account.byte_count(), 5);
+    }
+
+    #[test]
+    fn add_chunk_rejects_totals_over_the_limit() {
+        let mut account = ResponseAccount::new(NonZeroU64::new(4).expect("limit is non-zero"));
+
+        let result = account.add_chunk(b"hello");
+
+        assert_eq!(result, Err(BodyError::ResponseTooLarge));
+        assert_eq!(account.byte_count(), 0);
+    }
+
+    #[test]
+    fn add_chunk_rejects_accumulated_totals_over_the_limit() {
+        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        account
+            .add_chunk(b"hell")
+            .expect("first chunk should fit within the limit");
+
+        let result = account.add_chunk(b"oo");
+
+        assert_eq!(result, Err(BodyError::ResponseTooLarge));
+        assert_eq!(account.byte_count(), 4);
+    }
+
+    #[test]
+    fn finalize_digest_is_none_for_empty_responses() {
+        let account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+
+        assert_eq!(account.finalize_digest(), None);
+    }
+
+    #[test]
+    fn finalize_digest_hashes_accumulated_chunks() {
+        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        account
+            .add_chunk(b"hel")
+            .expect("first chunk should fit within the limit");
+        account
+            .add_chunk(b"lo")
+            .expect("second chunk should fit within the limit");
+
+        assert_eq!(account.finalize_digest().as_deref(), Some(HELLO_DIGEST));
+    }
+}

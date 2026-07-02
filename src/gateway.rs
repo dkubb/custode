@@ -176,3 +176,189 @@ impl Gateway {
         RequestId::from_parts(&self.run_token, sequence)
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use super::{Gateway, GatewayError, ResponseAuditInput};
+    use crate::allowlist::AcceptedTarget;
+    use crate::audit::{AuditDecision, AuditError, AuditTarget, RequestId};
+    use crate::body::{AccountedBody, ResponseAccount};
+    use crate::config::GatewayConfig;
+    use ::http::Method;
+    use axum::body::Body;
+    use core::num::NonZeroUsize;
+    use pretty_assertions::{assert_eq, assert_ne};
+    use std::path::Path;
+    use tempfile::tempdir;
+    use tokio::fs::read_to_string;
+
+    /// Builds a gateway writing audit events into the supplied directory.
+    async fn runtime_gateway(directory: &Path) -> Gateway {
+        let config = GatewayConfig::for_runtime_test(
+            directory.join("audit.ndjson"),
+            "https://api.openai.com",
+        );
+        Gateway::new(config)
+            .await
+            .expect("gateway should initialize")
+    }
+
+    /// Reads the single audit event written to the supplied directory.
+    async fn single_audit_event(directory: &Path) -> serde_json::Value {
+        let contents = read_to_string(directory.join("audit.ndjson"))
+            .await
+            .expect("audit log should be readable");
+        let mut lines = contents.lines();
+        let line = lines.next().expect("audit log should hold one event");
+        assert_eq!(
+            lines.next(),
+            None,
+            "audit log should hold exactly one event"
+        );
+        serde_json::from_str(line).expect("audit event should be JSON")
+    }
+
+    /// Reads a request body for audit input construction.
+    async fn accounted_body(body: Body) -> AccountedBody {
+        AccountedBody::read_request(
+            body,
+            NonZeroUsize::new(1_024).expect("limit should be non-zero"),
+        )
+        .await
+        .expect("request body should be accounted")
+    }
+
+    #[tokio::test]
+    async fn next_request_id_is_unique_per_request() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+
+        let first = gateway.next_request_id();
+        let second = gateway.next_request_id();
+
+        assert_ne!(first, second);
+    }
+
+    #[tokio::test]
+    async fn audit_denial_writes_a_denied_event() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+
+        gateway
+            .audit_denial(
+                RequestId::from_parts("run", 1),
+                &Method::CONNECT,
+                AuditTarget::from_uri_parts("/", None),
+                None,
+                "connect_unsupported",
+                405,
+            )
+            .await
+            .expect("denial audit should be written");
+
+        let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "connect_unsupported");
+        assert_eq!(event["method"], "CONNECT");
+        assert_eq!(event["path"], "/");
+        assert_eq!(event["status"], 405_u16);
+        assert_eq!(event["request_bytes"], 0_u64);
+        assert!(
+            event["request_body_blake3"].is_null(),
+            "denials without a body should have no request digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_denial_records_the_request_body_digest() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+        let request_body = accounted_body(Body::from("hello")).await;
+
+        gateway
+            .audit_denial(
+                RequestId::from_parts("run", 1),
+                &Method::POST,
+                AuditTarget::from_uri_parts("/v1/other", None),
+                Some(&request_body),
+                "path_denied",
+                403,
+            )
+            .await
+            .expect("denial audit should be written");
+
+        let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["request_bytes"], 5_u64);
+        assert!(
+            event["request_body_blake3"].is_string(),
+            "denials with a body should record its digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_response_writes_an_allowed_event() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+        let request_body = accounted_body(Body::empty()).await;
+        let mut response_account = ResponseAccount::new(gateway.config().max_response_bytes());
+        response_account
+            .add_chunk(b"world")
+            .expect("response chunk should be accounted");
+        let input = ResponseAuditInput {
+            decision: AuditDecision::Allowed,
+            error_class: None,
+            method: "GET".to_owned(),
+            request_body,
+            request_id: RequestId::from_parts("run", 1),
+            response_account,
+            status: Some(200),
+            target: AcceptedTarget::new("/v1/models", Some("limit=1"))
+                .expect("target should parse"),
+            upstream_path: "/v1/models".to_owned(),
+            upstream_query: Some("limit=1".to_owned()),
+        };
+
+        gateway
+            .audit_response(input)
+            .await
+            .expect("response audit should be written");
+
+        let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["status"], 200_u16);
+        assert_eq!(event["response_bytes"], 5_u64);
+        assert_eq!(event["upstream_path"], "/v1/models");
+        assert_eq!(event["upstream_query"], "limit=1");
+        assert!(
+            event["response_body_blake3"].is_string(),
+            "completed responses should record a body digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_returns_the_parsed_configuration() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+
+        let config = gateway.config();
+
+        assert_eq!(config.upstream_origin().as_str(), "https://api.openai.com");
+    }
+
+    #[tokio::test]
+    async fn new_fails_when_audit_log_is_a_directory() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let config = GatewayConfig::for_runtime_test(
+            directory.path().to_path_buf(),
+            "https://api.openai.com",
+        );
+
+        let result = Gateway::new(config).await;
+
+        assert!(
+            matches!(result, Err(GatewayError::Audit(AuditError::Open { .. }))),
+            "a directory audit log should fail to open"
+        );
+    }
+}
