@@ -300,6 +300,15 @@ impl AuditTimestamp {
         &self.0
     }
 
+    /// Creates a timestamp from a fixed RFC 3339 value for deterministic tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(value: &str) -> Self {
+        let timestamp =
+            humantime::parse_rfc3339(value).expect("test timestamp should parse as RFC 3339");
+        Self(humantime::format_rfc3339_nanos(timestamp).to_string())
+    }
+
     /// Returns the current RFC 3339 UTC timestamp for audit events.
     #[must_use]
     pub(crate) fn now() -> Self {

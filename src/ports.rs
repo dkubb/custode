@@ -155,6 +155,13 @@ impl UpstreamRequest {
         }
     }
 
+    /// Returns the upstream request headers.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
     /// Consumes the request into upstream adapter parts.
     #[must_use]
     pub(crate) fn into_parts(self) -> (Method, Url, HeaderMap, Vec<u8>) {
