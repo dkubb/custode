@@ -68,9 +68,19 @@ pub(super) struct ScenarioRequest {
     target: String,
 }
 
-/// Scripted upstream behavior for a deterministic gateway scenario.
+/// Scripted upstream outcome for a deterministic gateway scenario.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScenarioUpstream {
+    /// Return the fixed success response immediately.
+    Respond,
+
+    /// Return a timeout error immediately.
+    Timeout,
+}
+
+/// Scripted upstream behavior for deterministic handler tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptedUpstreamBehavior {
     /// Return the fixed success response immediately.
     Respond,
 
@@ -85,7 +95,7 @@ pub(super) enum ScenarioUpstream {
 #[derive(Clone, Debug)]
 pub(super) struct ScriptedUpstreamClient {
     /// Scripted upstream behavior.
-    behavior: ScenarioUpstream,
+    behavior: ScriptedUpstreamBehavior,
     /// Captured upstream requests.
     requests: Arc<Mutex<Vec<RecordedUpstreamRequest>>>,
 }
@@ -215,10 +225,16 @@ impl ScriptedUpstreamClient {
     pub(super) fn from_upstream(
         upstream: ScenarioUpstream,
     ) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
+        let behavior = match upstream {
+            ScenarioUpstream::Respond => ScriptedUpstreamBehavior::Respond,
+            ScenarioUpstream::Timeout => ScriptedUpstreamBehavior::Stall {
+                duration: Duration::MAX,
+            },
+        };
         let requests = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
-                behavior: upstream,
+                behavior,
                 requests: Arc::clone(&requests),
             },
             requests,
@@ -234,7 +250,14 @@ impl ScriptedUpstreamClient {
     /// Builds a scripted upstream client that stalls deterministically.
     #[must_use]
     pub(super) fn stalling(duration: Duration) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
-        Self::from_upstream(ScenarioUpstream::Stall { duration })
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                behavior: ScriptedUpstreamBehavior::Stall { duration },
+                requests: Arc::clone(&requests),
+            },
+            requests,
+        )
     }
 }
 
@@ -268,7 +291,7 @@ impl UpstreamClient for ScriptedUpstreamClient {
             .lock()
             .expect("scripted upstream should not be poisoned")
             .push(recorded);
-        if let ScenarioUpstream::Stall { duration } = self.behavior
+        if let ScriptedUpstreamBehavior::Stall { duration } = self.behavior
             && duration >= request.deadline().timeout()
         {
             let error = UpstreamError::new(
@@ -345,8 +368,6 @@ fn scenario_target_any() -> impl Strategy<Value = String> {
 fn scenario_upstream_any() -> impl Strategy<Value = ScenarioUpstream> {
     prop_oneof![
         Just(ScenarioUpstream::Respond),
-        Just(ScenarioUpstream::Stall {
-            duration: Duration::from_secs(10),
-        }),
+        Just(ScenarioUpstream::Timeout),
     ]
 }

@@ -702,7 +702,7 @@ mod tests {
             let query = query_value(scenario.request().target());
             let (decision, error_class) = match scenario.upstream() {
                 ScenarioUpstream::Respond => ("allowed", Value::Null),
-                ScenarioUpstream::Stall { .. } => (
+                ScenarioUpstream::Timeout => (
                     "upstream_error",
                     Value::String("upstream_timeout".to_owned()),
                 ),
@@ -773,11 +773,11 @@ mod tests {
         fn expected_run(scenario: &Scenario, deadline: UpstreamDeadline) -> ScenarioOracle {
             let response_body = match scenario.upstream() {
                 ScenarioUpstream::Respond => Bytes::from_static(b"scripted"),
-                ScenarioUpstream::Stall { .. } => Bytes::new(),
+                ScenarioUpstream::Timeout => Bytes::new(),
             };
             let status = match scenario.upstream() {
                 ScenarioUpstream::Respond => StatusCode::CREATED,
-                ScenarioUpstream::Stall { .. } => StatusCode::GATEWAY_TIMEOUT,
+                ScenarioUpstream::Timeout => StatusCode::GATEWAY_TIMEOUT,
             };
             ScenarioOracle {
                 audit_events: vec![expected_audit_event(scenario, &response_body, status)],
