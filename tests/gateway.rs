@@ -27,6 +27,9 @@ use axum::routing::any;
 use core::net::SocketAddr;
 use core::time::Duration;
 use serde_json::Value;
+use std::env::temp_dir;
+use std::fs::{DirBuilder, remove_dir};
+use std::io::Error;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -64,6 +67,13 @@ struct GatewayProcess {
     audit_log: PathBuf,
     /// Gateway child process.
     child: Child,
+}
+
+/// Cross-process lock for gateway subprocess tests.
+#[derive(Debug)]
+struct GatewayTestLock {
+    /// Lock directory created atomically while the lock is held.
+    path: PathBuf,
 }
 
 impl GatewayProcess {
@@ -135,6 +145,23 @@ impl GatewayProcess {
     }
 }
 
+impl GatewayTestLock {
+    /// Acquires the global gateway test lock.
+    async fn acquire() -> Result<Self, Error> {
+        let path = temp_dir().join("custode-gateway-tests.lock");
+        for _attempt in 0_u32..200 {
+            match DirBuilder::new().create(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(_error) if path.is_dir() => {
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(Error::other("gateway test lock should be acquired"))
+    }
+}
+
 #[expect(
     clippy::missing_trait_methods,
     reason = "only the stable Drop::drop method can be implemented"
@@ -143,6 +170,16 @@ impl Drop for GatewayProcess {
     fn drop(&mut self) {
         let _kill_result = self.child.kill();
         let _wait_result = self.child.wait();
+    }
+}
+
+#[expect(
+    clippy::missing_trait_methods,
+    reason = "only the stable Drop::drop method can be implemented"
+)]
+impl Drop for GatewayTestLock {
+    fn drop(&mut self) {
+        let _remove_result = remove_dir(&self.path);
     }
 }
 
@@ -232,10 +269,17 @@ fn wait_for_failure(mut child: Child) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Command, GatewayProcess, RecordedRequest, Stdio, free_local_addr, spawn_gateway_command,
-        start_upstream, tempdir, wait_for_failure,
+        Command, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio, free_local_addr,
+        spawn_gateway_command, start_upstream, tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
+
+    /// Serializes gateway subprocess tests across nextest processes.
+    async fn lock_gateway_test() -> GatewayTestLock {
+        GatewayTestLock::acquire()
+            .await
+            .expect("gateway test lock should be acquired")
+    }
 
     /// Clones the recorded upstream hits.
     fn recorded_hits(recorder: &super::Recorder) -> Vec<RecordedRequest> {
@@ -247,6 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_request_reaches_upstream_and_audits() {
+        let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
@@ -277,6 +322,7 @@ mod tests {
 
     #[tokio::test]
     async fn allowed_request_reaches_only_the_configured_upstream() {
+        let _guard = lock_gateway_test().await;
         let (configured, configured_recorder) = start_upstream().await;
         let (decoy, decoy_recorder) = start_upstream().await;
         let gateway =
@@ -305,6 +351,7 @@ mod tests {
 
     #[tokio::test]
     async fn denied_method_does_not_reach_upstream() {
+        let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
@@ -332,6 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn denied_path_does_not_reach_upstream() {
+        let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
@@ -356,6 +404,7 @@ mod tests {
 
     #[tokio::test]
     async fn harness_authorization_headers_reach_the_upstream() {
+        let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
@@ -379,6 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_allowed_and_denied_request_produces_an_audit_event() {
+        let _guard = lock_gateway_test().await;
         let (upstream, _recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
@@ -425,6 +475,7 @@ mod tests {
 
     #[tokio::test]
     async fn unopenable_audit_log_fails_closed_at_startup() {
+        let _guard = lock_gateway_test().await;
         let directory = tempdir().expect("temporary directory should be created");
         let addr = free_local_addr();
 
@@ -443,6 +494,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_allowlist_fails_closed_at_startup() {
+        let _guard = lock_gateway_test().await;
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
         let addr = free_local_addr();
@@ -466,6 +518,7 @@ mod tests {
 
     #[tokio::test]
     async fn wildcard_upstream_origin_fails_closed_at_startup() {
+        let _guard = lock_gateway_test().await;
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
         let addr = free_local_addr();
