@@ -6,7 +6,7 @@ use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
 use crate::headers::{HeaderError, forward_request_headers, forward_response_headers};
-use crate::ports::UpstreamRequest;
+use crate::ports::{UpstreamBodyError, UpstreamRequest, UpstreamResponse};
 use ::http::{HeaderMap, Method, Uri};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -342,7 +342,15 @@ async fn forward_request(
         .send()
         .await
     {
-        Ok(upstream_response) => upstream_response,
+        Ok(upstream_response) => {
+            let status = upstream_response.status();
+            let response_headers = upstream_response.headers().clone();
+            let response_body = upstream_response
+                .bytes_stream()
+                .map(|result| result.map_err(|error| UpstreamBodyError::new(error.to_string())))
+                .boxed();
+            UpstreamResponse::new(status, response_headers, response_body)
+        }
         Err(error) => {
             let status = upstream_error_status(&error);
             let input = ResponseAuditInput {
@@ -413,12 +421,12 @@ async fn forward_request(
 /// Streams the upstream response and writes exactly one terminal audit event.
 fn response_stream(
     mut context: ResponseAuditContext,
-    upstream_response: reqwest::Response,
+    upstream_response: UpstreamResponse,
 ) -> ReceiverStream<Result<Bytes, io::Error>> {
     let (sender, receiver) = mpsc::channel(8);
 
     tokio::spawn(async move {
-        let mut stream = upstream_response.bytes_stream();
+        let mut stream = upstream_response.into_body();
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
