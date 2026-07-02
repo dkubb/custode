@@ -182,6 +182,11 @@ Both containers MUST run as non-root users, drop Linux capabilities, and set
 filesystem. The harness container SHOULD use a read-only root filesystem when
 compatible with the selected harness.
 
+Both containers SHOULD set explicit process count and memory limits.
+
+The default composition SHOULD start the harness container only after the
+provider gateway container reports healthy.
+
 ### 5.2. Network Authority
 
 The harness container MUST be attached only to an internal network that has no
@@ -207,7 +212,9 @@ The gateway MUST reject HTTP `CONNECT` requests.
 
 The gateway MUST reject absolute-form request targets. Incoming request targets
 MUST use origin-form paths such as `/v1/responses`, MUST begin with `/`, and
-MUST NOT contain invalid percent-encoding.
+MUST NOT contain invalid percent-encoding. Incoming request paths MUST NOT
+contain literal or percent-encoded `.` or `..` segments, so that the allowlist
+decision and the upstream URL are computed from the same path.
 
 The gateway MUST derive the upstream URL by joining the configured provider
 origin with the incoming origin-form path and query. The incoming `Host` header
@@ -257,13 +264,16 @@ redacted by default.
 ### 5.5. Audit Logging
 
 The gateway MUST write one structured audit event for every runtime request
-decision: allowed upstream request, denied request, runtime configuration
-failure, upstream failure, or response completion failure. Invalid startup
+decision: allowed upstream request, denied request, upstream failure, or
+response completion failure. Invalid startup
 configuration MUST stop the gateway before it accepts traffic and does not need
-a request audit event.
+a request audit event. Local healthcheck requests answered by the gateway
+itself are not runtime request decisions and do not require request audit
+events.
 
 Each audit event MUST include:
 
+- schema version;
 - timestamp;
 - request identity;
 - decision;
@@ -282,6 +292,10 @@ Each audit event MUST include:
 Audit events MUST be newline-delimited JSON.
 
 The gateway MUST fail closed if it cannot write a required audit event.
+Failing closed means the affected request MUST NOT complete as an unaudited
+success: before a response starts, the gateway MUST return an error without
+forwarding; after a response has started, the gateway MUST terminate so that
+unaudited traffic cannot continue.
 
 Raw request and response body capture is OPTIONAL and MUST be separately
 configured with bounded sizes. Body capture MUST NOT be required for the
@@ -330,8 +344,12 @@ Gateway configuration MUST include:
   segment-bounded path prefix;
 - log sink;
 - request timeout;
-- maximum request body size;
-- maximum response bytes forwarded or read before aborting.
+- maximum request header bytes;
+- maximum request body bytes;
+- maximum response header bytes;
+- maximum response bytes forwarded or read before aborting;
+- maximum concurrent requests;
+- maximum audit event size.
 
 Invalid configuration MUST stop the gateway before it accepts traffic.
 
