@@ -219,11 +219,13 @@ src/lib.rs             Library exports
 src/main.rs            Binary entry point
 src/adapters.rs        Production audit, clock, request-id, and Reqwest adapters
 src/config.rs          Gateway configuration and fail-closed parsing
-src/allowlist.rs       Method and path decision logic
+src/allowlist.rs       Target syntax acceptance (AcceptedTarget) and the
+                       AllowedTarget allowlist witness
 src/audit.rs           Audit event schema and writer
 src/gateway.rs         Request handling state machine
 src/http.rs            Axum request and response wiring
-src/headers.rs         Hop-by-hop and redaction rules
+src/headers.rs         Hop-by-hop and redaction rules producing the
+                       ForwardedRequestHeaders witness
 src/body.rs            Bounded body accounting and BLAKE3 digests
 src/health.rs          Healthcheck subcommand probe
 src/ports.rs           Runtime port traits and pure request/response values
@@ -254,21 +256,25 @@ The library dependency direction is:
   as its byte-stream representation but MUST NOT depend on the server
   runtime.
 - `headers` owns header filtering and redaction rules.
-- `audit` depends on typed request and response summaries, not on the HTTP
-  server runtime. The audit writer owns the log file and performs the only
+- `audit` depends on typed request and response summaries, on `config` for
+  audit writer settings, and on accepted targets from `allowlist`, which it
+  converts into audit targets. It does not depend on the HTTP server
+  runtime. The audit writer owns the log file and performs the only
   filesystem mutation in the library.
-- `ports` depends on `audit`, `body`, `config`, and syntax-accepted request
-  targets. It owns runtime port traits, pure upstream request and response
-  values, and the conversion from accepted request targets to upstream
-  requests.
+- `ports` depends on `audit`, `body`, `config`, allowlist-proven
+  `AllowedTarget` values from `allowlist`, and the `ForwardedRequestHeaders`
+  witness from `headers`. It owns runtime port traits and pure upstream
+  request and response values. `UpstreamRequest::from_target` consumes
+  proof-carrying witnesses, not merely syntax-accepted targets.
 - `adapters` depends on `ports`, `audit`, and concrete runtime libraries. It
   owns the production audit sink, clock, request-id source, Reqwest upstream
   client, and reqwest error classification.
 - `gateway` depends on `config`, `allowlist`, `body`, `headers`, `audit`,
   and runtime ports. It owns no concrete I/O clients.
-- `http` depends on `gateway`, `ports`, and `adapters`. It owns Axum request
-  and response wiring, builds production adapters at the process edge, and
-  calls upstream clients through the `UpstreamClient` port.
+- `http` depends on `gateway`, `ports`, `adapters`, and the pure decision
+  modules (`allowlist`, `audit`, `body`, `config`, `headers`). It owns Axum
+  request and response wiring, builds production adapters at the process
+  edge, and calls upstream clients through the `UpstreamClient` port.
 - `health` depends on no other library module and owns the healthcheck
   subcommand's TCP probe.
 - `process` depends on `config`, `health`, and `http`; it owns the CLI,
