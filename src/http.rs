@@ -656,7 +656,8 @@ mod tests {
     use crate::headers::HeaderError;
     use crate::ports::{UpstreamDeadline, UpstreamError, UpstreamErrorKind};
     use crate::sim::{
-        FixedClock, MemoryAuditSink, RecordedUpstreamRequest, ScriptedUpstreamClient,
+        FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioRequest,
+        ScenarioUpstream, ScriptedUpstreamClient,
     };
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
@@ -691,6 +692,21 @@ mod tests {
         /// Parsed serve arguments.
         #[command(flatten)]
         args: ServeArgs,
+    }
+
+    /// Observations from a deterministic gateway scenario.
+    #[derive(Debug, Eq, PartialEq)]
+    struct ScenarioRun {
+        /// Captured audit events.
+        audit_events: Vec<Value>,
+        /// Upstream deadline used by the gateway.
+        deadline: UpstreamDeadline,
+        /// Captured response body.
+        response_body: Bytes,
+        /// Captured response status.
+        status: StatusCode,
+        /// Captured upstream requests.
+        upstream_requests: Vec<RecordedUpstreamRequest>,
     }
 
     /// Reads and parses every event in the audit log.
@@ -850,6 +866,72 @@ mod tests {
         (router, fatal_receiver)
     }
 
+    /// Runs one deterministic gateway scenario.
+    async fn run_scenario(scenario: Scenario) -> ScenarioRun {
+        let request_shape = scenario.request();
+        let (audit, audit_recorder) = MemoryAuditSink::new();
+        let (client, upstream_recorder) =
+            ScriptedUpstreamClient::from_upstream(scenario.upstream());
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        let mut builder = Request::builder()
+            .method(request_shape.method().clone())
+            .uri(request_shape.target());
+        for header in request_shape.headers() {
+            builder = builder.header(header.0.as_str(), header.1.as_str());
+        }
+        let request = builder
+            .body(Body::from(request_shape.body().to_vec()))
+            .expect("scenario request should build");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("scenario proxy should respond");
+
+        let status = response.status();
+        let response_body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("scenario response body should stream");
+        let captured_upstream_requests = upstream_recorder
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        let captured_audit_events = audit_recorder
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+
+        ScenarioRun {
+            audit_events: captured_audit_events,
+            deadline,
+            response_body,
+            status,
+            upstream_requests: captured_upstream_requests,
+        }
+    }
+
     /// Builds an upstream router that streams two chunks with a delay between.
     fn slow_upstream_router() -> Router {
         Router::new().route(
@@ -904,6 +986,44 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
         }
         audit_events(path).await
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scenario_runner_handles_allowed_requests() {
+        let scenario = Scenario::new(
+            ScenarioRequest::new(
+                b"hello".to_vec(),
+                vec![
+                    ("authorization".to_owned(), "Bearer harness".to_owned()),
+                    ("connection".to_owned(), "keep-alive".to_owned()),
+                    ("host".to_owned(), "proxy:8080".to_owned()),
+                    ("proxy-authorization".to_owned(), "Basic leak".to_owned()),
+                    ("x-request-id".to_owned(), "trace-1".to_owned()),
+                ],
+                Method::GET,
+                "/v1/models?limit=1",
+            ),
+            ScenarioUpstream::Respond,
+        );
+
+        let run = run_scenario(scenario).await;
+
+        assert_eq!(run.status, StatusCode::CREATED);
+        assert_eq!(run.response_body, Bytes::from_static(b"scripted"));
+        assert_eq!(
+            run.upstream_requests,
+            [RecordedUpstreamRequest::new(
+                b"hello".to_vec(),
+                run.deadline,
+                vec![
+                    ("authorization".to_owned(), "Bearer harness".to_owned()),
+                    ("x-request-id".to_owned(), "trace-1".to_owned()),
+                ],
+                Method::GET,
+                "https://api.openai.com/v1/models?limit=1",
+            )]
+        );
+        assert_eq!(run.audit_events, [injected_allowed_event()]);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

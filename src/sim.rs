@@ -44,9 +44,31 @@ pub(super) struct RecordedUpstreamRequest {
     url: String,
 }
 
-/// Scripted upstream behavior.
+/// One deterministic gateway scenario.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct Scenario {
+    /// Harness request shape.
+    request: ScenarioRequest,
+    /// Scripted upstream behavior.
+    upstream: ScenarioUpstream,
+}
+
+/// Harness request shape for a deterministic gateway scenario.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ScenarioRequest {
+    /// Request body.
+    body: Vec<u8>,
+    /// Request headers.
+    headers: Vec<(String, String)>,
+    /// Request method.
+    method: Method,
+    /// Request target.
+    target: String,
+}
+
+/// Scripted upstream behavior for a deterministic gateway scenario.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScriptedUpstreamBehavior {
+pub(super) enum ScenarioUpstream {
     /// Return the fixed success response immediately.
     Respond,
 
@@ -61,7 +83,7 @@ enum ScriptedUpstreamBehavior {
 #[derive(Clone, Debug)]
 pub(super) struct ScriptedUpstreamClient {
     /// Scripted upstream behavior.
-    behavior: ScriptedUpstreamBehavior,
+    behavior: ScenarioUpstream,
     /// Captured upstream requests.
     requests: Arc<Mutex<Vec<RecordedUpstreamRequest>>>,
 }
@@ -123,31 +145,94 @@ impl RecordedUpstreamRequest {
     }
 }
 
-impl ScriptedUpstreamClient {
-    /// Builds a scripted upstream client and its request recorder.
+impl Scenario {
+    /// Builds a deterministic gateway scenario.
     #[must_use]
-    pub(super) fn new() -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
+    pub(super) const fn new(request: ScenarioRequest, upstream: ScenarioUpstream) -> Self {
+        Self { request, upstream }
+    }
+
+    /// Returns the harness request shape.
+    #[must_use]
+    pub(super) const fn request(&self) -> &ScenarioRequest {
+        &self.request
+    }
+
+    /// Returns the scripted upstream behavior.
+    #[must_use]
+    pub(super) const fn upstream(&self) -> ScenarioUpstream {
+        self.upstream
+    }
+}
+
+impl ScenarioRequest {
+    /// Returns the request body.
+    #[must_use]
+    pub(super) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the request headers.
+    #[must_use]
+    pub(super) fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Returns the request method.
+    #[must_use]
+    pub(super) const fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Builds a harness request shape.
+    #[must_use]
+    pub(super) fn new(
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+        method: Method,
+        target: impl Into<String>,
+    ) -> Self {
+        Self {
+            body,
+            headers,
+            method,
+            target: target.into(),
+        }
+    }
+
+    /// Returns the request target.
+    #[must_use]
+    pub(super) fn target(&self) -> &str {
+        &self.target
+    }
+}
+
+impl ScriptedUpstreamClient {
+    /// Builds a scripted upstream client with explicit upstream behavior.
+    #[must_use]
+    pub(super) fn from_upstream(
+        upstream: ScenarioUpstream,
+    ) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
         let requests = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
-                behavior: ScriptedUpstreamBehavior::Respond,
+                behavior: upstream,
                 requests: Arc::clone(&requests),
             },
             requests,
         )
     }
 
+    /// Builds a scripted upstream client and its request recorder.
+    #[must_use]
+    pub(super) fn new() -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
+        Self::from_upstream(ScenarioUpstream::Respond)
+    }
+
     /// Builds a scripted upstream client that stalls deterministically.
     #[must_use]
     pub(super) fn stalling(duration: Duration) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                behavior: ScriptedUpstreamBehavior::Stall { duration },
-                requests: Arc::clone(&requests),
-            },
-            requests,
-        )
+        Self::from_upstream(ScenarioUpstream::Stall { duration })
     }
 }
 
@@ -181,7 +266,7 @@ impl UpstreamClient for ScriptedUpstreamClient {
             .lock()
             .expect("scripted upstream should not be poisoned")
             .push(recorded);
-        if let ScriptedUpstreamBehavior::Stall { duration } = self.behavior
+        if let ScenarioUpstream::Stall { duration } = self.behavior
             && duration >= request.deadline().timeout()
         {
             let error = UpstreamError::new(
