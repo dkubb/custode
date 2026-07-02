@@ -12,7 +12,8 @@ use crate::headers::{
     ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
 };
 use crate::ports::{
-    UpstreamClient, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
+    UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamRequest,
+    UpstreamResponse,
 };
 use ::http::{Method, Uri};
 use axum::body::{Body, Bytes};
@@ -346,6 +347,7 @@ async fn forward_request(
         &target,
         request_headers,
         &request_body,
+        UpstreamDeadline::from_timeout(gateway.config().request_timeout()),
     );
     let upstream_response = match client.send(upstream_request).await {
         Ok(upstream_response) => upstream_response,
@@ -507,8 +509,7 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
 pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
     let bind = config.bind();
     let max_concurrent_requests = config.max_concurrent_requests().get();
-    let client =
-        ReqwestUpstreamClient::new(config.request_timeout()).map_err(ServeError::Client)?;
+    let client = ReqwestUpstreamClient::new().map_err(ServeError::Client)?;
     let gateway = production_gateway(config)
         .await
         .map_err(ServeError::Gateway)?;
@@ -653,7 +654,7 @@ mod tests {
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
-    use crate::ports::{UpstreamError, UpstreamErrorKind};
+    use crate::ports::{UpstreamDeadline, UpstreamError, UpstreamErrorKind};
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, ScriptedUpstreamClient,
     };
@@ -794,8 +795,7 @@ mod tests {
         config: GatewayConfig,
         permits: usize,
     ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
-        let client = ReqwestUpstreamClient::new(config.request_timeout())
-            .expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
         let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
@@ -874,6 +874,7 @@ mod tests {
             PathBuf::from("unused-audit.ndjson"),
             "https://api.openai.com",
         );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
         let gateway =
             Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
@@ -910,6 +911,7 @@ mod tests {
             requests,
             [RecordedUpstreamRequest::new(
                 b"hello".to_vec(),
+                deadline,
                 vec![
                     ("authorization".to_owned(), "Bearer harness".to_owned()),
                     ("x-request-id".to_owned(), "trace-1".to_owned()),

@@ -9,6 +9,7 @@ use axum::body::Bytes;
 use core::fmt;
 use core::future::Future;
 use core::pin::Pin;
+use core::time::Duration;
 use futures_util::stream::BoxStream;
 use http::{HeaderMap, Method, StatusCode};
 use thiserror::Error;
@@ -19,6 +20,13 @@ pub(crate) type BoxFuture<'future, T> = Pin<Box<dyn Future<Output = T> + Send + 
 
 /// Streaming upstream response body.
 pub(crate) type UpstreamBody = BoxStream<'static, Result<Bytes, UpstreamBodyError>>;
+
+/// Per-request upstream timeout deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UpstreamDeadline {
+    /// Timeout duration applied to the upstream request.
+    timeout: Duration,
+}
 
 /// Port that supplies audit timestamps.
 pub(crate) trait Clock: fmt::Debug + Send + Sync {
@@ -55,6 +63,8 @@ pub(crate) trait UpstreamClient: fmt::Debug + Send + Sync {
 pub(crate) struct UpstreamRequest {
     /// Upstream request body bytes.
     body: Vec<u8>,
+    /// Per-request upstream timeout deadline.
+    deadline: UpstreamDeadline,
     /// Upstream request headers.
     headers: HeaderMap,
     /// Upstream request method.
@@ -104,6 +114,20 @@ pub(crate) struct UpstreamBodyError {
     message: String,
 }
 
+impl UpstreamDeadline {
+    /// Creates a deadline from a configured timeout duration.
+    #[must_use]
+    pub(crate) const fn from_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+
+    /// Returns the timeout duration.
+    #[must_use]
+    pub(crate) const fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
 impl UpstreamBodyError {
     /// Creates an upstream body error.
     #[must_use]
@@ -139,6 +163,13 @@ impl UpstreamRequest {
         &self.body
     }
 
+    /// Returns the upstream request deadline.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn deadline(&self) -> UpstreamDeadline {
+        self.deadline
+    }
+
     /// Creates an upstream request from proof-carrying forwarding inputs.
     #[must_use]
     pub(crate) fn from_target(
@@ -146,9 +177,11 @@ impl UpstreamRequest {
         target: &AllowedTarget,
         headers: ForwardedRequestHeaders,
         body: &AccountedBody,
+        deadline: UpstreamDeadline,
     ) -> Self {
         Self {
             body: body.bytes().to_vec(),
+            deadline,
             headers: headers.into_header_map(),
             method: target.method().clone(),
             url: origin.join_path_query(target.target().path(), target.target().query()),
@@ -164,8 +197,14 @@ impl UpstreamRequest {
 
     /// Consumes the request into upstream adapter parts.
     #[must_use]
-    pub(crate) fn into_parts(self) -> (Method, Url, HeaderMap, Vec<u8>) {
-        (self.method, self.url, self.headers, self.body)
+    pub(crate) fn into_parts(self) -> (Method, Url, HeaderMap, Vec<u8>, UpstreamDeadline) {
+        (
+            self.method,
+            self.url,
+            self.headers,
+            self.body,
+            self.deadline,
+        )
     }
 
     /// Returns the upstream request method.
@@ -256,7 +295,7 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::UpstreamRequest;
+    use super::{UpstreamDeadline, UpstreamRequest};
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, UpstreamOrigin};
@@ -299,12 +338,14 @@ mod proptests {
                 &allowed,
                 headers,
                 &body,
+                UpstreamDeadline::from_timeout(config.request_timeout()),
             );
 
             prop_assert_eq!(request.method(), &Method::GET);
             prop_assert_eq!(request.url().path(), target.path());
             prop_assert_eq!(request.url().query(), target.query());
             prop_assert_eq!(request.body(), b"payload");
+            prop_assert_eq!(request.deadline().timeout(), config.request_timeout());
         }
     }
 }

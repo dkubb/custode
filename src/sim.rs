@@ -7,7 +7,8 @@
 
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp};
 use crate::ports::{
-    AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamError, UpstreamRequest, UpstreamResponse,
+    AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamRequest,
+    UpstreamResponse,
 };
 use axum::body::Bytes;
 use core::future;
@@ -32,6 +33,8 @@ pub(super) struct MemoryAuditSink {
 pub(super) struct RecordedUpstreamRequest {
     /// Upstream request body.
     body: Vec<u8>,
+    /// Per-request upstream timeout deadline.
+    deadline: UpstreamDeadline,
     /// Forwarded upstream request headers.
     headers: Vec<(String, String)>,
     /// Upstream request method.
@@ -89,12 +92,14 @@ impl RecordedUpstreamRequest {
     #[must_use]
     pub(super) fn new(
         body: Vec<u8>,
+        deadline: UpstreamDeadline,
         headers: Vec<(String, String)>,
         method: Method,
         url: impl Into<String>,
     ) -> Self {
         Self {
             body,
+            deadline,
             headers,
             method,
             url: url.into(),
@@ -137,6 +142,7 @@ impl UpstreamClient for ScriptedUpstreamClient {
         headers.sort();
         let recorded = RecordedUpstreamRequest::new(
             request.body().to_vec(),
+            request.deadline(),
             headers,
             request.method().clone(),
             request.url().to_string(),

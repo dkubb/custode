@@ -6,7 +6,6 @@ use crate::ports::{
     UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::time::Duration;
 use futures_util::StreamExt as _;
 use std::process;
 use std::sync::Arc;
@@ -71,9 +70,8 @@ impl ReqwestUpstreamClient {
     /// # Errors
     ///
     /// Returns an error when reqwest client construction fails.
-    pub(crate) fn new(timeout: Duration) -> Result<Self, UpstreamClientBuildError> {
+    pub(crate) fn new() -> Result<Self, UpstreamClientBuildError> {
         let client = reqwest::Client::builder()
-            .timeout(timeout)
             .build()
             .map_err(upstream_client_build_error)?;
         Ok(Self { client })
@@ -117,7 +115,8 @@ impl UpstreamClient for ReqwestUpstreamClient {
         request: UpstreamRequest,
     ) -> BoxFuture<'_, Result<UpstreamResponse, UpstreamError>> {
         Box::pin(async move {
-            let (source_method, url, request_headers, request_body) = request.into_parts();
+            let (source_method, url, request_headers, request_body, deadline) =
+                request.into_parts();
             let upstream_method = reqwest::Method::from_bytes(source_method.as_str().as_bytes())
                 .expect("http and reqwest method parsing should agree");
             let response = self
@@ -125,6 +124,7 @@ impl UpstreamClient for ReqwestUpstreamClient {
                 .request(upstream_method, url)
                 .headers(request_headers)
                 .body(request_body)
+                .timeout(deadline.timeout())
                 .send()
                 .await
                 .map_err(|error| upstream_error_from_reqwest(&error))?;
@@ -194,7 +194,9 @@ mod tests {
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, UpstreamOrigin};
     use crate::headers::forward_request_headers;
-    use crate::ports::{Clock as _, UpstreamClient as _, UpstreamErrorKind, UpstreamRequest};
+    use crate::ports::{
+        Clock as _, UpstreamClient as _, UpstreamDeadline, UpstreamErrorKind, UpstreamRequest,
+    };
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::error::Error as _;
@@ -223,7 +225,7 @@ mod tests {
         }
     }
 
-    async fn empty_upstream_request(origin_text: &str) -> UpstreamRequest {
+    async fn empty_upstream_request(origin_text: &str, timeout: Duration) -> UpstreamRequest {
         let origin = UpstreamOrigin::parse(origin_text).expect("test origin should parse");
         let config =
             GatewayConfig::for_runtime_test(PathBuf::from("/unused/audit.ndjson"), origin_text);
@@ -241,7 +243,13 @@ mod tests {
         )
         .await
         .expect("request body should be accounted");
-        UpstreamRequest::from_target(&origin, &allowed_target, headers, &request_body)
+        UpstreamRequest::from_target(
+            &origin,
+            &allowed_target,
+            headers,
+            &request_body,
+            UpstreamDeadline::from_timeout(timeout),
+        )
     }
 
     async fn released_origin() -> String {
@@ -320,9 +328,8 @@ mod tests {
     #[tokio::test]
     async fn reqwest_upstream_client_classifies_connect_failures() {
         let origin = released_origin().await;
-        let client = ReqwestUpstreamClient::new(Duration::from_secs(1))
-            .expect("upstream client should build");
-        let request = empty_upstream_request(&origin).await;
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let request = empty_upstream_request(&origin, Duration::from_secs(1)).await;
 
         let error = client
             .send(request)
@@ -350,9 +357,9 @@ mod tests {
                 .await
                 .expect("garbage upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new(Duration::from_secs(1))
-            .expect("upstream client should build");
-        let request = empty_upstream_request(&format!("http://{address}")).await;
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let request =
+            empty_upstream_request(&format!("http://{address}"), Duration::from_secs(1)).await;
 
         let error = client
             .send(request)
@@ -377,9 +384,9 @@ mod tests {
                 .expect("silent upstream should accept");
             sleep(Duration::from_secs(10)).await;
         }));
-        let client = ReqwestUpstreamClient::new(Duration::from_millis(50))
-            .expect("upstream client should build");
-        let request = empty_upstream_request(&format!("http://{address}")).await;
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let request =
+            empty_upstream_request(&format!("http://{address}"), Duration::from_millis(50)).await;
 
         let error = client
             .send(request)
@@ -407,9 +414,9 @@ mod tests {
                 .await
                 .expect("chunked upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new(Duration::from_secs(1))
-            .expect("upstream client should build");
-        let request = empty_upstream_request(&format!("http://{address}")).await;
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let request =
+            empty_upstream_request(&format!("http://{address}"), Duration::from_secs(1)).await;
 
         let response = client
             .send(request)

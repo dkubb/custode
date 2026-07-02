@@ -267,7 +267,8 @@ The library dependency direction is:
   `AllowedTarget` values from `allowlist`, and the `ForwardedRequestHeaders`
   witness from `headers`. It owns runtime port traits and pure upstream
   request and response values. `UpstreamRequest::from_target` consumes
-  proof-carrying witnesses, not merely syntax-accepted targets.
+  proof-carrying target and header witnesses plus an `UpstreamDeadline`, not
+  merely syntax-accepted targets.
 - `adapters` depends on `ports`, `audit`, and concrete runtime libraries. It
   owns the production audit sink, clock, request-id source, Reqwest upstream
   client, and reqwest error classification.
@@ -379,7 +380,8 @@ For each request, the gateway performs these steps in order:
 1. Compute the request body byte count and digest.
 1. Build the upstream URL from the configured origin plus accepted path and
    query.
-1. Send the upstream request with the configured timeout.
+1. Build an upstream request carrying the configured timeout deadline.
+1. Send the upstream request; the adapter applies the carried deadline.
 1. Stream the upstream response to the harness while counting bytes and
    updating the response digest.
 1. Write a required audit event before the request task is considered
