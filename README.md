@@ -90,6 +90,7 @@ export CUSTODE_ALLOWED_OPERATIONS="${anthropic_ops}"
 export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 
 claude_cmd="claude --bare -p 'what is 2+2?'"
+claude_cmd="${claude_cmd} --output-format text --max-budget-usd 0.01"
 export CUSTODE_HARNESS_COMMAND="${claude_cmd}"
 
 docker compose up --abort-on-container-exit --exit-code-from harness
@@ -179,15 +180,18 @@ docker compose down --volumes
 The main development gates are:
 
 ```sh
-cargo +nightly-2026-07-01 fmt --all --check
-cargo +nightly-2026-07-01 clippy --workspace --all-targets --all-features
-cargo +nightly-2026-07-01 test --workspace --all-features
-mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
-docker compose build proxy harness
-cargo mutants --list
+just check        # fmt-check, lint, test, Dockerfile check
+just ci           # check plus cargo-deny
+just docs         # Markdown lint
+just docker-build # image build
+just docker-test  # container tests: static linkage, health, egress denial
+just coverage     # cargo llvm-cov summary
+just mutants      # cargo-mutants mutation testing
 ```
 
-`just docs` runs the Markdown gate. `just docker-build` runs the image build.
+The test suite includes inline unit tests, inline property tests, and
+integration tests in `tests/gateway.rs` that run the compiled binary against
+a local recording upstream.
 
 ## Design Documents
 
