@@ -1,17 +1,31 @@
-//! Runtime port values.
+//! Runtime port traits and values.
 
 use crate::allowlist::AcceptedTarget;
 use crate::body::AccountedBody;
 use crate::config::UpstreamOrigin;
 use axum::body::Bytes;
 use core::fmt;
+use core::future::Future;
+use core::pin::Pin;
 use futures_util::stream::BoxStream;
 use http::{HeaderMap, Method, StatusCode};
 use thiserror::Error;
 use url::Url;
 
+/// Boxed future returned by runtime ports.
+pub(crate) type BoxFuture<'future, T> = Pin<Box<dyn Future<Output = T> + Send + 'future>>;
+
 /// Streaming upstream response body.
 pub(crate) type UpstreamBody = BoxStream<'static, Result<Bytes, UpstreamBodyError>>;
+
+/// Port that sends accepted requests to the configured provider.
+pub(crate) trait UpstreamClient: fmt::Debug + Send + Sync {
+    /// Sends one upstream request.
+    fn send(
+        &self,
+        request: UpstreamRequest,
+    ) -> BoxFuture<'_, Result<UpstreamResponse, UpstreamError>>;
+}
 
 /// Request passed to the upstream client port.
 #[derive(Debug)]

@@ -1,5 +1,6 @@
-//! Axum and Reqwest runtime edges.
+//! Axum request and response wiring.
 
+use crate::adapters::{ReqwestUpstreamClient, UpstreamClientBuildError};
 use crate::allowlist::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
 use crate::audit::{AuditDecision, AuditTarget, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
@@ -7,7 +8,7 @@ use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
 use crate::headers::{HeaderError, forward_request_headers, forward_response_headers};
 use crate::ports::{
-    UpstreamBodyError, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
+    UpstreamClient, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
 use ::http::{HeaderMap, Method, Uri};
 use axum::body::{Body, Bytes};
@@ -19,7 +20,6 @@ use core::convert::Infallible;
 use core::future::IntoFuture;
 use futures_util::StreamExt as _;
 use futures_util::future::{self, Either};
-use reqwest::Client;
 use std::io;
 use std::sync::Arc;
 use thiserror::Error;
@@ -32,8 +32,8 @@ use tokio_stream::wrappers::ReceiverStream;
 #[derive(Debug, Error)]
 pub(crate) enum ServeError {
     /// Upstream client could not be built.
-    #[error("failed to build upstream client: {0}")]
-    Client(reqwest::Error),
+    #[error("{0}")]
+    Client(UpstreamClientBuildError),
 
     /// Gateway request handling failed fatally.
     #[error("{0}")]
@@ -52,7 +52,7 @@ pub(crate) enum ServeError {
 #[derive(Clone, Debug)]
 struct AppState {
     /// Upstream HTTP client.
-    client: Client,
+    client: Arc<dyn UpstreamClient>,
     /// Request concurrency limiter.
     concurrency: Arc<Semaphore>,
     /// Fatal error channel for failures detected after responses start.
@@ -244,7 +244,7 @@ async fn proxy(
 async fn handle_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
-    client: Client,
+    client: Arc<dyn UpstreamClient>,
     request: Request<Body>,
 ) -> Result<Response<Body>, GatewayError> {
     let request_id = gateway.next_request_id();
@@ -317,7 +317,7 @@ async fn handle_request(
 async fn forward_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
-    client: Client,
+    client: Arc<dyn UpstreamClient>,
     request_id: RequestId,
     method: Method,
     target: AcceptedTarget,
@@ -333,32 +333,13 @@ async fn forward_request(
         request_headers,
         &request_body,
     );
-    let (upstream_method, upstream_url, upstream_headers, upstream_body) =
-        upstream_request.into_parts();
-    let reqwest_method = reqwest::Method::from_bytes(upstream_method.as_str().as_bytes())
-        .expect("http and reqwest method parsing should agree");
-    let upstream_response = match client
-        .request(reqwest_method, upstream_url)
-        .headers(upstream_headers)
-        .body(upstream_body)
-        .send()
-        .await
-    {
-        Ok(upstream_response) => {
-            let status = upstream_response.status();
-            let response_headers = upstream_response.headers().clone();
-            let response_body = upstream_response
-                .bytes_stream()
-                .map(|result| result.map_err(|error| UpstreamBodyError::new(error.to_string())))
-                .boxed();
-            UpstreamResponse::new(status, response_headers, response_body)
-        }
+    let upstream_response = match client.send(upstream_request).await {
+        Ok(upstream_response) => upstream_response,
         Err(error) => {
-            let upstream_error = upstream_error_from_reqwest(&error);
-            let status = upstream_error_status(&upstream_error);
+            let status = upstream_error_status(&error);
             let input = ResponseAuditInput {
                 decision: AuditDecision::UpstreamError,
-                error_class: Some(upstream_error_class(&upstream_error).to_owned()),
+                error_class: Some(upstream_error_class(&error).to_owned()),
                 method: method.to_string(),
                 request_body,
                 request_id,
@@ -522,14 +503,12 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
 pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
     let bind = config.bind();
     let max_concurrent_requests = config.max_concurrent_requests().get();
-    let client = Client::builder()
-        .timeout(config.request_timeout())
-        .build()
-        .map_err(ServeError::Client)?;
+    let client =
+        ReqwestUpstreamClient::new(config.request_timeout()).map_err(ServeError::Client)?;
     let gateway = Gateway::new(config).await.map_err(ServeError::Gateway)?;
     let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
     let state = AppState {
-        client,
+        client: Arc::new(client),
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
         fatal_errors,
         gateway,
@@ -620,18 +599,6 @@ const fn upstream_error_class(error: &UpstreamError) -> &'static str {
     }
 }
 
-/// Creates an upstream request error from reqwest's stable predicates.
-fn upstream_error_from_reqwest(error: &reqwest::Error) -> UpstreamError {
-    let kind = if error.is_timeout() {
-        UpstreamErrorKind::Timeout
-    } else if error.is_connect() {
-        UpstreamErrorKind::Connect
-    } else {
-        UpstreamErrorKind::Request
-    };
-    UpstreamError::new(kind, error.to_string())
-}
-
 /// Maps upstream request errors to response statuses.
 const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
     match error.kind() {
@@ -649,6 +616,7 @@ mod tests {
         response_header_error_class, run_until_server_stops, send_stream_error, serve,
         synthetic_target, upstream_error_class, upstream_error_status,
     };
+    use crate::adapters::ReqwestUpstreamClient;
     use crate::allowlist::AcceptedTarget;
     use crate::audit::{AuditDecision, AuditError, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
@@ -749,16 +717,14 @@ mod tests {
         config: GatewayConfig,
         permits: usize,
     ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
-        let client = Client::builder()
-            .timeout(config.request_timeout())
-            .build()
+        let client = ReqwestUpstreamClient::new(config.request_timeout())
             .expect("upstream client should build");
         let gateway = Gateway::new(config)
             .await
             .expect("gateway should initialize");
         let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
-            client,
+            client: Arc::new(client),
             concurrency: Arc::new(Semaphore::new(permits)),
             fatal_errors,
             gateway,

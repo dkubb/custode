@@ -12,6 +12,7 @@ use tempfile as _;
 use tower as _;
 use tracing_subscriber as _;
 
+pub mod adapters;
 pub mod allowlist;
 pub mod audit;
 pub mod body;
