@@ -21,4 +21,4 @@ pub mod health;
 pub mod http;
 pub mod process;
 
-pub use config::Cli;
+pub use process::Cli;

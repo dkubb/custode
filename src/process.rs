@@ -1,10 +1,48 @@
-//! Process-level error surface.
+//! Binary process edge: command-line interface, dispatch, and exit codes.
 
-use crate::config::ConfigError;
+use crate::config::{ConfigError, ServeArgs};
 use crate::gateway::GatewayError;
-use crate::health::HealthcheckError;
+use crate::health::{self, HealthcheckError};
+use crate::http;
+use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use thiserror::Error;
+
+/// Custode command-line interface.
+#[derive(Debug, Parser)]
+#[command(name = "custode-proxy")]
+#[command(about = "Run the Custode provider gateway")]
+pub struct Cli {
+    /// Selected command.
+    #[command(subcommand)]
+    command: Command,
+}
+
+/// Top-level CLI command.
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Probe a running gateway health endpoint.
+    Healthcheck(health::HealthcheckArgs),
+
+    /// Run the HTTP gateway.
+    Serve(ServeArgs),
+}
+
+impl Cli {
+    /// Runs the selected command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when configuration parsing, serving, or healthchecking
+    /// fails.
+    #[inline]
+    pub async fn run(self) -> Result<(), RunError> {
+        match self.command {
+            Command::Healthcheck(args) => health::check(args).await.map_err(RunError::from),
+            Command::Serve(args) => http::serve(args.try_into()?).await.map_err(RunError::from),
+        }
+    }
+}
 
 /// Process-level error returned by the Custode binary.
 #[derive(Debug, Error)]

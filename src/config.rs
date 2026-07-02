@@ -1,9 +1,7 @@
 //! Gateway configuration parsing.
 
-use crate::process::RunError;
-use crate::{health, http};
 use ::http::Method;
-use clap::{Args, Parser, Subcommand};
+use clap::Args;
 use core::net::SocketAddr;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
@@ -37,26 +35,6 @@ enum AllowedPathKind {
 
     /// Path-prefix match constrained to path segments.
     Prefix,
-}
-
-/// Custode command-line interface.
-#[derive(Debug, Parser)]
-#[command(name = "custode-proxy")]
-#[command(about = "Run the Custode provider gateway")]
-pub struct Cli {
-    /// Selected command.
-    #[command(subcommand)]
-    command: Command,
-}
-
-/// Top-level CLI command.
-#[derive(Debug, Subcommand)]
-enum Command {
-    /// Probe a running gateway health endpoint.
-    Healthcheck(health::HealthcheckArgs),
-
-    /// Run the HTTP gateway.
-    Serve(ServeArgs),
 }
 
 /// Configuration parsing error.
@@ -165,7 +143,7 @@ pub(crate) struct GatewayConfig {
 
 /// Raw serve command arguments before fail-closed parsing.
 #[derive(Debug, Args)]
-struct ServeArgs {
+pub(crate) struct ServeArgs {
     /// Comma-separated method-path operations accepted by the gateway.
     ///
     /// There is intentionally no default: a missing or empty allowlist is a
@@ -324,22 +302,6 @@ impl AllowedPath {
             kind: AllowedPathKind::Prefix,
             value: parse_allowed_path(raw)?,
         })
-    }
-}
-
-impl Cli {
-    /// Runs the selected command.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when configuration parsing, serving, or healthchecking
-    /// fails.
-    #[inline]
-    pub async fn run(self) -> Result<(), RunError> {
-        match self.command {
-            Command::Healthcheck(args) => health::check(args).await.map_err(RunError::from),
-            Command::Serve(args) => http::serve(args.try_into()?).await.map_err(RunError::from),
-        }
     }
 }
 
