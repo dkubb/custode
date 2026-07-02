@@ -201,7 +201,8 @@ custode/
 │   ├── lib.rs
 │   ├── main.rs
 │   ├── ports.rs
-│   └── process.rs
+│   ├── process.rs
+│   └── sim.rs
 └── tests/
     └── gateway.rs
 ```
@@ -230,6 +231,7 @@ src/body.rs            Bounded body accounting and BLAKE3 digests
 src/health.rs          Healthcheck subcommand probe
 src/ports.rs           Runtime port traits and pure request/response values
 src/process.rs         Command-line interface, dispatch, and exit codes
+src/sim.rs             Test-only deterministic runtime adapters
 ```
 
 There is no central error module: each module owns its typed `thiserror`
