@@ -167,12 +167,10 @@ pub(crate) struct GatewayConfig {
 #[derive(Debug, Args)]
 struct ServeArgs {
     /// Comma-separated method-path operations accepted by the gateway.
-    #[arg(
-        long,
-        env = "CUSTODE_ALLOWED_OPERATIONS",
-        value_delimiter = ',',
-        default_value = "GET:exact:/v1/models,POST:prefix:/v1/responses,POST:prefix:/v1/chat/completions"
-    )]
+    ///
+    /// There is intentionally no default: a missing or empty allowlist is a
+    /// configuration error so the gateway fails closed.
+    #[arg(long, env = "CUSTODE_ALLOWED_OPERATIONS", value_delimiter = ',')]
     allowed_operations: Vec<String>,
 
     /// Newline-delimited JSON audit log path.

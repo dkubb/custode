@@ -1,4 +1,4 @@
-use super::{AllowedOperation, AllowedPath, ConfigError, UpstreamOrigin};
+use super::{AllowedOperation, AllowedPath, ConfigError, UpstreamOrigin, parse_allowed_operations};
 
 #[test]
 fn allowed_path_requires_leading_slash() {
@@ -35,5 +35,15 @@ fn upstream_origin_rejects_wildcard_hosts() {
             ),
             "origin {origin} should be rejected"
         );
+    }
+}
+
+#[test]
+fn empty_operations_fail_closed() {
+    for operations in [Vec::new(), vec![String::new()]] {
+        assert!(matches!(
+            parse_allowed_operations(operations),
+            Err(ConfigError::EmptyOperations),
+        ));
     }
 }

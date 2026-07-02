@@ -7,7 +7,8 @@ services:
     command: ["serve"]
     environment:
       CUSTODE_AUDIT_LOG: /var/log/custode/proxy.ndjson
-      CUSTODE_ALLOWED_OPERATIONS: "${CUSTODE_ALLOWED_OPERATIONS-GET:exact:/v1/models,POST:prefix:/v1/responses,POST:prefix:/v1/chat/completions}"
+      # No default: an unset allowlist must fail closed at gateway startup.
+      CUSTODE_ALLOWED_OPERATIONS: "${CUSTODE_ALLOWED_OPERATIONS-}"
       CUSTODE_BIND: 0.0.0.0:8080
       CUSTODE_MAX_AUDIT_EVENT_BYTES: "16384"
       CUSTODE_MAX_CONCURRENT_REQUESTS: "8"
@@ -16,7 +17,8 @@ services:
       CUSTODE_MAX_RESPONSE_BYTES: "104857600"
       CUSTODE_MAX_RESPONSE_HEADER_BYTES: "65536"
       CUSTODE_REQUEST_TIMEOUT_SECS: "120"
-      CUSTODE_UPSTREAM_ORIGIN: "${CUSTODE_UPSTREAM_ORIGIN-https://api.openai.com}"
+      # No default: an unset upstream origin must fail closed at gateway startup.
+      CUSTODE_UPSTREAM_ORIGIN: "${CUSTODE_UPSTREAM_ORIGIN-}"
     networks:
       - internal
       - egress
