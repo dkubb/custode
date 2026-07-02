@@ -69,7 +69,8 @@ pub(crate) struct AuditEvent {
     error_class: Option<String>,
     /// Request method.
     method: String,
-    /// Accepted or synthetic request path.
+    /// Accepted request path, or the raw request target for denied
+    /// non-origin-form requests.
     path: String,
     /// Request query string without `?`.
     query: Option<String>,

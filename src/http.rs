@@ -562,14 +562,19 @@ async fn run_until_server_stops(
 }
 
 /// Builds a synthetic target for audit events before target parsing succeeds.
+///
+/// Non-origin-form targets audit the full raw request target as the path so
+/// denial events preserve the requested authority for forensics.
 fn synthetic_target(uri: &Uri) -> AuditTarget {
-    AuditTarget::from_uri_parts(
-        if uri.path().is_empty() {
-            "/"
-        } else {
-            uri.path()
+    uri.authority().map_or_else(
+        || AuditTarget::from_uri_parts(uri.path(), uri.query()),
+        |authority| {
+            let raw_target = uri.scheme_str().map_or_else(
+                || authority.as_str().to_owned(),
+                |scheme| format!("{scheme}://{authority}{}", uri.path()),
+            );
+            AuditTarget::from_uri_parts(&raw_target, uri.query())
         },
-        uri.query(),
     )
 }
 
@@ -1049,7 +1054,7 @@ mod tests {
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["decision"], "denied");
         assert_eq!(event["error_class"], "connect_unsupported");
-        assert_eq!(event["path"], "/");
+        assert_eq!(event["path"], "example.com:443");
     }
 
     #[tokio::test]
@@ -1067,6 +1072,7 @@ mod tests {
         let events = audit_events(&audit_log).await;
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["error_class"], "absolute_form_unsupported");
+        assert_eq!(event["path"], "http://example.com/v1/models");
     }
 
     #[tokio::test]
@@ -1669,12 +1675,22 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_target_defaults_empty_paths_to_root() {
-        let uri = Uri::from_static("example.com:443");
+    fn synthetic_target_preserves_absolute_form_targets() {
+        let uri = Uri::from_static("http://evil.example/steal?limit=1");
 
         let target = synthetic_target(&uri);
 
-        assert_eq!(target.path(), "/");
+        assert_eq!(target.path(), "http://evil.example/steal");
+        assert_eq!(target.query(), Some("limit=1"));
+    }
+
+    #[test]
+    fn synthetic_target_preserves_authority_form_targets() {
+        let uri = Uri::from_static("evil.example:443");
+
+        let target = synthetic_target(&uri);
+
+        assert_eq!(target.path(), "evil.example:443");
         assert_eq!(target.query(), None);
     }
 

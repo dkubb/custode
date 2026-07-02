@@ -431,6 +431,9 @@ nanosecond precision. `request_id` embeds a per-process run token and a
 monotonic sequence, so identities from different gateway runs appended to
 the same audit log do not collide.
 
+`path` is the accepted request path. For denied non-origin-form requests it
+records the full raw request target, including the requested authority, such
+as `http://evil.example/steal` or `evil.example:443`.
 `upstream_path` and `upstream_query` are null when no upstream request is
 attempted. When an upstream request is attempted, `upstream_query` equals the
 accepted incoming query. `status` is the response status returned to the
