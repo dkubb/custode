@@ -231,8 +231,11 @@ The gateway MUST reject:
 - absolute-form targets such as `https://api.openai.com/v1/responses`;
 - paths that do not start with `/`;
 - paths containing invalid percent-encoding;
-- methods absent from the configured method allowlist;
-- paths absent from the configured exact path or path-prefix allowlist.
+- paths containing literal or percent-encoded `.` or `..` segments, so the
+  allowlist decision and the upstream URL are computed from the same path;
+- method-path pairs absent from the configured operation allowlist, where each
+  allowed operation binds exactly one method to exactly one exact path or
+  segment-bounded path prefix.
 
 The gateway constructs the upstream URL by joining the configured provider
 origin with the accepted path and query. The incoming `Host` header does not
@@ -244,7 +247,9 @@ HTTP `CONNECT` are not part of the gateway protocol.
 
 ## 9. Gateway Configuration
 
-The initial gateway configuration comes from environment variables:
+The initial gateway configuration comes from environment variables. Every
+variable is also available as a `--flag` on the `serve` subcommand, and flags
+override environment values:
 
 ```text
 CUSTODE_BIND=0.0.0.0:8080
@@ -260,20 +265,22 @@ CUSTODE_MAX_CONCURRENT_REQUESTS=8
 CUSTODE_MAX_AUDIT_EVENT_BYTES=16384
 ```
 
+`CUSTODE_UPSTREAM_ORIGIN` and `CUSTODE_ALLOWED_OPERATIONS` have no defaults:
+leaving either unset or empty is a startup configuration error. The
+remaining variables default to the values shown above.
+
 Configuration parsing is fail-closed:
 
 - `CUSTODE_BIND` MUST parse as a socket address.
 - `CUSTODE_UPSTREAM_ORIGIN` MUST parse as an HTTP or HTTPS URL with scheme,
-  host, and optional port, and MUST NOT include path, query, or fragment.
+  host, and optional port, MUST NOT include path, query, fragment, or
+  userinfo credentials, and MUST NOT use a wildcard host.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at least one operation.
 - Each operation MUST have the form `METHOD:exact:/path` or
   `METHOD:prefix:/path`.
 - Every configured path or prefix MUST begin with `/`.
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
   `/v1/responses` and `/v1/responses/{id}`, but not `/v1/responses-other`.
-- Request paths MUST NOT contain literal or percent-encoded `.` or `..`
-  segments, because the allowlist and upstream URL builder MUST operate on the
-  same path representation.
 - Size, concurrency, and duration bounds MUST be positive.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
@@ -287,7 +294,8 @@ For each request, the gateway performs these steps in order:
 1. Parse and validate the method and origin-form target, rejecting literal or
    percent-encoded dot segments.
 1. Check the method-path operation allowlist.
-1. Copy end-to-end headers, excluding hop-by-hop headers and `Host`.
+1. Copy end-to-end headers, excluding hop-by-hop headers, the `Host` header,
+   and HTTP proxy credential headers such as `Proxy-Authorization`.
 1. Read the request body up to the configured maximum.
 1. Compute the request body byte count and digest.
 1. Build the upstream URL from the configured origin plus accepted path and
@@ -301,11 +309,18 @@ For each request, the gateway performs these steps in order:
 If a request is denied before upstream I/O, the gateway writes a denied audit
 event and returns an HTTP error without contacting the provider.
 
-If the audit event cannot be written before a response has started, the gateway
-returns an HTTP 500. If the audit event cannot be written after an upstream
-response has started, including after the upstream response body has been fully
-forwarded, the gateway exits the process with a non-zero status so the
-container fails closed.
+If a bound is exceeded before response streaming starts, the gateway writes a
+denied or failure audit event and returns a typed HTTP error. If a bound is
+exceeded after response streaming starts, the gateway terminates the stream,
+writes a `response_error` audit event, and fails closed.
+
+If a required audit event cannot be written before a response to the harness
+has started, the gateway returns an HTTP 500 without forwarding the request
+upstream, instead of an unaudited response.
+If a required audit event cannot be written after an upstream response has
+started, including after the upstream response body has been fully forwarded,
+the gateway exits the process with a non-zero status so the container fails
+closed and the request cannot complete as an unaudited success.
 
 ## 11. Audit Log
 
@@ -316,8 +331,8 @@ The event schema is:
 ```json
 {
   "version": 1,
-  "timestamp": "2026-07-01T00:00:00Z",
-  "request_id": "01J...",
+  "timestamp": "2026-07-01T00:00:00.000000000Z",
+  "request_id": "req-<run>-<sequence>",
   "decision": "allowed",
   "method": "POST",
   "path": "/v1/responses",
@@ -339,15 +354,32 @@ The event schema is:
 - `allowed`;
 - `denied`;
 - `upstream_error`;
-- `response_error`;
-- `configuration_error`.
+- `response_error`.
+
+Invalid startup configuration stops the gateway before it accepts traffic,
+so no configuration decision ever appears in the request audit stream.
+
+The example's field order is illustrative; events serialize a fixed field
+set without a guaranteed key order. `timestamp` is RFC 3339 UTC with
+nanosecond precision. `request_id` embeds a per-process run token and a
+monotonic sequence, so identities from different gateway runs appended to
+the same audit log do not collide.
+
+`upstream_path` and `upstream_query` are null when no upstream request is
+attempted. When an upstream request is attempted, `upstream_query` equals the
+accepted incoming query. `status` is the response status returned to the
+harness, and is null when no response status exists.
+`request_body_blake3` is null when the request has no body.
+`response_body_blake3` is null when the response has no body.
 
 An audit write failure cannot be represented as an `audit_error` event in the
 required audit log because the failure mode is the inability to write that log.
 The process fails closed instead.
 
-Authorization, cookie, and proxy authorization header values MUST NOT be
-logged.
+Request and response header values MUST NOT be logged. If header logging is
+added later, authorization and cookie-like headers, including `Authorization`,
+`Proxy-Authorization`, `Cookie`, `x-api-key`, and provider-specific credential
+headers, MUST be redacted by default.
 
 Request and response bodies are not logged by default. Body digests and byte
 counts are logged.
