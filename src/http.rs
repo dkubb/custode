@@ -169,7 +169,7 @@ async fn accept_allowed_target(
         return Ok(Err(status_response(StatusCode::METHOD_NOT_ALLOWED)));
     }
 
-    if uri.scheme().is_some() || uri.authority().is_some() {
+    if uri.authority().is_some() {
         let target = synthetic_target(uri);
         gateway
             .audit_denial(
