@@ -445,17 +445,31 @@ The `proxy` stage contains only:
 
 - `/custode-proxy`;
 - CA certificates required for upstream TLS;
-- required metadata files if numeric user execution needs them.
+- required metadata files if numeric user execution needs them;
+- pre-created, gateway-owned mount points for the audit log volume and the
+  `/tmp` tmpfs, which a read-only root filesystem cannot create at runtime.
 
 The `proxy` stage runs as `65532:65532`, exposes port `8080`, and has a
 Dockerfile healthcheck that calls the proxy binary's healthcheck subcommand.
+The subcommand opens a TCP connection to the gateway socket from inside the
+container and succeeds when the listener accepts. The probe adds no provider
+path, sends no HTTP request, never reaches the upstream, and produces no
+request audit event. The probe targets the default bind port, so an operator
+override of the `CUSTODE_BIND` port requires a matching healthcheck override.
+The harness can already reach the gateway socket by design, so the probe
+exposes no surface the internal network does not already have.
 
 The `harness` stage contains Debian `trixie-slim`, CA certificates, `bash`,
-`git`, `curl`, and minimal process utilities needed by common harnesses. It
+`git`, `curl`, and minimal process and network utilities (`procps`,
+`iproute2`) needed by common harnesses and by containment diagnostics.
+Containment does not depend on the absence of tools in the untrusted
+container; network isolation is enforced by the Compose topology. It
 does not install any specific harness by default.
 
-The `harness` stage accepts `HARNESS_NPM_PACKAGES` as a build argument. When it
-is non-empty, the stage installs Node.js and npm and installs the supplied npm
+The `harness` stage accepts `HARNESS_NPM_PACKAGES` as a build argument. The
+Compose file maps the operator environment variable
+`CUSTODE_HARNESS_NPM_PACKAGES` to this build argument. When the argument is
+non-empty, the stage installs Node.js and npm and installs the supplied npm
 packages into `/opt/harness/npm`. This lets the operator build a harness image
 with tools such as Claude Code without hard-coding a specific harness into the
 Dockerfile.
@@ -487,6 +501,11 @@ The `harness` service depends on the `proxy` service healthcheck.
 
 The `harness` service mounts the operator workspace at `/workspace`.
 
+The checked-in Compose file passes `CUSTODE_UPSTREAM_ORIGIN` and
+`CUSTODE_ALLOWED_OPERATIONS` through from the operator environment with empty
+defaults, so an unconfigured gateway fails closed at startup instead of
+running with an implicit provider surface.
+
 The checked-in `harness` service environment contains only explicit base URL
 defaults and one explicit harness environment file. The file defaults to
 `./secrets/env.example`; operators can set `CUSTODE_HARNESS_ENV_FILE` to point
@@ -500,9 +519,9 @@ not make shell commands inherit the values.
 The `harness` service MUST NOT import the host environment wholesale through
 bare variable interpolation or unscoped environment pass-through. Values in
 the harness environment file are readable by the untrusted harness. Provider
-credentials that the harness needs MAY be placed there. Docker credentials and
-broad host ambient secrets MUST NOT be placed there unless the operator
-intentionally wants the harness to read them.
+credentials that the harness needs MAY be placed there. Docker credentials,
+host API tokens, and broad host ambient secrets MUST NOT be placed there
+unless the operator intentionally wants the harness to read them.
 
 The `proxy` service mounts an audit log volume at `/var/log/custode`. It does
 not mount provider credentials.
@@ -611,39 +630,63 @@ initial architecture.
 
 ## 16. Testing Architecture
 
-Unit tests cover:
+Unit tests live inline in each source file's `tests` module and cover:
 
-- configuration parsing;
-- method allowlist decisions;
-- path exact-match and prefix-match decisions;
+- configuration parsing, including the fail-closed rejections: empty
+  allowlists, unknown operation kinds, invalid methods, wildcard hosts,
+  origin credentials, and zero bounds;
+- operation allowlist decisions, proving each decision binds one method to one
+  exact path or segment-bounded path prefix with no method and path
+  cross-product;
 - upstream URL construction;
 - hop-by-hop header stripping;
 - provider authorization header pass-through;
-- audit event serialization.
+- audit event serialization, including the closed decision set, the full
+  field set, and null semantics;
+- timestamp formatting at calendar boundary instants.
 
-Integration tests cover:
+Property-based tests live inline in each source file's `proptests` module
+and cover the parsers, constructors, and serializers with paired
+accept-every-valid and reject-every-invalid grammars: allowed operation
+parsing, upstream origin parsing, segment-bounded prefix matching, upstream
+URL joining, accepted-target validation (dot segments, percent encoding,
+origin form), audit event serialization option semantics, request identity
+formatting, and timestamp round-tripping.
+
+Integration tests in `tests/gateway.rs` run the compiled `custode-proxy`
+binary against a local recording upstream and cover:
 
 - allowed request reaches a local test upstream;
-- allowed request reaches only the configured upstream origin;
+- allowed request reaches only the configured upstream origin, with the
+  incoming `Host` header unable to redirect it;
 - denied method does not reach a local test upstream;
 - denied path does not reach a local test upstream;
 - harness-supplied authorization reaches the local test upstream for allowed
   requests;
-- every allowed and denied request produces an audit event;
-- audit log write failure fails closed.
+- every allowed and denied request produces an audit event with a unique
+  request identity;
+- an unopenable audit log fails closed at startup;
+- a missing allowlist fails closed at startup;
+- a wildcard upstream origin fails closed at startup.
 
-Container tests cover:
+Container tests are implemented by `scripts/container-test.sh`, run with
+`just docker-test`, and cover:
 
 - `docker compose build proxy harness`;
 - static linkage of `/custode-proxy` in the `proxy` image;
-- `docker compose up --detach --build`;
-- successful proxy healthcheck;
-- proxy healthcheck is container-local and does not expose a provider-shaped
-  gateway path to the harness;
-- harness cannot reach an external URL directly.
+- `docker compose up --detach --wait` with a healthy proxy;
+- the proxy publishes no ports to the host, so the gateway and its
+  healthcheck are reachable only from the Compose networks;
+- harness cannot reach an external URL directly;
+- harness reaches the gateway service on the internal network.
 
 The direct-egress denial test MUST run from inside the harness container. A
 passing proxy request is not proof that direct egress is denied.
+
+Mutation runs that gate a change are scoped to the touched files with unit
+tests only (`cargo mutants -f <file> -- --lib`); the `just mutants` recipe
+runs the full unscoped suite. Surviving mutants are either killed with new
+unit tests or documented as equivalent at the mutation site.
 
 ## 17. Initial Build Plan
 
