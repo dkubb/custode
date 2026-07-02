@@ -269,7 +269,10 @@ response completion failure. Invalid startup
 configuration MUST stop the gateway before it accepts traffic and does not need
 a request audit event. Local healthcheck requests answered by the gateway
 itself are not runtime request decisions and do not require request audit
-events.
+events. Requests the HTTP implementation rejects before they parse into a
+request are outside the runtime decision path; they MUST be refused without
+forwarding, and MAY be surfaced through connection-level diagnostics rather
+than request audit events.
 
 Each audit event MUST include:
 
