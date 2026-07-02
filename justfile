@@ -18,7 +18,7 @@ test:
     cargo test --workspace --all-features
 
 docs:
-    mado check docs/IDEA.md docs/ARCHITECTURE.md
+    mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
 
 deny:
     cargo deny check --config .cargo/deny.toml

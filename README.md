@@ -1,0 +1,193 @@
+# Custode
+
+Custode runs an untrusted coding harness behind a small Rust provider proxy.
+
+The harness container has only the internal Docker network. It can read and
+write `./workspace` and can reach only `http://proxy:8080`. The proxy
+container has the provider credential, an egress network, a method/path
+allowlist, and an NDJSON audit log.
+
+## Security Model
+
+Custode is meant to make hidden outbound traffic easier to block and inspect.
+It assumes Docker, the host kernel, the provider, and the configured upstream
+TLS endpoint are trusted. It does not claim to survive a Docker/container
+escape.
+
+Keep provider secrets out of the harness. If a harness insists on a syntactic
+API key, use a non-secret placeholder and let the proxy inject the real
+provider credential from the Docker secret.
+
+## Requirements
+
+- Docker with Compose v2.
+- A provider API token in `secrets/provider_token`.
+- Rust and Cargo for local development gates.
+- `cargo-deny`, `cargo-mutants`, and `mado` for the optional full gate set.
+
+## Create Provider Secret
+
+Create the local secret and workspace directories:
+
+```sh
+mkdir -p secrets workspace
+${EDITOR:-vi} secrets/provider_token
+chmod 600 secrets/provider_token
+```
+
+The token file may contain one trailing newline. `secrets/provider_token` is
+ignored by Git.
+
+## Build
+
+Build both images with the local provider token:
+
+```sh
+export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+docker compose build proxy harness
+```
+
+The proxy image is a `scratch` runtime image containing only the statically
+linked Rust proxy. The harness image is intentionally generic; choose the
+harness package and command with environment variables.
+
+## Claude Code Harness
+
+Claude Code can be installed into the harness image through npm. Anthropic's
+official docs also describe native, Homebrew, package-manager, and npm
+install paths; this Dockerfile uses the npm path because the harness image
+already supports npm package injection.
+
+First build and smoke-test the CLI:
+
+```sh
+export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
+docker compose build harness
+
+export CUSTODE_HARNESS_COMMAND='claude --version'
+docker compose run --rm harness
+```
+
+Then run Claude through the proxy:
+
+```sh
+anthropic_ops='POST:prefix:/v1/messages'
+anthropic_ops="${anthropic_ops},GET:prefix:/v1/models"
+
+export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com
+export CUSTODE_ALLOWED_OPERATIONS="${anthropic_ops}"
+export CUSTODE_AUTHORIZATION_BEARER_FILE=
+export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token
+export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
+
+claude_cmd='env ANTHROPIC_API_KEY=sk-ant-api03-placeholder'
+claude_cmd="${claude_cmd} ANTHROPIC_BASE_URL=http://proxy:8080"
+claude_cmd="${claude_cmd} claude --bare -p 'what is 2+2?'"
+export CUSTODE_HARNESS_COMMAND="${claude_cmd}"
+
+docker compose up --abort-on-container-exit --exit-code-from harness
+```
+
+The placeholder key is not the provider credential. The proxy strips harness
+credentials and injects the Docker secret as `x-api-key` upstream.
+
+## Codex Harness
+
+Codex can also be installed into the harness image through npm. OpenAI's
+official docs describe standalone, npm, and Homebrew installs; this Dockerfile
+uses the npm path for the same reason as Claude Code.
+
+Build and smoke-test the CLI:
+
+```sh
+export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
+docker compose build harness
+
+export CUSTODE_HARNESS_COMMAND='codex --version'
+docker compose run --rm harness
+```
+
+For model calls, route Codex to the proxy and keep the real API key out of the
+harness. The compose file exports `OPENAI_BASE_URL=http://proxy:8080` for
+clients that honor it. Current Codex CLI docs also support one-off config
+overrides with `-c`, and the OpenAI provider base URL key is
+`openai_base_url`.
+
+A non-interactive command should use the proxy URL as the OpenAI API base URL:
+
+```sh
+openai_ops='GET:exact:/v1/models,POST:prefix:/v1/responses'
+openai_ops="${openai_ops},POST:prefix:/v1/chat/completions"
+
+export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_UPSTREAM_ORIGIN=https://api.openai.com
+export CUSTODE_ALLOWED_OPERATIONS="${openai_ops}"
+export CUSTODE_AUTHORIZATION_BEARER_FILE=/run/secrets/provider_token
+export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=
+export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
+
+codex_cmd='env OPENAI_API_KEY=sk-placeholder'
+codex_cmd="${codex_cmd} codex exec"
+codex_cmd="${codex_cmd} --dangerously-bypass-approvals-and-sandbox"
+codex_cmd="${codex_cmd} --skip-git-repo-check --ephemeral"
+codex_cmd="${codex_cmd} -c 'openai_base_url=\"http://proxy:8080/v1\"'"
+codex_cmd="${codex_cmd} --cd /workspace 'what is 2+2?'"
+export CUSTODE_HARNESS_COMMAND="${codex_cmd}"
+
+docker compose up --abort-on-container-exit --exit-code-from harness
+```
+
+The `--dangerously-bypass-approvals-and-sandbox` flag belongs only inside this
+externally sandboxed harness container.
+
+## Audit Log
+
+The proxy writes one NDJSON audit event per handled request:
+
+```sh
+docker run --rm \
+  -v custode_proxy-logs:/logs \
+  custode-harness:local \
+  bash -c 'tail -n 20 /logs/proxy.ndjson'
+```
+
+Remove stopped containers while preserving audit logs:
+
+```sh
+docker compose down --remove-orphans
+```
+
+Remove containers and the audit-log volume:
+
+```sh
+docker compose down --volumes
+```
+
+## Local Gates
+
+The main development gates are:
+
+```sh
+cargo +nightly-2026-07-01 fmt --all --check
+cargo +nightly-2026-07-01 clippy --workspace --all-targets --all-features
+cargo +nightly-2026-07-01 test --workspace --all-features
+mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
+docker compose build proxy harness
+cargo mutants --list
+```
+
+`just docs` runs the Markdown gate. `just docker-build` runs the image build.
+
+## Design Documents
+
+- [IDEA.md](docs/IDEA.md)
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md)
+
+## Upstream Harness Docs
+
+- [Claude Code setup](https://code.claude.com/docs/en/setup)
+- [Codex CLI](https://developers.openai.com/codex/cli)
+- [Codex configuration reference](https://developers.openai.com/codex/config-reference)
