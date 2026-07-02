@@ -704,7 +704,20 @@ URL joining, accepted-target validation (dot segments, percent encoding,
 origin form), header filtering (hop-by-hop stripping, byte limits,
 connection tokens), upstream request construction from allowed targets
 (`UpstreamRequest::from_target`), audit event serialization option
-semantics, request identity formatting, and timestamp round-tripping.
+semantics, request identity formatting, timestamp round-tripping, and
+generated gateway scenarios.
+
+Simulation tests are test-only and live behind `#[cfg(test)]`. They run the
+real Axum handler on a paused current-thread Tokio runtime, with the
+production adapters replaced by deterministic ports from `src/sim.rs`:
+`FixedClock`, `MemoryAuditSink`, `ScriptedUpstreamClient`, and generated
+`Scenario` values. The current scenario generator covers allowed `GET`
+`/v1/models` requests with bounded bodies, representative harness headers,
+provider success, and deterministic upstream timeout. The oracle asserts the
+exact response status, response body, recorded upstream request, forwarded
+header set, and 16-field audit event. Simulation tests do not replace the
+real hyper parse-boundary tests, real Reqwest socket-classification tests, or
+container network-isolation tests.
 
 Integration tests in `tests/gateway.rs` run the compiled `custode-proxy`
 binary against a local recording upstream and cover:
