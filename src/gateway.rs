@@ -64,10 +64,6 @@ pub(crate) struct ResponseAuditInput {
     pub status: Option<u16>,
     /// Accepted target.
     pub target: AcceptedTarget,
-    /// Upstream path.
-    pub upstream_path: String,
-    /// Upstream query.
-    pub upstream_query: Option<String>,
 }
 
 impl Gateway {
@@ -116,6 +112,8 @@ impl Gateway {
         &self,
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
+        let upstream_path = Some(input.target.path().to_owned());
+        let upstream_query = input.target.query().map(str::to_owned);
         let event = AuditEvent::new_at(
             AuditEventInput {
                 decision: input.decision,
@@ -129,8 +127,8 @@ impl Gateway {
                 status: input.status,
                 target: input.target.into(),
                 upstream_origin: self.config.upstream_origin().as_str().to_owned(),
-                upstream_path: Some(input.upstream_path),
-                upstream_query: input.upstream_query,
+                upstream_path,
+                upstream_query,
             },
             self.clock.now(),
         );
@@ -320,8 +318,6 @@ mod tests {
             status: Some(200),
             target: AcceptedTarget::new("/v1/models", Some("limit=1"))
                 .expect("target should parse"),
-            upstream_path: "/v1/models".to_owned(),
-            upstream_query: Some("limit=1".to_owned()),
         };
 
         gateway

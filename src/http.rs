@@ -84,10 +84,6 @@ struct ResponseAuditContext {
     status: u16,
     /// Accepted target.
     target: AcceptedTarget,
-    /// Upstream request path.
-    upstream_path: String,
-    /// Upstream request query.
-    upstream_query: Option<String>,
 }
 
 impl ResponseAuditContext {
@@ -106,8 +102,6 @@ impl ResponseAuditContext {
             response_account: self.response_account,
             status: Some(self.status),
             target: self.target,
-            upstream_path: self.upstream_path,
-            upstream_query: self.upstream_query,
         };
         self.gateway.audit_response(input).await
     }
@@ -324,8 +318,6 @@ async fn forward_request(
 ) -> Result<Response<Body>, GatewayError> {
     let method = target.method().clone();
     let accepted_target = target.target().clone();
-    let upstream_path = accepted_target.path().to_owned();
-    let upstream_query = accepted_target.query().map(str::to_owned);
     let upstream_request = UpstreamRequest::from_target(
         gateway.config().upstream_origin(),
         &target,
@@ -345,8 +337,6 @@ async fn forward_request(
                 response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
                 status: Some(status.as_u16()),
                 target: accepted_target,
-                upstream_path,
-                upstream_query,
             };
             gateway.audit_response(input).await?;
             return Ok(status_response(status));
@@ -370,8 +360,6 @@ async fn forward_request(
                 // discarded upstream status.
                 status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                 target: accepted_target,
-                upstream_path,
-                upstream_query,
             };
             gateway.audit_response(input).await?;
             return Ok(status_response(StatusCode::BAD_GATEWAY));
@@ -387,8 +375,6 @@ async fn forward_request(
         response_account,
         status: status.as_u16(),
         target: accepted_target,
-        upstream_path,
-        upstream_query,
     };
     let stream = response_stream(context, upstream_response);
 
@@ -1770,8 +1756,6 @@ mod tests {
             response_account,
             status: 200,
             target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
-            upstream_path: "/v1/models".to_owned(),
-            upstream_query: None,
         };
 
         let result = context
