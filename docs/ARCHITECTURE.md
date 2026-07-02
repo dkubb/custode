@@ -375,6 +375,11 @@ For each request, the gateway performs these steps in order:
 If a request is denied before upstream I/O, the gateway writes a denied audit
 event and returns an HTTP error without contacting the provider.
 
+Requests that hyper cannot parse, such as malformed request lines or
+scheme-without-authority request targets, are rejected with an HTTP 400
+before the handler runs and produce no audit event. Every request that
+reaches the gateway's decision path is audited.
+
 If a bound is exceeded before response streaming starts, the gateway writes a
 denied or failure audit event and returns a typed HTTP error. If a bound is
 exceeded after response streaming starts, the gateway terminates the stream,
