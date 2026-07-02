@@ -192,6 +192,7 @@ impl From<AcceptedTarget> for AuditTarget {
 
 impl AuditEvent {
     /// Creates an audit event for a request decision.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new(input: AuditEventInput) -> Self {
         Self::new_at(input, AuditTimestamp::now())

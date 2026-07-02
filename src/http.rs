@@ -1,8 +1,10 @@
 //! Axum request and response wiring.
 
-use crate::adapters::{ReqwestUpstreamClient, UpstreamClientBuildError};
+use crate::adapters::{
+    ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
+};
 use crate::allowlist::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
-use crate::audit::{AuditDecision, AuditTarget, RequestId};
+use crate::audit::{AuditDecision, AuditTarget, AuditWriter, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
@@ -505,7 +507,9 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
     let max_concurrent_requests = config.max_concurrent_requests().get();
     let client =
         ReqwestUpstreamClient::new(config.request_timeout()).map_err(ServeError::Client)?;
-    let gateway = Gateway::new(config).await.map_err(ServeError::Gateway)?;
+    let gateway = production_gateway(config)
+        .await
+        .map_err(ServeError::Gateway)?;
     let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
     let state = AppState {
         client: Arc::new(client),
@@ -519,6 +523,21 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
         .map_err(ServeError::ServerBind)?;
 
     run_until_server_stops(axum::serve(listener, app), fatal_receiver).await
+}
+
+/// Builds a gateway from production adapters.
+///
+/// # Errors
+///
+/// Returns an error when the audit log cannot be opened.
+async fn production_gateway(config: GatewayConfig) -> Result<Gateway, GatewayError> {
+    let audit = AuditWriter::open(&config).await?;
+    Ok(Gateway::from_ports(
+        config,
+        audit,
+        SystemClock,
+        SequentialRequestIds::production(),
+    ))
 }
 
 /// Runs a server until it stops or a fatal stream task error arrives.
@@ -611,7 +630,7 @@ const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppState, ResponseAuditContext, ServeError, proxy, report_fatal_error,
+        AppState, ResponseAuditContext, ServeError, production_gateway, proxy, report_fatal_error,
         request_body_error_status, request_header_error_class, request_header_error_status,
         response_header_error_class, run_until_server_stops, send_stream_error, serve,
         synthetic_target, upstream_error_class, upstream_error_status,
@@ -621,7 +640,7 @@ mod tests {
     use crate::audit::{AuditDecision, AuditError, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
-    use crate::gateway::{Gateway, GatewayError};
+    use crate::gateway::GatewayError;
     use crate::headers::HeaderError;
     use crate::ports::{UpstreamError, UpstreamErrorKind};
     use ::http::{Method, Uri};
@@ -719,7 +738,7 @@ mod tests {
     ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
         let client = ReqwestUpstreamClient::new(config.request_timeout())
             .expect("upstream client should build");
-        let gateway = Gateway::new(config)
+        let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
         let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
@@ -1507,7 +1526,7 @@ mod tests {
             directory.path().join("audit.ndjson"),
             NonZeroUsize::new(1).expect("limit should be non-zero"),
         );
-        let gateway = Gateway::new(config)
+        let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
         let request_body = AccountedBody::read_request(

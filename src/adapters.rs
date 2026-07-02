@@ -1,12 +1,30 @@
 //! Production runtime adapters.
 
+use crate::audit::{AuditError, AuditEvent, AuditTimestamp, AuditWriter, RequestId};
 use crate::ports::{
-    BoxFuture, UpstreamBodyError, UpstreamClient, UpstreamError, UpstreamErrorKind,
-    UpstreamRequest, UpstreamResponse,
+    AuditSink, BoxFuture, Clock, RequestIdSource, UpstreamBodyError, UpstreamClient, UpstreamError,
+    UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
 use core::time::Duration;
 use futures_util::StreamExt as _;
+use std::process;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
+
+/// Production audit timestamp source.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SystemClock;
+
+/// Production monotonic request identity source.
+#[derive(Debug)]
+pub(crate) struct SequentialRequestIds {
+    /// Next request sequence.
+    next: AtomicU64,
+    /// Per-process run token embedded in request identities.
+    run_token: Arc<str>,
+}
 
 /// Production reqwest-backed upstream client.
 #[derive(Clone, Debug)]
@@ -32,6 +50,21 @@ trait ReqwestErrorView {
     fn is_timeout(&self) -> bool;
 }
 
+impl AuditSink for AuditWriter {
+    fn append_event<'future>(
+        &'future self,
+        event: &'future AuditEvent,
+    ) -> BoxFuture<'future, Result<(), AuditError>> {
+        Box::pin(Self::write_event(self, event))
+    }
+}
+
+impl Clock for SystemClock {
+    fn now(&self) -> AuditTimestamp {
+        AuditTimestamp::now()
+    }
+}
+
 impl ReqwestUpstreamClient {
     /// Builds a reqwest-backed upstream client.
     ///
@@ -44,6 +77,37 @@ impl ReqwestUpstreamClient {
             .build()
             .map_err(upstream_client_build_error)?;
         Ok(Self { client })
+    }
+}
+
+impl RequestIdSource for SequentialRequestIds {
+    fn next_request_id(&self) -> RequestId {
+        let sequence = self.next.fetch_add(1, Ordering::Relaxed);
+        RequestId::from_parts(&self.run_token, sequence)
+    }
+}
+
+impl SequentialRequestIds {
+    /// Creates a sequence source that starts at request 1 with a run token.
+    #[must_use]
+    pub(crate) fn new(run_token: impl Into<Arc<str>>) -> Self {
+        Self {
+            next: AtomicU64::new(1),
+            run_token: run_token.into(),
+        }
+    }
+
+    /// Creates a production request identity source.
+    #[must_use]
+    pub(crate) fn production() -> Self {
+        let run_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should not be before the Unix epoch")
+            .as_nanos();
+        // The process id disambiguates runs whose wall clocks collide, such
+        // as restored snapshots or stepped clocks.
+        let run_token = format!("{:x}-{run_nanos:x}", process::id());
+        Self::new(run_token)
     }
 }
 
@@ -119,13 +183,13 @@ fn upstream_error_kind_from_reqwest(error: &impl ReqwestErrorView) -> UpstreamEr
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        ReqwestErrorView, ReqwestUpstreamClient, upstream_client_build_error,
+        ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_client_build_error,
         upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::AccountedBody;
     use crate::config::UpstreamOrigin;
-    use crate::ports::{UpstreamClient as _, UpstreamErrorKind, UpstreamRequest};
+    use crate::ports::{Clock as _, UpstreamClient as _, UpstreamErrorKind, UpstreamRequest};
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::error::Error as _;
@@ -234,6 +298,14 @@ mod tests {
         let kind = upstream_error_kind_from_reqwest(&error);
 
         assert_eq!(kind, UpstreamErrorKind::Request);
+    }
+
+    #[test]
+    fn system_clock_returns_parseable_timestamps() {
+        let timestamp = SystemClock.now();
+
+        humantime::parse_rfc3339(timestamp.as_str())
+            .expect("system clock timestamp should parse as RFC 3339");
     }
 
     #[tokio::test]

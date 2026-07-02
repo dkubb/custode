@@ -2,29 +2,27 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
-    AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditWriter, RequestId,
+    AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
-use crate::config::{ConfigError, GatewayConfig};
+use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
+use crate::ports::{AuditSink, Clock, RequestIdSource};
 use ::http::{Error as HttpError, Method};
-use core::sync::atomic::{AtomicU64, Ordering};
-use std::process;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Shared gateway state.
 #[derive(Clone, Debug)]
 pub(crate) struct Gateway {
     /// Audit log writer.
-    audit: AuditWriter,
+    audit: Arc<dyn AuditSink>,
+    /// Audit timestamp source.
+    clock: Arc<dyn Clock>,
     /// Parsed gateway configuration.
     config: Arc<GatewayConfig>,
-    /// Monotonic request sequence.
-    request_sequence: Arc<AtomicU64>,
-    /// Per-process run token embedded in request identities.
-    run_token: Arc<str>,
+    /// Request identity source.
+    request_ids: Arc<dyn RequestIdSource>,
 }
 
 /// Gateway runtime error.
@@ -37,10 +35,6 @@ pub(crate) enum GatewayError {
     /// Body accounting failed.
     #[error("{0}")]
     Body(#[from] BodyError),
-
-    /// Upstream URL construction failed.
-    #[error("{0}")]
-    Config(#[from] ConfigError),
 
     /// Header filtering failed.
     #[error("{0}")]
@@ -91,22 +85,25 @@ impl Gateway {
         error_class: &'static str,
         status: u16,
     ) -> Result<(), GatewayError> {
-        let event = AuditEvent::new(AuditEventInput {
-            decision: AuditDecision::Denied,
-            error_class: Some(error_class.to_owned()),
-            method: method.to_string(),
-            request_body_blake3: request_body.and_then(|body| body.digest().map(str::to_owned)),
-            request_bytes: request_body.map_or(0, AccountedBody::byte_count),
-            request_id,
-            response_body_blake3: None,
-            response_bytes: 0,
-            status: Some(status),
-            target,
-            upstream_origin: self.config.upstream_origin().as_str().to_owned(),
-            upstream_path: None,
-            upstream_query: None,
-        });
-        self.audit.write_event(&event).await?;
+        let event = AuditEvent::new_at(
+            AuditEventInput {
+                decision: AuditDecision::Denied,
+                error_class: Some(error_class.to_owned()),
+                method: method.to_string(),
+                request_body_blake3: request_body.and_then(|body| body.digest().map(str::to_owned)),
+                request_bytes: request_body.map_or(0, AccountedBody::byte_count),
+                request_id,
+                response_body_blake3: None,
+                response_bytes: 0,
+                status: Some(status),
+                target,
+                upstream_origin: self.config.upstream_origin().as_str().to_owned(),
+                upstream_path: None,
+                upstream_query: None,
+            },
+            self.clock.now(),
+        );
+        self.audit.append_event(&event).await?;
         Ok(())
     }
 
@@ -119,22 +116,25 @@ impl Gateway {
         &self,
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
-        let event = AuditEvent::new(AuditEventInput {
-            decision: input.decision,
-            error_class: input.error_class,
-            method: input.method,
-            request_body_blake3: input.request_body.digest().map(str::to_owned),
-            request_bytes: input.request_body.byte_count(),
-            request_id: input.request_id,
-            response_body_blake3: input.response_account.finalize_digest(),
-            response_bytes: input.response_account.byte_count(),
-            status: input.status,
-            target: input.target.into(),
-            upstream_origin: self.config.upstream_origin().as_str().to_owned(),
-            upstream_path: Some(input.upstream_path),
-            upstream_query: input.upstream_query,
-        });
-        self.audit.write_event(&event).await?;
+        let event = AuditEvent::new_at(
+            AuditEventInput {
+                decision: input.decision,
+                error_class: input.error_class,
+                method: input.method,
+                request_body_blake3: input.request_body.digest().map(str::to_owned),
+                request_bytes: input.request_body.byte_count(),
+                request_id: input.request_id,
+                response_body_blake3: input.response_account.finalize_digest(),
+                response_bytes: input.response_account.byte_count(),
+                status: input.status,
+                target: input.target.into(),
+                upstream_origin: self.config.upstream_origin().as_str().to_owned(),
+                upstream_path: Some(input.upstream_path),
+                upstream_query: input.upstream_query,
+            },
+            self.clock.now(),
+        );
+        self.audit.append_event(&event).await?;
         Ok(())
     }
 
@@ -144,26 +144,20 @@ impl Gateway {
         &self.config
     }
 
-    /// Builds a gateway from parsed configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the audit log cannot be opened.
-    pub(crate) async fn new(config: GatewayConfig) -> Result<Self, GatewayError> {
-        let audit = AuditWriter::open(&config).await?;
-        let run_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should not be before the Unix epoch")
-            .as_nanos();
-        // The process id disambiguates runs whose wall clocks collide, such
-        // as restored snapshots or stepped clocks.
-        let run_token = format!("{:x}-{run_nanos:x}", process::id());
-        Ok(Self {
-            audit,
+    /// Builds a gateway from parsed configuration and explicit runtime ports.
+    #[must_use]
+    pub(crate) fn from_ports(
+        config: GatewayConfig,
+        audit: impl AuditSink + 'static,
+        clock: impl Clock + 'static,
+        request_ids: impl RequestIdSource + 'static,
+    ) -> Self {
+        Self {
+            audit: Arc::new(audit),
+            clock: Arc::new(clock),
             config: Arc::new(config),
-            request_sequence: Arc::new(AtomicU64::new(1)),
-            run_token: Arc::from(run_token),
-        })
+            request_ids: Arc::new(request_ids),
+        }
     }
 
     /// Allocates a request identity unique within the audit log.
@@ -172,8 +166,7 @@ impl Gateway {
     /// different gateway runs appended to the same audit log do not collide.
     #[must_use]
     pub(crate) fn next_request_id(&self) -> RequestId {
-        let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
-        RequestId::from_parts(&self.run_token, sequence)
+        self.request_ids.next_request_id()
     }
 }
 
@@ -181,8 +174,9 @@ impl Gateway {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput};
+    use crate::adapters::{SequentialRequestIds, SystemClock};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditDecision, AuditError, AuditTarget, RequestId};
+    use crate::audit::{AuditDecision, AuditError, AuditTarget, AuditWriter, RequestId};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
     use ::http::Method;
@@ -199,9 +193,20 @@ mod tests {
             directory.join("audit.ndjson"),
             "https://api.openai.com",
         );
-        Gateway::new(config)
+        production_gateway(config)
             .await
             .expect("gateway should initialize")
+    }
+
+    /// Builds a gateway from production adapters.
+    async fn production_gateway(config: GatewayConfig) -> Result<Gateway, GatewayError> {
+        let audit = AuditWriter::open(&config).await?;
+        Ok(Gateway::from_ports(
+            config,
+            audit,
+            SystemClock,
+            SequentialRequestIds::production(),
+        ))
     }
 
     /// Reads the single audit event written to the supplied directory.
@@ -347,14 +352,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn new_fails_when_audit_log_is_a_directory() {
+    async fn production_gateway_fails_when_audit_log_is_a_directory() {
         let directory = tempdir().expect("temporary directory should be created");
         let config = GatewayConfig::for_runtime_test(
             directory.path().to_path_buf(),
             "https://api.openai.com",
         );
 
-        let result = Gateway::new(config).await;
+        let result = production_gateway(config).await;
 
         assert!(
             matches!(result, Err(GatewayError::Audit(AuditError::Open { .. }))),

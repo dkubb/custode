@@ -1,6 +1,7 @@
 //! Runtime port traits and values.
 
 use crate::allowlist::AcceptedTarget;
+use crate::audit::{AuditError, AuditEvent, AuditTimestamp, RequestId};
 use crate::body::AccountedBody;
 use crate::config::UpstreamOrigin;
 use axum::body::Bytes;
@@ -17,6 +18,27 @@ pub(crate) type BoxFuture<'future, T> = Pin<Box<dyn Future<Output = T> + Send + 
 
 /// Streaming upstream response body.
 pub(crate) type UpstreamBody = BoxStream<'static, Result<Bytes, UpstreamBodyError>>;
+
+/// Port that supplies audit timestamps.
+pub(crate) trait Clock: fmt::Debug + Send + Sync {
+    /// Returns the current audit timestamp.
+    fn now(&self) -> AuditTimestamp;
+}
+
+/// Port that writes audit events.
+pub(crate) trait AuditSink: fmt::Debug + Send + Sync {
+    /// Writes one required audit event.
+    fn append_event<'future>(
+        &'future self,
+        event: &'future AuditEvent,
+    ) -> BoxFuture<'future, Result<(), AuditError>>;
+}
+
+/// Port that allocates request identities.
+pub(crate) trait RequestIdSource: fmt::Debug + Send + Sync {
+    /// Allocates the next request identity.
+    fn next_request_id(&self) -> RequestId;
+}
 
 /// Port that sends accepted requests to the configured provider.
 pub(crate) trait UpstreamClient: fmt::Debug + Send + Sync {
