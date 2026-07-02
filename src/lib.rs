@@ -20,6 +20,7 @@ pub mod gateway;
 pub mod headers;
 pub mod health;
 pub mod http;
+pub mod ports;
 pub mod process;
 
 pub use process::Cli;

@@ -6,6 +6,7 @@ use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
 use crate::headers::{HeaderError, forward_request_headers, forward_response_headers};
+use crate::ports::UpstreamRequest;
 use ::http::{HeaderMap, Method, Uri};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -321,18 +322,23 @@ async fn forward_request(
     request_headers: HeaderMap,
     request_body: AccountedBody,
 ) -> Result<Response<Body>, GatewayError> {
-    let upstream = gateway
-        .config()
-        .upstream_origin()
-        .join_path_query(target.path(), target.query());
     let upstream_path = target.path().to_owned();
     let upstream_query = target.query().map(str::to_owned);
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
+    let upstream_request = UpstreamRequest::from_target(
+        method.clone(),
+        gateway.config().upstream_origin(),
+        &target,
+        request_headers,
+        &request_body,
+    );
+    let (upstream_method, upstream_url, upstream_headers, upstream_body) =
+        upstream_request.into_parts();
+    let reqwest_method = reqwest::Method::from_bytes(upstream_method.as_str().as_bytes())
         .expect("http and reqwest method parsing should agree");
     let upstream_response = match client
-        .request(reqwest_method, upstream)
-        .headers(request_headers)
-        .body(request_body.bytes().to_vec())
+        .request(reqwest_method, upstream_url)
+        .headers(upstream_headers)
+        .body(upstream_body)
         .send()
         .await
     {
