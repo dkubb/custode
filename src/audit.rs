@@ -616,3 +616,152 @@ mod tests {
         assert_eq!(contents, "");
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod proptests {
+    use super::{AuditDecision, AuditEvent, AuditEventInput, AuditTarget, RequestId};
+    use crate::allowlist::AcceptedTarget;
+    use core::time::Duration;
+    use proptest::option;
+    use proptest::prelude::*;
+    use std::time::UNIX_EPOCH;
+
+    /// Every member of the closed decision set.
+    fn decision_any() -> impl Strategy<Value = AuditDecision> {
+        prop_oneof![
+            Just(AuditDecision::Allowed),
+            Just(AuditDecision::Denied),
+            Just(AuditDecision::ResponseError),
+            Just(AuditDecision::UpstreamError),
+        ]
+    }
+
+    /// BLAKE3 hex digest shaped strings.
+    fn hex_digest() -> impl Strategy<Value = String> {
+        "[0-9a-f]{64}"
+    }
+
+    /// Raw request paths: origin-form spellings biased with the empty path
+    /// that `from_uri_parts` replaces with `/`.
+    fn raw_path() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => "/[A-Za-z0-9/_-]{0,20}",
+            1 => Just(String::new()),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn event_serialization_preserves_option_semantics(
+            decision in decision_any(),
+            method in "[A-Z]{3,8}",
+            path in raw_path(),
+            query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
+            upstream in option::of((
+                "/[A-Za-z0-9/_-]{0,20}",
+                option::of("[a-z]{1,5}=[a-z]{1,5}"),
+            )),
+            status in option::of(any::<u16>()),
+            request_bytes in any::<u64>(),
+            response_bytes in any::<u64>(),
+            request_digest in option::of(hex_digest()),
+            response_digest in option::of(hex_digest()),
+            error_class in option::of("[a-z_]{1,20}"),
+            run_token in "[0-9a-f]{1,16}",
+            sequence in any::<u64>(),
+        ) {
+            let (upstream_path, upstream_query) = match upstream {
+                Some((upstream_path, upstream_query)) => (Some(upstream_path), upstream_query),
+                None => (None, None),
+            };
+            let input = AuditEventInput {
+                request_id: RequestId::from_parts(&run_token, sequence),
+                decision,
+                method,
+                target: AuditTarget::from_uri_parts(&path, query.as_deref()),
+                upstream_origin: "https://api.openai.com".to_owned(),
+                upstream_path: upstream_path.clone(),
+                upstream_query: upstream_query.clone(),
+                status,
+                request_bytes,
+                response_bytes,
+                request_body_blake3: request_digest.clone(),
+                response_body_blake3: response_digest.clone(),
+                error_class: error_class.clone(),
+            };
+
+            let value = serde_json::to_value(AuditEvent::new(input))
+                .expect("event should serialize");
+            let object = value.as_object().expect("event should be a JSON object");
+
+            prop_assert_eq!(object.len(), 16);
+            let decision_text = object["decision"]
+                .as_str()
+                .expect("decision should be a string");
+            prop_assert!(
+                ["allowed", "denied", "response_error", "upstream_error"]
+                    .contains(&decision_text)
+            );
+            let expected_path = if path.is_empty() { "/" } else { path.as_str() };
+            prop_assert_eq!(object["path"].as_str(), Some(expected_path));
+            prop_assert_eq!(object["upstream_path"].is_null(), upstream_path.is_none());
+            prop_assert_eq!(object["upstream_query"].is_null(), upstream_query.is_none());
+            prop_assert_eq!(object["query"].is_null(), query.is_none());
+            prop_assert_eq!(object["status"].is_null(), status.is_none());
+            prop_assert_eq!(
+                object["request_body_blake3"].is_null(),
+                request_digest.is_none()
+            );
+            prop_assert_eq!(
+                object["response_body_blake3"].is_null(),
+                response_digest.is_none()
+            );
+            prop_assert_eq!(object["error_class"].is_null(), error_class.is_none());
+            prop_assert_eq!(object["request_bytes"].as_u64(), Some(request_bytes));
+            prop_assert_eq!(object["response_bytes"].as_u64(), Some(response_bytes));
+        }
+
+        #[test]
+        fn accepted_targets_convert_without_loss(
+            path in "/[A-Za-z0-9_-]{0,20}",
+            query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
+        ) {
+            let accepted = AcceptedTarget::new(&path, query.as_deref())
+                .expect("generated paths are valid origin-form targets");
+
+            let target = AuditTarget::from(accepted);
+
+            prop_assert_eq!(target.path(), path.as_str());
+            prop_assert_eq!(target.query(), query.as_deref());
+        }
+
+        #[test]
+        fn request_id_embeds_run_token_and_padded_sequence(
+            run_token in "[0-9a-f]{1,16}",
+            sequence in any::<u64>(),
+        ) {
+            let value = serde_json::to_value(RequestId::from_parts(&run_token, sequence))
+                .expect("request id should serialize");
+
+            let expected = format!("req-{run_token}-{sequence:016x}");
+            prop_assert_eq!(value.as_str(), Some(expected.as_str()));
+        }
+
+        #[test]
+        fn timestamp_formatting_round_trips(
+            seconds in 0_u64..=253_402_300_799,
+            nanoseconds in 0_u32..1_000_000_000,
+        ) {
+            let instant = UNIX_EPOCH
+                .checked_add(Duration::new(seconds, nanoseconds))
+                .expect("generated instants fit in SystemTime");
+
+            let formatted = humantime::format_rfc3339_nanos(instant).to_string();
+            let parsed = humantime::parse_rfc3339(&formatted)
+                .expect("formatted timestamps should parse");
+
+            prop_assert_eq!(parsed, instant);
+        }
+    }
+}

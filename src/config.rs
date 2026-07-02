@@ -823,3 +823,415 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod proptests {
+    use super::{
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,
+        parse_allowed_operations, tests::serve_args,
+    };
+    use ::http::Method;
+    use core::iter;
+    use core::net::SocketAddr;
+    use core::time::Duration;
+    use proptest::prelude::*;
+    use proptest::{collection, option};
+    use std::path::PathBuf;
+
+    /// HTTP token methods drawn from common and custom token spellings,
+    /// including methods that collide with the kind tokens.
+    fn method_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => prop_oneof![
+                Just("GET".to_owned()),
+                Just("POST".to_owned()),
+                Just("PUT".to_owned()),
+                Just("DELETE".to_owned()),
+                Just("PATCH".to_owned()),
+            ],
+            1 => "[A-Z]{3,10}",
+            1 => prop_oneof![
+                Just("exact".to_owned()),
+                Just("prefix".to_owned()),
+                Just("EXACT".to_owned()),
+            ],
+        ]
+    }
+
+    /// Methods containing a representative non-token byte.
+    fn method_invalid() -> impl Strategy<Value = String> {
+        (
+            "[A-Z]{0,4}",
+            prop_oneof![Just('@'), Just('('), Just(' ')],
+            "[A-Z]{0,4}",
+        )
+            .prop_map(|(head, invalid, tail)| format!("{head}{invalid}{tail}"))
+    }
+
+    /// Operation match kinds accepted by the grammar.
+    fn kind_valid() -> impl Strategy<Value = String> {
+        prop_oneof![Just("exact".to_owned()), Just("prefix".to_owned())]
+    }
+
+    /// Allowed paths: `/`-joined segments, biased toward a colon suffix
+    /// because everything after the second delimiter belongs to the path.
+    fn allowed_path_valid() -> impl Strategy<Value = String> {
+        let base = collection::vec("[A-Za-z0-9_.-]{1,8}", 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")));
+        prop_oneof![
+            4 => collection::vec("[A-Za-z0-9_.-]{1,8}", 1..4)
+                .prop_map(|segments| format!("/{}", segments.join("/"))),
+            1 => base.prop_map(|path| format!("{path}:v1")),
+        ]
+    }
+
+    /// Non-zero `u64` bounds biased toward the low boundary.
+    fn bound_u64() -> impl Strategy<Value = u64> {
+        prop_oneof![1 => Just(1_u64), 4 => 1_u64..]
+    }
+
+    /// Non-zero `usize` bounds biased toward the low boundary.
+    fn bound_usize() -> impl Strategy<Value = usize> {
+        prop_oneof![1 => Just(1_usize), 4 => 1_usize..]
+    }
+
+    /// Paths missing the required leading slash (first invalid form).
+    fn allowed_path_invalid() -> impl Strategy<Value = String> {
+        "[A-Za-z0-9_.-][A-Za-z0-9/_.-]{0,12}"
+    }
+
+    /// Accepted request paths: no dot segments, mirroring what the request
+    /// validator admits. `Url::set_path` normalizes `.` and `..` segments, so
+    /// paths containing them never reach the URL builder at runtime.
+    fn accepted_path() -> impl Strategy<Value = String> {
+        collection::vec("[A-Za-z0-9_-]{1,8}", 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    /// Registrable-looking hostnames without wildcards.
+    fn host_valid() -> impl Strategy<Value = String> {
+        collection::vec("[a-z][a-z0-9-]{0,8}[a-z0-9]", 1..4).prop_map(|labels| labels.join("."))
+    }
+
+    /// Ports biased toward the boundary values.
+    fn port_any() -> impl Strategy<Value = u16> {
+        prop_oneof![
+            1 => Just(1_u16),
+            1 => Just(u16::MAX),
+            3 => 1_u16..,
+        ]
+    }
+
+    /// Valid origins: scheme, host, and optional port only.
+    fn origin_valid() -> impl Strategy<Value = String> {
+        (
+            prop_oneof![Just("http"), Just("https")],
+            host_valid(),
+            option::of(port_any()),
+        )
+            .prop_map(|(scheme, host, port)| {
+                port.map_or_else(
+                    || format!("{scheme}://{host}"),
+                    |port_number| format!("{scheme}://{host}:{port_number}"),
+                )
+            })
+    }
+
+    /// Invalid origins sampling representative rejection classes: wildcard
+    /// hosts, extra components, credentials, unsupported schemes, and
+    /// unparsable spellings (hostless and scheme-relative).
+    fn origin_invalid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            host_valid().prop_map(|host| format!("https://*.{host}")),
+            Just("https://*".to_owned()),
+            (host_valid(), "[a-z]{1,8}").prop_map(|(host, path)| format!("https://{host}/{path}")),
+            (host_valid(), "[a-z]{1,8}")
+                .prop_map(|(host, query)| { format!("https://{host}?{query}") }),
+            (host_valid(), "[a-z]{1,8}")
+                .prop_map(|(host, fragment)| { format!("https://{host}#{fragment}") }),
+            (host_valid(), "[a-z]{1,8}").prop_map(|(user, host)| format!("https://{user}@{host}")),
+            host_valid().prop_map(|host| format!("ftp://{host}")),
+            Just("http://".to_owned()),
+            host_valid(),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn parse_accepts_every_valid_operation(
+            method in method_valid(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+
+            prop_assert!(AllowedOperation::parse(&raw).is_ok());
+        }
+
+        #[test]
+        fn parse_rejects_pathless_operations(
+            method in method_valid(),
+            kind in kind_valid(),
+            path in allowed_path_invalid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+
+            prop_assert!(AllowedOperation::parse(&raw).is_err());
+        }
+
+        #[test]
+        fn parse_rejects_unknown_kinds(
+            method in method_valid(),
+            kind in "[a-z]{1,8}",
+            path in allowed_path_valid(),
+        ) {
+            prop_assume!(kind != "exact" && kind != "prefix");
+            let raw = format!("{method}:{kind}:{path}");
+
+            prop_assert!(AllowedOperation::parse(&raw).is_err());
+        }
+
+        #[test]
+        fn parse_rejects_invalid_methods(
+            method in method_invalid(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+
+            let is_invalid_method = matches!(
+                AllowedOperation::parse(&raw),
+                Err(ConfigError::InvalidMethod { .. }),
+            );
+            prop_assert!(is_invalid_method);
+        }
+
+        #[test]
+        fn parse_rejects_operations_with_missing_parts(
+            method in method_valid(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+            missing in 0_u8..4,
+        ) {
+            let raw = match missing {
+                0 => format!(":{kind}:{path}"),
+                1 => format!("{method}::{path}"),
+                2 => format!("{method}:{kind}:"),
+                _ => format!("{method}:{kind}"),
+            };
+
+            let is_invalid_operation = matches!(
+                AllowedOperation::parse(&raw),
+                Err(ConfigError::InvalidAllowedOperation { .. }),
+            );
+            prop_assert!(is_invalid_operation);
+        }
+
+        #[test]
+        fn parsed_operations_bind_the_method_to_the_path(
+            method in method_valid(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+            let operation = AllowedOperation::parse(&raw)
+                .expect("generated operations should parse");
+            let parsed_method = Method::from_bytes(method.as_bytes())
+                .expect("generated methods are valid tokens");
+            let other_method = Method::from_bytes(b"ZZ")
+                .expect("two-letter tokens are valid methods");
+
+            prop_assert!(operation.has_method(&parsed_method));
+            prop_assert!(!operation.has_method(&other_method));
+            prop_assert!(operation.matches(&parsed_method, &path));
+            prop_assert!(!operation.matches(&other_method, &path));
+        }
+
+        #[test]
+        fn exact_paths_match_only_themselves(
+            path in allowed_path_valid(),
+            suffix in "[A-Za-z0-9_.-]{1,8}",
+        ) {
+            let allowed = AllowedPath::exact(&path).expect("generated path should parse");
+            let child = format!("{path}/{suffix}");
+            let extended = format!("{path}{suffix}");
+
+            prop_assert!(allowed.matches(&path));
+            prop_assert!(!allowed.matches(&child));
+            prop_assert!(!allowed.matches(&extended));
+        }
+
+        #[test]
+        fn parse_allowed_operations_rejects_empty_entries_and_absent_lists(
+            operations in collection::vec(
+                (method_valid(), kind_valid(), allowed_path_valid()),
+                0..4,
+            ),
+            empty_entries in 0_usize..3,
+        ) {
+            let expected_count = operations.len();
+            let mut raw: Vec<String> = operations
+                .into_iter()
+                .map(|(method, kind, path)| format!("{method}:{kind}:{path}"))
+                .collect();
+            raw.extend(iter::repeat_n(String::new(), empty_entries));
+
+            let result = parse_allowed_operations(raw);
+
+            if expected_count == 0 {
+                let is_empty_error = matches!(result, Err(ConfigError::EmptyOperations));
+                prop_assert!(is_empty_error);
+            } else if empty_entries > 0 {
+                let is_invalid_operation =
+                    matches!(result, Err(ConfigError::InvalidAllowedOperation { .. }));
+                prop_assert!(is_invalid_operation);
+            } else {
+                let parsed = result.expect("valid operations should parse");
+                prop_assert_eq!(parsed.len(), expected_count);
+            }
+        }
+
+        #[test]
+        fn serve_args_with_non_zero_bounds_convert(
+            port in port_any(),
+            max_audit_event_bytes in bound_usize(),
+            max_concurrent_requests in bound_usize(),
+            max_request_bytes in bound_usize(),
+            max_request_header_bytes in bound_usize(),
+            max_response_bytes in bound_u64(),
+            max_response_header_bytes in bound_usize(),
+            request_timeout_secs in bound_u64(),
+            origin in origin_valid(),
+        ) {
+            let args = ServeArgs {
+                allowed_operations: vec!["GET:exact:/v1/models".to_owned()],
+                audit_log: PathBuf::from("/var/log/custode/proxy.ndjson"),
+                bind: SocketAddr::from(([127, 0, 0, 1], port)),
+                max_audit_event_bytes,
+                max_concurrent_requests,
+                max_request_bytes,
+                max_request_header_bytes,
+                max_response_bytes,
+                max_response_header_bytes,
+                request_timeout_secs,
+                upstream_origin: origin.clone(),
+            };
+
+            let config = GatewayConfig::try_from(args)
+                .expect("non-zero bounds should convert");
+
+            prop_assert_eq!(config.allowed_operations().len(), 1);
+            prop_assert_eq!(
+                config.audit_log(),
+                &PathBuf::from("/var/log/custode/proxy.ndjson")
+            );
+            prop_assert_eq!(config.bind().port(), port);
+            prop_assert_eq!(config.max_audit_event_bytes().get(), max_audit_event_bytes);
+            prop_assert_eq!(
+                config.max_concurrent_requests().get(),
+                max_concurrent_requests
+            );
+            prop_assert_eq!(config.max_request_bytes().get(), max_request_bytes);
+            prop_assert_eq!(
+                config.max_request_header_bytes().get(),
+                max_request_header_bytes
+            );
+            prop_assert_eq!(config.max_response_bytes().get(), max_response_bytes);
+            prop_assert_eq!(
+                config.max_response_header_bytes().get(),
+                max_response_header_bytes
+            );
+            prop_assert_eq!(
+                config.request_timeout(),
+                Duration::from_secs(request_timeout_secs)
+            );
+            let expected_origin = UpstreamOrigin::parse(&origin)
+                .expect("generated origins should parse");
+            prop_assert_eq!(config.upstream_origin(), &expected_origin);
+        }
+
+        #[test]
+        fn serve_args_with_a_zero_bound_fail_closed(zeroed in 0_u8..7) {
+            let mut args = serve_args();
+            let expected_name = match zeroed {
+                0 => {
+                    args.max_audit_event_bytes = 0;
+                    "CUSTODE_MAX_AUDIT_EVENT_BYTES"
+                }
+                1 => {
+                    args.max_concurrent_requests = 0;
+                    "CUSTODE_MAX_CONCURRENT_REQUESTS"
+                }
+                2 => {
+                    args.max_request_bytes = 0;
+                    "CUSTODE_MAX_REQUEST_BYTES"
+                }
+                3 => {
+                    args.max_request_header_bytes = 0;
+                    "CUSTODE_MAX_REQUEST_HEADER_BYTES"
+                }
+                4 => {
+                    args.max_response_bytes = 0;
+                    "CUSTODE_MAX_RESPONSE_BYTES"
+                }
+                5 => {
+                    args.max_response_header_bytes = 0;
+                    "CUSTODE_MAX_RESPONSE_HEADER_BYTES"
+                }
+                _ => {
+                    args.request_timeout_secs = 0;
+                    "CUSTODE_REQUEST_TIMEOUT_SECS"
+                }
+            };
+
+            let error = GatewayConfig::try_from(args)
+                .expect_err("zero bounds should fail closed");
+
+            let is_zero_bound =
+                matches!(error, ConfigError::ZeroBound { name } if name == expected_name);
+            prop_assert!(is_zero_bound);
+        }
+
+        #[test]
+        fn prefix_matching_is_segment_bounded(
+            prefix in allowed_path_valid(),
+            suffix in "[A-Za-z0-9_.-]{1,8}",
+        ) {
+            let allowed = AllowedPath::prefix(&prefix).expect("generated prefix should parse");
+            let child = format!("{prefix}/{suffix}");
+            let sibling = format!("{prefix}{suffix}");
+
+            prop_assert!(allowed.matches(&prefix));
+            prop_assert!(allowed.matches(&child));
+            prop_assert!(!allowed.matches(&sibling));
+        }
+
+        #[test]
+        fn origin_parse_accepts_every_valid_origin(origin in origin_valid()) {
+            prop_assert!(UpstreamOrigin::parse(&origin).is_ok());
+        }
+
+        #[test]
+        fn origin_parse_rejects_every_invalid_origin(origin in origin_invalid()) {
+            prop_assert!(UpstreamOrigin::parse(&origin).is_err());
+        }
+
+        #[test]
+        fn join_path_query_preserves_origin_path_and_query(
+            origin in origin_valid(),
+            path in accepted_path(),
+            query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
+        ) {
+            let parsed = UpstreamOrigin::parse(&origin).expect("generated origin should parse");
+
+            let joined = parsed.join_path_query(&path, query.as_deref());
+
+            let expected = query.as_deref().map_or_else(
+                || format!("{}{path}", parsed.as_str()),
+                |query_text| format!("{}{path}?{query_text}", parsed.as_str()),
+            );
+            prop_assert_eq!(joined.as_str(), expected.as_str());
+        }
+    }
+}

@@ -10,6 +10,8 @@ use http_body_util as _;
 use humantime as _;
 #[cfg(test)]
 use pretty_assertions as _;
+#[cfg(test)]
+use proptest as _;
 use reqwest as _;
 use serde as _;
 use serde_json as _;
