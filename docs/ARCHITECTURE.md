@@ -685,15 +685,22 @@ Unit tests live inline in each source file's `tests` module and cover:
 - provider authorization header pass-through;
 - audit event serialization, including the closed decision set, the full
   field set, and null semantics;
-- timestamp formatting at calendar boundary instants.
+- timestamp formatting at calendar boundary instants;
+- adapter classification of Reqwest errors against real local sockets:
+  connection refusal, timeout, protocol garbage, and body-stream failure;
+- the deterministic handler with injected ports (fixed clock, in-memory
+  audit sink, scripted upstream client), asserting the exact full audit
+  event.
 
 Property-based tests live inline in each source file's `proptests` module
 and cover the parsers, constructors, and serializers with paired
 accept-every-valid and reject-every-invalid grammars: allowed operation
 parsing, upstream origin parsing, segment-bounded prefix matching, upstream
 URL joining, accepted-target validation (dot segments, percent encoding,
-origin form), audit event serialization option semantics, request identity
-formatting, and timestamp round-tripping.
+origin form), header filtering (hop-by-hop stripping, byte limits,
+connection tokens), upstream request construction from allowed targets
+(`UpstreamRequest::from_target`), audit event serialization option
+semantics, request identity formatting, and timestamp round-tripping.
 
 Integration tests in `tests/gateway.rs` run the compiled `custode-proxy`
 binary against a local recording upstream and cover:
@@ -703,6 +710,9 @@ binary against a local recording upstream and cover:
   incoming `Host` header unable to redirect it;
 - denied method does not reach a local test upstream;
 - denied path does not reach a local test upstream;
+- raw absolute-form, authority-form, and `CONNECT` request lines are denied
+  without reaching a local test upstream and audited with the raw
+  authority-bearing target;
 - harness-supplied authorization reaches the local test upstream for allowed
   requests;
 - every allowed and denied request produces an audit event with a unique
