@@ -696,16 +696,19 @@ Unit tests live inline in each source file's `tests` module and cover:
   audit sink, scripted upstream client), run on a paused current-thread Tokio
   runtime and asserting exact full audit events for success and timeout paths.
 
-Property-based tests live inline in each source file's `proptests` module
-and cover the parsers, constructors, and serializers with paired
+Property-based tests normally live inline in each source file's `proptests`
+module and cover the parsers, constructors, and serializers with paired
 accept-every-valid and reject-every-invalid grammars: allowed operation
 parsing, upstream origin parsing, segment-bounded prefix matching, upstream
 URL joining, accepted-target validation (dot segments, percent encoding,
 origin form), header filtering (hop-by-hop stripping, byte limits,
 connection tokens), upstream request construction from allowed targets
 (`UpstreamRequest::from_target`), audit event serialization option
-semantics, request identity formatting, timestamp round-tripping, and
-generated gateway scenarios.
+semantics, request identity formatting, and timestamp round-tripping.
+Generated gateway scenario property tests live inside `http`'s inline
+`tests::proptests` module because their oracle intentionally reuses the
+test-only HTTP scenario runner helpers rather than publishing those helpers
+as a wider crate test-support surface.
 
 Simulation tests are test-only and live behind `#[cfg(test)]`. They run the
 real Axum handler on a paused current-thread Tokio runtime, with the
