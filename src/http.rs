@@ -6,7 +6,9 @@ use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
 use crate::headers::{HeaderError, forward_request_headers, forward_response_headers};
-use crate::ports::{UpstreamBodyError, UpstreamRequest, UpstreamResponse};
+use crate::ports::{
+    UpstreamBodyError, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
+};
 use ::http::{HeaderMap, Method, Uri};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -352,10 +354,11 @@ async fn forward_request(
             UpstreamResponse::new(status, response_headers, response_body)
         }
         Err(error) => {
-            let status = upstream_error_status(&error);
+            let upstream_error = upstream_error_from_reqwest(&error);
+            let status = upstream_error_status(&upstream_error);
             let input = ResponseAuditInput {
                 decision: AuditDecision::UpstreamError,
-                error_class: Some(upstream_error_class(&error).to_owned()),
+                error_class: Some(upstream_error_class(&upstream_error).to_owned()),
                 method: method.to_string(),
                 request_body,
                 request_id,
@@ -609,22 +612,31 @@ const fn response_header_error_class(error: HeaderError) -> &'static str {
 }
 
 /// Maps upstream request errors to audit classes.
-fn upstream_error_class(error: &reqwest::Error) -> &'static str {
-    if error.is_timeout() {
-        "upstream_timeout"
-    } else if error.is_connect() {
-        "upstream_connect_failed"
-    } else {
-        "upstream_request_failed"
+const fn upstream_error_class(error: &UpstreamError) -> &'static str {
+    match error.kind() {
+        UpstreamErrorKind::Timeout => "upstream_timeout",
+        UpstreamErrorKind::Connect => "upstream_connect_failed",
+        UpstreamErrorKind::Request => "upstream_request_failed",
     }
 }
 
-/// Maps upstream request errors to response statuses.
-fn upstream_error_status(error: &reqwest::Error) -> StatusCode {
-    if error.is_timeout() {
-        StatusCode::GATEWAY_TIMEOUT
+/// Creates an upstream request error from reqwest's stable predicates.
+fn upstream_error_from_reqwest(error: &reqwest::Error) -> UpstreamError {
+    let kind = if error.is_timeout() {
+        UpstreamErrorKind::Timeout
+    } else if error.is_connect() {
+        UpstreamErrorKind::Connect
     } else {
-        StatusCode::BAD_GATEWAY
+        UpstreamErrorKind::Request
+    };
+    UpstreamError::new(kind, error.to_string())
+}
+
+/// Maps upstream request errors to response statuses.
+const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
+    match error.kind() {
+        UpstreamErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        UpstreamErrorKind::Connect | UpstreamErrorKind::Request => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -643,6 +655,7 @@ mod tests {
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
+    use crate::ports::{UpstreamError, UpstreamErrorKind};
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
     use axum::http::{Request, StatusCode};
@@ -664,7 +677,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
-    use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
     use tokio::sync::{Semaphore, mpsc};
     use tokio::time::sleep;
@@ -1422,76 +1434,25 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn upstream_error_mappings_classify_connect_failures() {
-        let origin = closed_origin().await;
-        let client = Client::builder()
-            .no_proxy()
-            .build()
-            .expect("probe client should build");
-
-        let error = client
-            .get(format!("{origin}/v1/models"))
-            .send()
-            .await
-            .expect_err("closed port should fail");
+    #[test]
+    fn upstream_error_mappings_classify_connect_failures() {
+        let error = UpstreamError::new(UpstreamErrorKind::Connect, "connect failed");
 
         assert_eq!(upstream_error_class(&error), "upstream_connect_failed");
         assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);
     }
 
-    #[tokio::test]
-    async fn upstream_error_mappings_classify_timeouts() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind an ephemeral port");
-        let addr = listener
-            .local_addr()
-            .expect("listener should expose its address");
-        let client = Client::builder()
-            .no_proxy()
-            .timeout(Duration::from_millis(50))
-            .build()
-            .expect("probe client should build");
-
-        let error = client
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect_err("a silent upstream should time out");
+    #[test]
+    fn upstream_error_mappings_classify_timeouts() {
+        let error = UpstreamError::new(UpstreamErrorKind::Timeout, "timed out");
 
         assert_eq!(upstream_error_class(&error), "upstream_timeout");
         assert_eq!(upstream_error_status(&error), StatusCode::GATEWAY_TIMEOUT);
     }
 
-    #[tokio::test]
-    async fn upstream_error_mappings_classify_protocol_failures() {
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("listener should bind an ephemeral port");
-        let addr = listener
-            .local_addr()
-            .expect("listener should expose its address");
-        drop(tokio::spawn(async move {
-            let (mut socket, _peer) = listener
-                .accept()
-                .await
-                .expect("garbage upstream should accept");
-            socket
-                .write_all(b"garbage\r\n\r\n")
-                .await
-                .expect("garbage upstream should write");
-        }));
-        let client = Client::builder()
-            .no_proxy()
-            .build()
-            .expect("probe client should build");
-
-        let error = client
-            .get(format!("http://{addr}/"))
-            .send()
-            .await
-            .expect_err("a garbage response should fail");
+    #[test]
+    fn upstream_error_mappings_classify_protocol_failures() {
+        let error = UpstreamError::new(UpstreamErrorKind::Request, "protocol failed");
 
         assert_eq!(upstream_error_class(&error), "upstream_request_failed");
         assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);

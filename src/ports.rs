@@ -36,6 +36,29 @@ pub(crate) struct UpstreamResponse {
     status: StatusCode,
 }
 
+/// Upstream request failure kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpstreamErrorKind {
+    /// The upstream connection could not be established.
+    Connect,
+
+    /// The upstream request failed before a response was available.
+    Request,
+
+    /// The upstream request timed out.
+    Timeout,
+}
+
+/// Upstream request failure.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub(crate) struct UpstreamError {
+    /// Stable failure kind.
+    kind: UpstreamErrorKind,
+    /// Source error message.
+    message: String,
+}
+
 /// Upstream response body streaming failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{message}")]
@@ -49,6 +72,23 @@ impl UpstreamBodyError {
     #[must_use]
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl UpstreamError {
+    /// Returns the stable failure kind.
+    #[must_use]
+    pub(crate) const fn kind(&self) -> UpstreamErrorKind {
+        self.kind
+    }
+
+    /// Creates an upstream request error.
+    #[must_use]
+    pub(crate) fn new(kind: UpstreamErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
             message: message.into(),
         }
     }
