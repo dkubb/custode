@@ -300,7 +300,9 @@ Host: proxy:8080
 The gateway MUST reject:
 
 - `CONNECT` requests;
-- absolute-form targets such as `https://api.openai.com/v1/responses`;
+- absolute-form and other authority-bearing targets, such as
+  `https://api.openai.com/v1/responses` and authority-form request lines
+  like `evil.example:443`;
 - paths that do not start with `/`;
 - paths containing invalid percent-encoding;
 - paths containing literal or percent-encoded `.` or `..` segments, so the
@@ -362,6 +364,9 @@ same fail-closed semantics.
 
 For each request, the gateway performs these steps in order:
 
+1. Acquire a concurrency admission permit before allocating the request
+   identity. A refused request is audited as a `denied` decision with error
+   class `too_many_requests` and answered with HTTP 429.
 1. Allocate a request identity.
 1. Parse and validate the method and origin-form target, rejecting literal or
    percent-encoded dot segments.
