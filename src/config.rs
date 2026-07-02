@@ -124,6 +124,10 @@ pub(crate) enum ConfigError {
     #[error("upstream origin must not include credentials")]
     UpstreamOriginHasCredentials,
 
+    /// Upstream origin used a wildcard host.
+    #[error("upstream origin must not use a wildcard host")]
+    WildcardUpstreamHost,
+
     /// A numeric bound was zero.
     #[error("{name} must be greater than zero")]
     ZeroBound {
@@ -492,7 +496,8 @@ impl UpstreamOrigin {
     /// # Errors
     ///
     /// Returns a configuration error when the origin is not HTTP(S), lacks a
-    /// host, or contains path, query, fragment, username, or password.
+    /// host, uses a wildcard host, or contains path, query, fragment,
+    /// username, or password.
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
         let url = Url::parse(raw).map_err(|source| ConfigError::InvalidUpstreamOrigin {
             raw: raw.to_owned(),
@@ -504,8 +509,11 @@ impl UpstreamOrigin {
                 scheme: url.scheme().to_owned(),
             });
         }
-        if url.host_str().is_none() {
+        let Some(host) = url.host_str() else {
             return Err(ConfigError::MissingUpstreamHost);
+        };
+        if host.contains('*') {
+            return Err(ConfigError::WildcardUpstreamHost);
         }
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(ConfigError::UpstreamOriginHasComponents);

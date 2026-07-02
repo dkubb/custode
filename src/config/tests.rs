@@ -24,3 +24,16 @@ fn upstream_origin_rejects_path() {
         Err(ConfigError::UpstreamOriginHasComponents),
     ));
 }
+
+#[test]
+fn upstream_origin_rejects_wildcard_hosts() {
+    for origin in ["https://*", "https://*.openai.com"] {
+        assert!(
+            matches!(
+                UpstreamOrigin::parse(origin),
+                Err(ConfigError::WildcardUpstreamHost),
+            ),
+            "origin {origin} should be rejected"
+        );
+    }
+}
