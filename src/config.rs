@@ -911,7 +911,16 @@ mod proptests {
 
     /// Registrable-looking hostnames without wildcards.
     fn host_valid() -> impl Strategy<Value = String> {
-        collection::vec("[a-z][a-z0-9-]{0,8}[a-z0-9]", 1..4).prop_map(|labels| labels.join("."))
+        // Avoid the `xn--` IDNA prefix: those labels are interpreted as
+        // Punycode and not every ASCII spelling is a valid IDNA label.
+        let label = prop_oneof![
+            "[a-wy-z][a-z0-9-]{0,8}[a-z0-9]",
+            "x[a-mo-z0-9][a-z0-9-]{0,8}[a-z0-9]",
+            "xn[a-z0-9][a-z0-9-]{0,7}[a-z0-9]",
+            "xn-[a-z0-9]",
+            "xn-[a-z0-9][a-z0-9-]{0,6}[a-z0-9]",
+        ];
+        collection::vec(label, 1..4).prop_map(|labels| labels.join("."))
     }
 
     /// Ports biased toward the boundary values.
