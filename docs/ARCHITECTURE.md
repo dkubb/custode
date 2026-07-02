@@ -95,15 +95,24 @@ Reference inputs are:
 The implementation uses these concrete foundations:
 
 - Language: Rust, edition 2024.
-- Toolchain: pinned per commit via `rust-toolchain.toml`, following the
-  sibling `incremental-gate` setup.
+- Toolchain: a pinned nightly channel recorded per commit in
+  `rust-toolchain.toml`.
 - Async runtime: Tokio.
 - HTTP server: Hyper through Axum.
 - HTTP client: Reqwest with Rustls TLS and no native TLS dependency.
 - URL representation: `url::Url`.
 - Serialization: Serde and `serde_json`.
 - Request digest: BLAKE3.
-- CLI parsing: Clap.
+- CLI parsing: Clap, with environment variable bindings declared on the
+  argument types.
+- Timestamps: `humantime` RFC 3339 formatting.
+- Error modeling: `thiserror` typed errors owned per module.
+- Diagnostics: `tracing` with `tracing-subscriber`, enabled by `RUST_LOG`.
+- HTTP plumbing: `futures-util`, the `http` crate, `http-body-util`, and
+  `tokio-stream`.
+- Test tooling: `proptest`, `pretty_assertions`, `tempfile`, and `tower` as
+  dev-dependencies, with `cargo-mutants` mutation testing configured by
+  `.cargo/mutants.toml`.
 - Container composition: Docker Compose.
 - Harness Linux distribution: Debian `trixie-slim`, pinned by digest.
 - Gateway builder image: official Rust `1-trixie`, pinned by digest.
@@ -129,18 +138,28 @@ trust model.
 
 ## 5. Toolchain and Gates
 
-The local gate vocabulary follows `incremental-gate`:
+The local gate vocabulary is:
 
-- `just fmt-check` runs `cargo fmt --all --check`.
+- `just fmt` runs `cargo fmt --all`; `just fmt-check` runs the check form.
 - `just lint` runs Clippy for all targets and all features.
-- `just test` runs the Rust test suite.
-- `just docs` runs Markdown linting when `mado` is available.
-- `just deny` runs `cargo deny check` when `cargo-deny` is available.
-- `just check` runs formatting, linting, tests, and Dockerfile syntax checks.
+- `just test` runs the Rust test suite, including property and integration
+  tests.
+- `just docs` runs Markdown linting with `mado`.
+- `just deny` runs `cargo deny check`.
+- `just dockerfile-check` runs the BuildKit Dockerfile check.
+- `just docker-build` builds both images; `just docker-test` runs the
+  container tests in `scripts/container-test.sh`.
+- `just coverage` reports `cargo llvm-cov` coverage.
+- `just mutants` runs `cargo-mutants` mutation testing.
+- `just check` runs formatting, linting, tests, and the Dockerfile check.
+- `just ci` runs `check` plus `deny`.
 
-Rust lint posture follows `incremental-gate`: warnings, missing docs, unsafe
-code, future incompatibilities, unused dependencies, and broad Clippy lint
-groups are denied. Suppressions MUST NOT be used to hide warnings. If a
+Gates never skip silently: a recipe fails when its tool is missing rather
+than reporting success without running.
+
+The Rust lint posture denies warnings, missing docs, unsafe code, future
+incompatibilities, unused dependencies, and broad Clippy lint groups.
+Suppressions MUST NOT be used to hide warnings. If a
 site-local lint exception is needed, it MUST use
 `#[expect(..., reason = "...")]` and the reason MUST explain the invariant.
 
@@ -156,16 +175,24 @@ custode/
 ├── justfile
 ├── Dockerfile
 ├── compose.yaml
+├── README.md
 ├── .cargo/
 │   ├── config.toml
 │   ├── clippy.toml
-│   └── deny.toml
+│   ├── deny.toml
+│   └── mutants.toml
 ├── docs/
 │   ├── IDEA.md
 │   └── ARCHITECTURE.md
-└── src/
-    ├── lib.rs
-    └── main.rs
+├── scripts/
+│   └── container-test.sh
+├── secrets/
+│   └── env.example
+├── src/
+│   ├── lib.rs
+│   └── main.rs
+└── tests/
+    └── gateway.rs
 ```
 
 The root crate produces one binary, `custode-proxy`, and one library crate.
@@ -186,9 +213,16 @@ src/gateway.rs         Request handling state machine
 src/http.rs            Axum and Reqwest runtime edges
 src/headers.rs         Hop-by-hop and redaction rules
 src/body.rs            Bounded body accounting and BLAKE3 digests
-src/health.rs          Healthcheck command and endpoint
-src/error.rs           Error model and HTTP status mapping
+src/health.rs          Healthcheck subcommand probe
+src/process.rs         Command-line interface, dispatch, and exit codes
 ```
+
+There is no central error module: each module owns its typed `thiserror`
+error, and HTTP status mapping lives in `http` at the runtime edge.
+
+Example-based unit tests live inline in each source file's `tests` module,
+and property-based tests live in the same file's `proptests` module.
+End-to-end tests that exercise the binary live in `tests/gateway.rs`.
 
 These module names SHOULD remain stable through the initial product. A module
 name MAY change only when the old name would become misleading after a
@@ -200,17 +234,28 @@ section and the dependency direction in Section 7.
 The library dependency direction is:
 
 - `config` depends on primitive parsing, `url::Url`, and typed config errors.
+  Environment variable names are declared as clap bindings on the raw
+  argument types; the binary edge performs the actual environment read.
 - `allowlist` depends on `config` types and owns pure allow/deny decisions.
-- `body` owns byte limits and digest accounting.
+- `body` owns byte limits and digest accounting. It MAY use Axum body types
+  as its byte-stream representation but MUST NOT depend on the server
+  runtime.
 - `headers` owns header filtering and redaction rules.
 - `audit` depends on typed request and response summaries, not on the HTTP
-  server runtime.
-- `gateway` depends on `config`, `allowlist`, `body`, `headers`, and `audit`.
-- `http` depends on `gateway` and owns Axum/Reqwest conversions.
-- `main` depends on the library and owns process startup.
+  server runtime. The audit writer owns the log file and performs the only
+  filesystem mutation in the library.
+- `gateway` depends on `config`, `allowlist`, `body`, `headers`, and `audit`,
+  and owns no I/O clients.
+- `http` depends on `gateway`, owns the upstream Reqwest client, and owns
+  Axum/Reqwest conversions.
+- `health` depends on no other library module and owns the healthcheck
+  subcommand's TCP probe.
+- `process` depends on `config`, `health`, and `http`; it owns the CLI,
+  command dispatch, and process exit codes.
+- `main` depends on `process` and owns process startup.
 
-Pure decision modules MUST NOT depend on Axum, Reqwest, Tokio sockets, process
-environment access, or filesystem mutation. Runtime modules adapt those pure
+Pure decision modules MUST NOT depend on Reqwest, the Axum server runtime,
+Tokio sockets, or process environment reads. Runtime modules adapt those pure
 decisions to I/O.
 
 ## 8. Gateway Protocol
@@ -608,7 +653,7 @@ The initial build sequence is:
 1. Derive this architecture from [IDEA.md](IDEA.md).
 1. Review both documents in alternating order until suggestions stop,
    quality degrades, or scope expands.
-1. Add the Rust project setup from `../incremental-gate/`.
+1. Add the Rust project setup.
 1. Implement configuration parsing and pure allowlist decisions.
 1. Implement audit event serialization and fail-closed audit writer.
 1. Implement the HTTP gateway.
