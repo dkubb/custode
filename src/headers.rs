@@ -132,6 +132,7 @@ mod tests {
     use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};
     use ::http::{HeaderMap, HeaderValue};
     use core::num::NonZeroUsize;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn request_headers_strip_connection_named_headers() {

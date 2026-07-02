@@ -233,6 +233,7 @@ const fn hex_value(byte: u8) -> Option<u8> {
 mod tests {
     use super::{AcceptedTarget, RejectionReason};
     use crate::config::AllowedPath;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn prefix_matches_path_segments_only() {

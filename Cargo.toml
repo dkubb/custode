@@ -98,5 +98,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = { version = "2.5", features = ["serde"] }
 
 [dev-dependencies]
+pretty_assertions = "1.4.1"
 tempfile = "3"
 tower = "0.5"

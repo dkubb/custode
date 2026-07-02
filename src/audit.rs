@@ -287,6 +287,7 @@ fn rfc3339_timestamp() -> String {
 mod tests {
     use super::{AuditDecision, AuditEvent, AuditEventInput, AuditTarget, RequestId};
     use core::time::Duration;
+    use pretty_assertions::assert_eq;
     use std::time::UNIX_EPOCH;
 
     #[test]
