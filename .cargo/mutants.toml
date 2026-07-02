@@ -1,5 +1,5 @@
 all_features = true
-cap_lints = false
+cap_lints = true
 copy_target = true
 minimum_test_timeout = 10.0
 output = "target/cargo-mutants"
