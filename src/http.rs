@@ -790,6 +790,46 @@ mod tests {
         ]))
     }
 
+    /// Returns the expected deterministic audit event for an injected timeout.
+    fn injected_timeout_event() -> Value {
+        Value::Object(Map::from_iter([
+            (
+                "decision".to_owned(),
+                Value::String("upstream_error".to_owned()),
+            ),
+            (
+                "error_class".to_owned(),
+                Value::String("upstream_timeout".to_owned()),
+            ),
+            ("method".to_owned(), Value::String("GET".to_owned())),
+            ("path".to_owned(), Value::String("/v1/models".to_owned())),
+            ("query".to_owned(), Value::Null),
+            ("request_body_blake3".to_owned(), Value::Null),
+            ("request_bytes".to_owned(), Value::from(0_u64)),
+            (
+                "request_id".to_owned(),
+                Value::String("req-test-0000000000000001".to_owned()),
+            ),
+            ("response_body_blake3".to_owned(), Value::Null),
+            ("response_bytes".to_owned(), Value::from(0_u64)),
+            ("status".to_owned(), Value::from(504_u64)),
+            (
+                "timestamp".to_owned(),
+                Value::String("2026-07-02T00:00:00.000000000Z".to_owned()),
+            ),
+            (
+                "upstream_origin".to_owned(),
+                Value::String("https://api.openai.com".to_owned()),
+            ),
+            (
+                "upstream_path".to_owned(),
+                Value::String("/v1/models".to_owned()),
+            ),
+            ("upstream_query".to_owned(), Value::Null),
+            ("version".to_owned(), Value::from(1_u64)),
+        ]))
+    }
+
     /// Builds the proxy router and fatal error channel around a configuration.
     async fn proxy_router(
         config: GatewayConfig,
@@ -925,6 +965,67 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert_eq!(events, [injected_allowed_event()]);
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_uses_injected_ports_for_upstream_timeouts() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let (client, upstream_requests) = ScriptedUpstreamClient::stalling(Duration::from_secs(10));
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models")
+            .body(Body::empty())
+            .expect("request should build");
+
+        let response = router.oneshot(request).await.expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should stream");
+        assert_eq!(body, Bytes::new());
+        let requests = upstream_requests
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            [RecordedUpstreamRequest::new(
+                Vec::new(),
+                deadline,
+                Vec::new(),
+                Method::GET,
+                "https://api.openai.com/v1/models",
+            )]
+        );
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events, [injected_timeout_event()]);
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(

@@ -7,11 +7,12 @@
 
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp};
 use crate::ports::{
-    AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamRequest,
-    UpstreamResponse,
+    AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamDeadline, UpstreamError,
+    UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
 use axum::body::Bytes;
 use core::future;
+use core::time::Duration;
 use futures_util::{StreamExt as _, stream};
 use http::{Method, StatusCode};
 use serde_json::Value;
@@ -43,9 +44,24 @@ pub(super) struct RecordedUpstreamRequest {
     url: String,
 }
 
+/// Scripted upstream behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptedUpstreamBehavior {
+    /// Return the fixed success response immediately.
+    Respond,
+
+    /// Simulate an upstream stall for the supplied duration.
+    Stall {
+        /// Simulated stall duration.
+        duration: Duration,
+    },
+}
+
 /// Scripted upstream client for deterministic handler tests.
 #[derive(Clone, Debug)]
 pub(super) struct ScriptedUpstreamClient {
+    /// Scripted upstream behavior.
+    behavior: ScriptedUpstreamBehavior,
     /// Captured upstream requests.
     requests: Arc<Mutex<Vec<RecordedUpstreamRequest>>>,
 }
@@ -114,6 +130,20 @@ impl ScriptedUpstreamClient {
         let requests = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
+                behavior: ScriptedUpstreamBehavior::Respond,
+                requests: Arc::clone(&requests),
+            },
+            requests,
+        )
+    }
+
+    /// Builds a scripted upstream client that stalls deterministically.
+    #[must_use]
+    pub(super) fn stalling(duration: Duration) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                behavior: ScriptedUpstreamBehavior::Stall { duration },
                 requests: Arc::clone(&requests),
             },
             requests,
@@ -151,6 +181,15 @@ impl UpstreamClient for ScriptedUpstreamClient {
             .lock()
             .expect("scripted upstream should not be poisoned")
             .push(recorded);
+        if let ScriptedUpstreamBehavior::Stall { duration } = self.behavior
+            && duration >= request.deadline().timeout()
+        {
+            let error = UpstreamError::new(
+                UpstreamErrorKind::Timeout,
+                format!("scripted upstream stalled for {duration:?}"),
+            );
+            return Box::pin(future::ready(Err(error)));
+        }
         let response = UpstreamResponse::new(
             StatusCode::CREATED,
             ::http::HeaderMap::new(),
