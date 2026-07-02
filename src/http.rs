@@ -648,15 +648,14 @@ mod tests {
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::AuditEvent;
-    use crate::audit::{AuditError, AuditTimestamp, RequestId};
+    use crate::audit::{AuditError, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
-    use crate::ports::{
-        AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamError, UpstreamErrorKind,
-        UpstreamRequest, UpstreamResponse,
+    use crate::ports::{UpstreamError, UpstreamErrorKind};
+    use crate::sim::{
+        FixedClock, MemoryAuditSink, RecordedUpstreamRequest, ScriptedUpstreamClient,
     };
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
@@ -677,7 +676,7 @@ mod tests {
     use serde_json::{Map, Value};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
     use tokio::net::TcpListener;
@@ -691,111 +690,6 @@ mod tests {
         /// Parsed serve arguments.
         #[command(flatten)]
         args: ServeArgs,
-    }
-
-    /// Fixed clock used by deterministic handler tests.
-    #[derive(Clone, Copy, Debug)]
-    struct FixedClock;
-
-    /// In-memory audit sink used by deterministic handler tests.
-    #[derive(Clone, Debug)]
-    struct MemoryAuditSink {
-        /// Captured serialized audit events.
-        events: Arc<Mutex<Vec<Value>>>,
-    }
-
-    /// Request observed by the scripted upstream client.
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct RecordedUpstreamRequest {
-        /// Upstream request body.
-        body: Vec<u8>,
-        /// Forwarded upstream request headers.
-        headers: Vec<(String, String)>,
-        /// Upstream request method.
-        method: Method,
-        /// Fully joined upstream URL.
-        url: String,
-    }
-
-    /// Scripted upstream client for deterministic handler tests.
-    #[derive(Clone, Debug)]
-    struct ScriptedUpstreamClient {
-        /// Captured upstream requests.
-        requests: Arc<Mutex<Vec<RecordedUpstreamRequest>>>,
-    }
-
-    impl AuditSink for MemoryAuditSink {
-        fn append_event<'future>(
-            &'future self,
-            event: &'future AuditEvent,
-        ) -> BoxFuture<'future, Result<(), AuditError>> {
-            let result = serde_json::to_value(event)
-                .map_err(AuditError::Serialize)
-                .map(|value| {
-                    self.events
-                        .lock()
-                        .expect("memory audit sink should not be poisoned")
-                        .push(value);
-                });
-            Box::pin(future::ready(result))
-        }
-    }
-
-    impl Clock for FixedClock {
-        fn now(&self) -> AuditTimestamp {
-            AuditTimestamp::for_test("2026-07-02T00:00:00.000000000Z")
-        }
-    }
-
-    impl ScriptedUpstreamClient {
-        /// Builds a scripted upstream client and its request recorder.
-        fn new() -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
-            let requests = Arc::new(Mutex::new(Vec::new()));
-            (
-                Self {
-                    requests: Arc::clone(&requests),
-                },
-                requests,
-            )
-        }
-    }
-
-    impl UpstreamClient for ScriptedUpstreamClient {
-        fn send(
-            &self,
-            request: UpstreamRequest,
-        ) -> BoxFuture<'_, Result<UpstreamResponse, UpstreamError>> {
-            let mut headers = request
-                .headers()
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.as_str().to_owned(),
-                        value
-                            .to_str()
-                            .expect("test request header should be UTF-8")
-                            .to_owned(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            headers.sort();
-            let recorded = RecordedUpstreamRequest {
-                body: request.body().to_vec(),
-                headers,
-                method: request.method().clone(),
-                url: request.url().to_string(),
-            };
-            self.requests
-                .lock()
-                .expect("scripted upstream should not be poisoned")
-                .push(recorded);
-            let response = UpstreamResponse::new(
-                StatusCode::CREATED,
-                ::http::HeaderMap::new(),
-                stream::iter([Ok(Bytes::from_static(b"scripted"))]).boxed(),
-            );
-            Box::pin(future::ready(Ok(response)))
-        }
     }
 
     /// Reads and parses every event in the audit log.
@@ -974,10 +868,7 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_uses_injected_ports_for_allowed_requests() {
-        let audit_events = Arc::new(Mutex::new(Vec::new()));
-        let audit = MemoryAuditSink {
-            events: Arc::clone(&audit_events),
-        };
+        let (audit, audit_events) = MemoryAuditSink::new();
         let (client, upstream_requests) = ScriptedUpstreamClient::new();
         let config = GatewayConfig::for_runtime_test(
             PathBuf::from("unused-audit.ndjson"),
@@ -1017,15 +908,15 @@ mod tests {
             .clone();
         assert_eq!(
             requests,
-            [RecordedUpstreamRequest {
-                body: b"hello".to_vec(),
-                headers: vec![
+            [RecordedUpstreamRequest::new(
+                b"hello".to_vec(),
+                vec![
                     ("authorization".to_owned(), "Bearer harness".to_owned()),
                     ("x-request-id".to_owned(), "trace-1".to_owned()),
                 ],
-                method: Method::GET,
-                url: "https://api.openai.com/v1/models?limit=1".to_owned(),
-            }]
+                Method::GET,
+                "https://api.openai.com/v1/models?limit=1",
+            )]
         );
         let events = audit_events
             .lock()

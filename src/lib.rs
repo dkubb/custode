@@ -23,5 +23,7 @@ pub mod health;
 pub mod http;
 pub mod ports;
 pub mod process;
+#[cfg(test)]
+mod sim;
 
 pub use process::Cli;
