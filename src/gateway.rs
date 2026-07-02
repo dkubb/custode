@@ -48,22 +48,80 @@ pub(crate) enum GatewayError {
 /// Input for response audit events.
 #[derive(Debug)]
 pub(crate) struct ResponseAuditInput {
-    /// Audit decision.
-    pub decision: AuditDecision,
-    /// Error class.
-    pub error_class: Option<String>,
     /// Method.
     pub method: String,
+    /// Closed response audit outcome.
+    pub outcome: ResponseAuditOutcome,
     /// Accounted request body.
     pub request_body: AccountedBody,
     /// Request identity.
     pub request_id: RequestId,
-    /// Accounted response body.
-    pub response_account: ResponseAccount,
-    /// Response status.
-    pub status: Option<u16>,
     /// Accepted target.
     pub target: AcceptedTarget,
+}
+
+/// Closed response audit outcome.
+#[derive(Debug)]
+pub(crate) enum ResponseAuditOutcome {
+    /// Request was allowed and completed normally.
+    Allowed {
+        /// Accounted response body.
+        response_account: ResponseAccount,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Response handling failed.
+    ResponseError {
+        /// Stable error class.
+        error_class: String,
+        /// Accounted response body.
+        response_account: ResponseAccount,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Upstream request failed before a response completed.
+    UpstreamError {
+        /// Stable error class.
+        error_class: String,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+}
+
+impl ResponseAuditOutcome {
+    /// Creates an allowed response outcome.
+    #[must_use]
+    pub(crate) const fn allowed(response_account: ResponseAccount, status: u16) -> Self {
+        Self::Allowed {
+            response_account,
+            status,
+        }
+    }
+
+    /// Creates a response-error outcome.
+    #[must_use]
+    pub(crate) fn response_error(
+        error_class: impl Into<String>,
+        response_account: ResponseAccount,
+        status: u16,
+    ) -> Self {
+        Self::ResponseError {
+            error_class: error_class.into(),
+            response_account,
+            status,
+        }
+    }
+
+    /// Creates an upstream-error outcome.
+    #[must_use]
+    pub(crate) fn upstream_error(error_class: impl Into<String>, status: u16) -> Self {
+        Self::UpstreamError {
+            error_class: error_class.into(),
+            status,
+        }
+    }
 }
 
 impl Gateway {
@@ -114,17 +172,51 @@ impl Gateway {
     ) -> Result<(), GatewayError> {
         let upstream_path = Some(input.target.path().to_owned());
         let upstream_query = input.target.query().map(str::to_owned);
+        let (decision, error_class, response_body_blake3, response_bytes, status) =
+            match input.outcome {
+                ResponseAuditOutcome::Allowed {
+                    response_account,
+                    status,
+                } => (
+                    AuditDecision::Allowed,
+                    None,
+                    response_account.finalize_digest(),
+                    response_account.byte_count(),
+                    status,
+                ),
+                ResponseAuditOutcome::ResponseError {
+                    error_class,
+                    response_account,
+                    status,
+                } => (
+                    AuditDecision::ResponseError,
+                    Some(error_class),
+                    response_account.finalize_digest(),
+                    response_account.byte_count(),
+                    status,
+                ),
+                ResponseAuditOutcome::UpstreamError {
+                    error_class,
+                    status,
+                } => (
+                    AuditDecision::UpstreamError,
+                    Some(error_class),
+                    None,
+                    0,
+                    status,
+                ),
+            };
         let event = AuditEvent::new_at(
             AuditEventInput {
-                decision: input.decision,
-                error_class: input.error_class,
+                decision,
+                error_class,
                 method: input.method,
                 request_body_blake3: input.request_body.digest().map(str::to_owned),
                 request_bytes: input.request_body.byte_count(),
                 request_id: input.request_id,
-                response_body_blake3: input.response_account.finalize_digest(),
-                response_bytes: input.response_account.byte_count(),
-                status: input.status,
+                response_body_blake3,
+                response_bytes,
+                status: Some(status),
                 target: input.target.into(),
                 upstream_origin: self.config.upstream_origin().as_str().to_owned(),
                 upstream_path,
@@ -171,10 +263,10 @@ impl Gateway {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
-    use super::{Gateway, GatewayError, ResponseAuditInput};
+    use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditDecision, AuditError, AuditTarget, AuditWriter, RequestId};
+    use crate::audit::{AuditError, AuditTarget, AuditWriter, RequestId};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
     use ::http::Method;
@@ -309,13 +401,10 @@ mod tests {
             .add_chunk(b"world")
             .expect("response chunk should be accounted");
         let input = ResponseAuditInput {
-            decision: AuditDecision::Allowed,
-            error_class: None,
             method: "GET".to_owned(),
+            outcome: ResponseAuditOutcome::allowed(response_account, 200),
             request_body,
             request_id: RequestId::from_parts("run", 1),
-            response_account,
-            status: Some(200),
             target: AcceptedTarget::new("/v1/models", Some("limit=1"))
                 .expect("target should parse"),
         };

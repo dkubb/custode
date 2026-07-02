@@ -4,10 +4,10 @@ use crate::adapters::{
     ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
 };
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
-use crate::audit::{AuditDecision, AuditTarget, AuditWriter, RequestId};
+use crate::audit::{AuditTarget, AuditWriter, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
-use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
+use crate::gateway::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
 use crate::headers::{
     ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
 };
@@ -86,34 +86,57 @@ struct ResponseAuditContext {
     target: AcceptedTarget,
 }
 
+/// Terminal response stream outcome.
+#[derive(Debug)]
+enum ResponseStreamOutcome {
+    /// Response completed successfully.
+    Allowed,
+
+    /// Response stream failed after upstream I/O started.
+    ResponseError {
+        /// Stable error class.
+        error_class: String,
+    },
+}
+
 impl ResponseAuditContext {
     /// Writes the terminal response audit event.
-    async fn audit(
-        self,
-        decision: AuditDecision,
-        error_class: Option<String>,
-    ) -> Result<(), GatewayError> {
-        let input = ResponseAuditInput {
-            decision,
-            error_class,
-            method: self.method.to_string(),
-            request_body: self.request_body,
-            request_id: self.request_id,
-            response_account: self.response_account,
-            status: Some(self.status),
-            target: self.target,
+    async fn audit(self, stream_outcome: ResponseStreamOutcome) -> Result<(), GatewayError> {
+        let Self {
+            gateway,
+            method,
+            request_body,
+            request_id,
+            response_account,
+            status,
+            target,
+            ..
+        } = self;
+        let audit_outcome = match stream_outcome {
+            ResponseStreamOutcome::Allowed => {
+                ResponseAuditOutcome::allowed(response_account, status)
+            }
+            ResponseStreamOutcome::ResponseError { error_class } => {
+                ResponseAuditOutcome::response_error(error_class, response_account, status)
+            }
         };
-        self.gateway.audit_response(input).await
+        let input = ResponseAuditInput {
+            method: method.to_string(),
+            outcome: audit_outcome,
+            request_body,
+            request_id,
+            target,
+        };
+        gateway.audit_response(input).await
     }
 
     /// Writes the terminal response audit event or reports a fatal error.
     async fn audit_after_response_started(
         self,
-        decision: AuditDecision,
-        error_class: Option<String>,
+        outcome: ResponseStreamOutcome,
     ) -> Result<(), String> {
         let fatal_errors = self.fatal_errors.clone();
-        match self.audit(decision, error_class).await {
+        match self.audit(outcome).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = error.to_string();
@@ -329,13 +352,13 @@ async fn forward_request(
         Err(error) => {
             let status = upstream_error_status(&error);
             let input = ResponseAuditInput {
-                decision: AuditDecision::UpstreamError,
-                error_class: Some(upstream_error_class(&error).to_owned()),
                 method: method.to_string(),
+                outcome: ResponseAuditOutcome::upstream_error(
+                    upstream_error_class(&error),
+                    status.as_u16(),
+                ),
                 request_body,
                 request_id,
-                response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
-                status: Some(status.as_u16()),
                 target: accepted_target,
             };
             gateway.audit_response(input).await?;
@@ -350,15 +373,14 @@ async fn forward_request(
         Ok(response_headers) => response_headers,
         Err(error) => {
             let input = ResponseAuditInput {
-                decision: AuditDecision::ResponseError,
-                error_class: Some(response_header_error_class(error).to_owned()),
                 method: method.to_string(),
+                outcome: ResponseAuditOutcome::response_error(
+                    response_header_error_class(error),
+                    ResponseAccount::new(gateway.config().max_response_bytes()),
+                    StatusCode::BAD_GATEWAY.as_u16(),
+                ),
                 request_body,
                 request_id,
-                response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
-                // The audited status is what the harness receives, not the
-                // discarded upstream status.
-                status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                 target: accepted_target,
             };
             gateway.audit_response(input).await?;
@@ -404,10 +426,9 @@ fn response_stream(
                     send_stream_error(
                         &sender,
                         context
-                            .audit_after_response_started(
-                                AuditDecision::ResponseError,
-                                Some(error_class),
-                            )
+                            .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                                error_class,
+                            })
                             .await,
                         error.to_string(),
                     )
@@ -421,10 +442,9 @@ fn response_stream(
                 send_stream_error(
                     &sender,
                     context
-                        .audit_after_response_started(
-                            AuditDecision::ResponseError,
-                            Some(error_class.clone()),
-                        )
+                        .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                            error_class: error_class.clone(),
+                        })
                         .await,
                     error_class,
                 )
@@ -434,10 +454,9 @@ fn response_stream(
 
             if sender.send(Ok(chunk)).await.is_err() {
                 if let Err(error) = context
-                    .audit_after_response_started(
-                        AuditDecision::ResponseError,
-                        Some("downstream_closed".to_owned()),
-                    )
+                    .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                        error_class: "downstream_closed".to_owned(),
+                    })
                     .await
                 {
                     tracing::error!(%error, "failed to audit downstream close");
@@ -447,7 +466,7 @@ fn response_stream(
         }
 
         if let Err(error) = context
-            .audit_after_response_started(AuditDecision::Allowed, None)
+            .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await
         {
             tracing::error!(%error, "failed to audit completed response");
@@ -613,15 +632,15 @@ const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AppState, ResponseAuditContext, ServeError, production_gateway, proxy, report_fatal_error,
-        request_body_error_status, request_header_error_class, request_header_error_status,
-        response_header_error_class, run_until_server_stops, send_stream_error, serve,
-        synthetic_target, upstream_error_class, upstream_error_status,
+        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, production_gateway,
+        proxy, report_fatal_error, request_body_error_status, request_header_error_class,
+        request_header_error_status, response_header_error_class, run_until_server_stops,
+        send_stream_error, serve, synthetic_target, upstream_error_class, upstream_error_status,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
     use crate::audit::AuditEvent;
-    use crate::audit::{AuditDecision, AuditError, AuditTimestamp, RequestId};
+    use crate::audit::{AuditError, AuditTimestamp, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
@@ -1759,7 +1778,7 @@ mod tests {
         };
 
         let result = context
-            .audit_after_response_started(AuditDecision::Allowed, None)
+            .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
         let fatal = fatal_receiver
             .recv()
