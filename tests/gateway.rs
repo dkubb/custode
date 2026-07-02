@@ -20,9 +20,9 @@ use tracing_subscriber as _;
 use url as _;
 
 use axum::Router;
-use axum::body::Body;
+use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::Request;
+use axum::http::{HeaderMap, Request};
 use axum::routing::any;
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -43,17 +43,22 @@ use tokio::time::sleep;
 /// POSIX `EEXIST` returned when another process holds the lock directory.
 const ALREADY_EXISTS_OS_ERROR: i32 = 17;
 
+/// Maximum body size recorded by the test upstream.
+const MAX_RECORDED_BODY_BYTES: usize = 0x0010_0000;
+
 /// One request observed by the recording upstream.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedRequest {
-    /// `x-api-key` header value, when present.
-    api_key: Option<String>,
-    /// `Authorization` header value, when present.
-    authorization: Option<String>,
+    /// Request body.
+    body: Vec<u8>,
+    /// Request headers.
+    headers: Vec<(String, String)>,
     /// Request method.
     method: String,
     /// Request path.
     path: String,
+    /// Request query string.
+    query: Option<String>,
 }
 
 /// Shared recording of upstream requests.
@@ -188,24 +193,41 @@ impl Drop for GatewayTestLock {
 
 /// Records one upstream request and returns a fixed body.
 async fn record(State(recorder): State<Recorder>, request: Request<Body>) -> &'static str {
-    let header_text = |name: &str| {
-        request
-            .headers()
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .map(str::to_owned)
-    };
+    let (parts, body_stream) = request.into_parts();
+    let recorded_body = to_bytes(body_stream, MAX_RECORDED_BODY_BYTES)
+        .await
+        .expect("recorded body should fit test limit")
+        .to_vec();
     let entry = RecordedRequest {
-        api_key: header_text("x-api-key"),
-        authorization: header_text("authorization"),
-        method: request.method().to_string(),
-        path: request.uri().path().to_owned(),
+        body: recorded_body,
+        headers: recorded_headers(&parts.headers),
+        method: parts.method.to_string(),
+        path: parts.uri.path().to_owned(),
+        query: parts.uri.query().map(str::to_owned),
     };
     recorder
         .lock()
         .expect("recorder mutex should not be poisoned")
         .push(entry);
     "ok"
+}
+
+/// Returns sorted, UTF-8 upstream request headers.
+fn recorded_headers(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut recorded = headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value
+                    .to_str()
+                    .expect("test upstream headers should be UTF-8")
+                    .to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    recorded.sort();
+    recorded
 }
 
 /// Starts a local recording upstream and returns its address and recorder.
@@ -277,6 +299,33 @@ mod tests {
     };
     use pretty_assertions::{assert_eq, assert_ne};
 
+    /// Asserts that a header was not received by the upstream.
+    fn assert_header_absent(request: &RecordedRequest, name: &str) {
+        assert_eq!(
+            header_values(request, name),
+            Vec::<&str>::new(),
+            "{name} should not be forwarded"
+        );
+    }
+
+    /// Asserts all values received for one upstream header.
+    fn assert_header_values(request: &RecordedRequest, name: &str, expected: &[&str]) {
+        assert_eq!(header_values(request, name), expected);
+    }
+
+    /// Returns all recorded values for one header.
+    fn header_values<'request>(
+        request: &'request RecordedRequest,
+        name: &str,
+    ) -> Vec<&'request str> {
+        request
+            .headers
+            .iter()
+            .filter(|entry| entry.0.as_str() == name)
+            .map(|entry| entry.1.as_str())
+            .collect()
+    }
+
     /// Serializes gateway subprocess tests across nextest processes.
     async fn lock_gateway_test() -> GatewayTestLock {
         GatewayTestLock::acquire()
@@ -311,8 +360,10 @@ mod tests {
         let hits = recorded_hits(&recorder);
         assert_eq!(hits.len(), 1);
         let hit = hits.first().expect("one hit should be recorded");
+        assert_eq!(hit.body, b"");
         assert_eq!(hit.method, "GET");
         assert_eq!(hit.path, "/v1/models");
+        assert_eq!(hit.query, None);
 
         let events = gateway.read_audit_events(1).await;
         assert_eq!(events.len(), 1);
@@ -340,11 +391,17 @@ mod tests {
             .expect("gateway request should succeed");
 
         assert_eq!(response.status(), 200);
+        let configured_hits = recorded_hits(&configured_recorder);
         assert_eq!(
-            recorded_hits(&configured_recorder).len(),
+            configured_hits.len(),
             1,
             "configured upstream should be reached"
         );
+        let hit = configured_hits
+            .first()
+            .expect("configured upstream should record one hit");
+        let configured_host = configured.to_string();
+        assert_header_values(hit, "host", &[configured_host.as_str()]);
         assert_eq!(
             recorded_hits(&decoy_recorder).len(),
             0,
@@ -416,7 +473,12 @@ mod tests {
         let response = client
             .get(format!("{}/v1/models", gateway.base_url()))
             .header("authorization", "Bearer harness-token")
+            .header("connection", "x-secret")
+            .header("host", "attacker.invalid")
+            .header("proxy-authorization", "Basic bad")
             .header("x-api-key", "harness-key")
+            .header("x-secret", "hidden")
+            .body("payload")
             .send()
             .await
             .expect("gateway request should succeed");
@@ -425,8 +487,14 @@ mod tests {
         let hits = recorded_hits(&recorder);
         assert_eq!(hits.len(), 1);
         let hit = hits.first().expect("one hit should be recorded");
-        assert_eq!(hit.authorization.as_deref(), Some("Bearer harness-token"));
-        assert_eq!(hit.api_key.as_deref(), Some("harness-key"));
+        let upstream_host = upstream.to_string();
+        assert_eq!(hit.body, b"payload");
+        assert_header_values(hit, "authorization", &["Bearer harness-token"]);
+        assert_header_values(hit, "host", &[upstream_host.as_str()]);
+        assert_header_values(hit, "x-api-key", &["harness-key"]);
+        assert_header_absent(hit, "connection");
+        assert_header_absent(hit, "proxy-authorization");
+        assert_header_absent(hit, "x-secret");
     }
 
     #[tokio::test]
