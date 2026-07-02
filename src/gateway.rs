@@ -2,13 +2,15 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
-    AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, RequestId,
+    AuditBodySummary, AuditError, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
+    AuditTarget, AuditUpstreamTarget, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdSource};
 use ::http::{Error as HttpError, Method};
+use core::num::NonZeroU64;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -139,24 +141,17 @@ impl Gateway {
         error_class: &'static str,
         status: u16,
     ) -> Result<(), GatewayError> {
-        let event = AuditEvent::new_at(
-            AuditEventInput {
-                decision: AuditDecision::Denied,
-                error_class: Some(error_class.to_owned()),
-                method: method.to_string(),
-                request_body_blake3: request_body.and_then(|body| body.digest().map(str::to_owned)),
-                request_bytes: request_body.map_or(0, AccountedBody::byte_count),
-                request_id,
-                response_body_blake3: None,
-                response_bytes: 0,
-                status: Some(status),
-                target,
-                upstream_origin: self.config.upstream_origin().as_str().to_owned(),
-                upstream_path: None,
-                upstream_query: None,
-            },
-            self.clock.now(),
+        let request_summary =
+            request_body.map_or_else(AuditBodySummary::empty, request_body_summary);
+        let request = AuditRequestInput::new(
+            method.to_string(),
+            target,
+            request_id,
+            request_summary,
+            self.config.upstream_origin().as_str().to_owned(),
         );
+        let outcome = AuditOutcome::denied(error_class, status);
+        let event = AuditEvent::new_at(AuditEventInput::new(request, outcome), self.clock.now());
         self.audit.append_event(&event).await?;
         Ok(())
     }
@@ -170,60 +165,35 @@ impl Gateway {
         &self,
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
-        let upstream_path = Some(input.target.path().to_owned());
-        let upstream_query = input.target.query().map(str::to_owned);
-        let (decision, error_class, response_body_blake3, response_bytes, status) =
-            match input.outcome {
-                ResponseAuditOutcome::Allowed {
-                    response_account,
-                    status,
-                } => (
-                    AuditDecision::Allowed,
-                    None,
-                    response_account.finalize_digest(),
-                    response_account.byte_count(),
-                    status,
-                ),
-                ResponseAuditOutcome::ResponseError {
-                    error_class,
-                    response_account,
-                    status,
-                } => (
-                    AuditDecision::ResponseError,
-                    Some(error_class),
-                    response_account.finalize_digest(),
-                    response_account.byte_count(),
-                    status,
-                ),
-                ResponseAuditOutcome::UpstreamError {
-                    error_class,
-                    status,
-                } => (
-                    AuditDecision::UpstreamError,
-                    Some(error_class),
-                    None,
-                    0,
-                    status,
-                ),
-            };
-        let event = AuditEvent::new_at(
-            AuditEventInput {
-                decision,
+        let upstream = AuditUpstreamTarget::from(&input.target);
+        let outcome = match input.outcome {
+            ResponseAuditOutcome::Allowed {
+                response_account,
+                status,
+            } => AuditOutcome::allowed(response_body_summary(&response_account), status, upstream),
+            ResponseAuditOutcome::ResponseError {
                 error_class,
-                method: input.method,
-                request_body_blake3: input.request_body.digest().map(str::to_owned),
-                request_bytes: input.request_body.byte_count(),
-                request_id: input.request_id,
-                response_body_blake3,
-                response_bytes,
-                status: Some(status),
-                target: input.target.into(),
-                upstream_origin: self.config.upstream_origin().as_str().to_owned(),
-                upstream_path,
-                upstream_query,
-            },
-            self.clock.now(),
+                response_account,
+                status,
+            } => AuditOutcome::response_error(
+                error_class,
+                response_body_summary(&response_account),
+                status,
+                upstream,
+            ),
+            ResponseAuditOutcome::UpstreamError {
+                error_class,
+                status,
+            } => AuditOutcome::upstream_error(error_class, status, upstream),
+        };
+        let request = AuditRequestInput::new(
+            input.method,
+            input.target.into(),
+            input.request_id,
+            request_body_summary(&input.request_body),
+            self.config.upstream_origin().as_str().to_owned(),
         );
+        let event = AuditEvent::new_at(AuditEventInput::new(request, outcome), self.clock.now());
         self.audit.append_event(&event).await?;
         Ok(())
     }
@@ -258,6 +228,32 @@ impl Gateway {
     pub(crate) fn next_request_id(&self) -> RequestId {
         self.request_ids.next_request_id()
     }
+}
+
+/// Summarizes an accounted request body for audit logging.
+fn request_body_summary(request_body: &AccountedBody) -> AuditBodySummary {
+    request_body
+        .digest()
+        .map_or_else(AuditBodySummary::empty, |digest| {
+            AuditBodySummary::non_empty(
+                digest.to_owned(),
+                NonZeroU64::new(request_body.byte_count())
+                    .expect("request body digest requires non-zero bytes"),
+            )
+        })
+}
+
+/// Summarizes an accounted response body for audit logging.
+fn response_body_summary(response_account: &ResponseAccount) -> AuditBodySummary {
+    response_account
+        .finalize_digest()
+        .map_or_else(AuditBodySummary::empty, |digest| {
+            AuditBodySummary::non_empty(
+                digest,
+                NonZeroU64::new(response_account.byte_count())
+                    .expect("response body digest requires non-zero bytes"),
+            )
+        })
 }
 
 #[cfg(test)]

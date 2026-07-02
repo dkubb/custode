@@ -2,6 +2,7 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::config::GatewayConfig;
+use core::num::NonZeroU64;
 use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
@@ -96,35 +97,90 @@ pub(crate) struct AuditEvent {
     version: u8,
 }
 
+/// Body accounting summary recorded in audit events.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuditBodySummary {
+    /// Body digest.
+    blake3: Option<String>,
+    /// Body byte count.
+    bytes: u64,
+}
+
 /// Input used to construct an audit event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuditEventInput {
-    /// Audit decision.
-    pub decision: AuditDecision,
-    /// Error class, when one exists.
-    pub error_class: Option<String>,
+    /// Closed audit outcome.
+    outcome: AuditOutcome,
+    /// Request context common to every audit event.
+    request: AuditRequestInput,
+}
+
+/// Closed audit outcome.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum AuditOutcome {
+    /// Request was allowed and completed normally.
+    Allowed {
+        /// Response body summary.
+        response_body: AuditBodySummary,
+        /// Response status returned to the harness.
+        status: u16,
+        /// Upstream target.
+        upstream: AuditUpstreamTarget,
+    },
+
+    /// Request was denied before upstream I/O.
+    Denied {
+        /// Stable error class.
+        error_class: String,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Response handling failed.
+    ResponseError {
+        /// Stable error class.
+        error_class: String,
+        /// Response body summary.
+        response_body: AuditBodySummary,
+        /// Response status returned to the harness.
+        status: u16,
+        /// Upstream target.
+        upstream: AuditUpstreamTarget,
+    },
+
+    /// Upstream request failed before a response completed.
+    UpstreamError {
+        /// Stable error class.
+        error_class: String,
+        /// Response status returned to the harness.
+        status: u16,
+        /// Upstream target.
+        upstream: AuditUpstreamTarget,
+    },
+}
+
+/// Request context common to every audit event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuditRequestInput {
+    /// Request body summary.
+    body: AuditBodySummary,
     /// Request method.
-    pub method: String,
-    /// Request body digest.
-    pub request_body_blake3: Option<String>,
-    /// Request body byte count.
-    pub request_bytes: u64,
+    method: String,
     /// Request identity.
-    pub request_id: RequestId,
-    /// Response body digest.
-    pub response_body_blake3: Option<String>,
-    /// Response body byte count.
-    pub response_bytes: u64,
-    /// Response status, when one exists.
-    pub status: Option<u16>,
+    request_id: RequestId,
     /// Accepted or raw audit target.
-    pub target: AuditTarget,
+    target: AuditTarget,
     /// Configured upstream origin.
-    pub upstream_origin: String,
-    /// Upstream path, when an upstream request was attempted.
-    pub upstream_path: Option<String>,
-    /// Upstream query, when an upstream request was attempted.
-    pub upstream_query: Option<String>,
+    upstream_origin: String,
+}
+
+/// Upstream target recorded when upstream I/O was attempted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuditUpstreamTarget {
+    /// Upstream request path.
+    path: String,
+    /// Upstream request query.
+    query: Option<String>,
 }
 
 /// Request target recorded in the audit log.
@@ -154,6 +210,109 @@ pub(crate) struct RequestId(String);
 #[serde(transparent)]
 pub(crate) struct AuditTimestamp(String);
 
+impl AuditBodySummary {
+    /// Creates an empty body summary.
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self {
+            blake3: None,
+            bytes: 0,
+        }
+    }
+
+    /// Creates a non-empty body summary.
+    #[must_use]
+    pub(crate) const fn non_empty(blake3: String, bytes: NonZeroU64) -> Self {
+        Self {
+            blake3: Some(blake3),
+            bytes: bytes.get(),
+        }
+    }
+}
+
+impl AuditEventInput {
+    /// Creates an audit event input from request context and outcome.
+    #[must_use]
+    pub(crate) const fn new(request: AuditRequestInput, outcome: AuditOutcome) -> Self {
+        Self { outcome, request }
+    }
+}
+
+impl AuditOutcome {
+    /// Creates an allowed outcome.
+    #[must_use]
+    pub(crate) const fn allowed(
+        response_body: AuditBodySummary,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        Self::Allowed {
+            response_body,
+            status,
+            upstream,
+        }
+    }
+
+    /// Creates a denied outcome.
+    #[must_use]
+    pub(crate) fn denied(error_class: impl Into<String>, status: u16) -> Self {
+        Self::Denied {
+            error_class: error_class.into(),
+            status,
+        }
+    }
+
+    /// Creates a response-error outcome.
+    #[must_use]
+    pub(crate) fn response_error(
+        error_class: impl Into<String>,
+        response_body: AuditBodySummary,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        Self::ResponseError {
+            error_class: error_class.into(),
+            response_body,
+            status,
+            upstream,
+        }
+    }
+
+    /// Creates an upstream-error outcome.
+    #[must_use]
+    pub(crate) fn upstream_error(
+        error_class: impl Into<String>,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        Self::UpstreamError {
+            error_class: error_class.into(),
+            status,
+            upstream,
+        }
+    }
+}
+
+impl AuditRequestInput {
+    /// Creates request context common to every audit event.
+    #[must_use]
+    pub(crate) const fn new(
+        method: String,
+        target: AuditTarget,
+        request_id: RequestId,
+        body: AuditBodySummary,
+        upstream_origin: String,
+    ) -> Self {
+        Self {
+            body,
+            method,
+            request_id,
+            target,
+            upstream_origin,
+        }
+    }
+}
+
 impl AuditTarget {
     /// Creates an audit target from raw request URI parts.
     #[must_use]
@@ -181,6 +340,24 @@ impl AuditTarget {
     }
 }
 
+#[cfg(test)]
+impl AuditUpstreamTarget {
+    /// Creates an upstream target from forwarded path and query.
+    #[must_use]
+    const fn new(path: String, query: Option<String>) -> Self {
+        Self { path, query }
+    }
+}
+
+impl From<&AcceptedTarget> for AuditUpstreamTarget {
+    fn from(target: &AcceptedTarget) -> Self {
+        Self {
+            path: target.path().to_owned(),
+            query: target.query().map(str::to_owned),
+        }
+    }
+}
+
 impl From<AcceptedTarget> for AuditTarget {
     fn from(target: AcceptedTarget) -> Self {
         Self {
@@ -201,22 +378,81 @@ impl AuditEvent {
     /// Creates an audit event for a request decision at a supplied timestamp.
     #[must_use]
     pub(crate) fn new_at(input: AuditEventInput, timestamp: AuditTimestamp) -> Self {
+        let AuditEventInput { request, outcome } = input;
+        let AuditRequestInput {
+            body: request_body,
+            method,
+            request_id,
+            target,
+            upstream_origin,
+        } = request;
+        let (decision, error_class, response_body, status, upstream) = match outcome {
+            AuditOutcome::Allowed {
+                response_body,
+                status,
+                upstream,
+            } => (
+                AuditDecision::Allowed,
+                None,
+                response_body,
+                Some(status),
+                Some(upstream),
+            ),
+            AuditOutcome::Denied {
+                error_class,
+                status,
+            } => (
+                AuditDecision::Denied,
+                Some(error_class),
+                AuditBodySummary::empty(),
+                Some(status),
+                None,
+            ),
+            AuditOutcome::ResponseError {
+                error_class,
+                response_body,
+                status,
+                upstream,
+            } => (
+                AuditDecision::ResponseError,
+                Some(error_class),
+                response_body,
+                Some(status),
+                Some(upstream),
+            ),
+            AuditOutcome::UpstreamError {
+                error_class,
+                status,
+                upstream,
+            } => (
+                AuditDecision::UpstreamError,
+                Some(error_class),
+                AuditBodySummary::empty(),
+                Some(status),
+                Some(upstream),
+            ),
+        };
+        let (upstream_path, upstream_query) = match upstream {
+            Some(upstream_target) => (Some(upstream_target.path), upstream_target.query),
+            None => (None, None),
+        };
+
         Self {
-            decision: input.decision,
-            error_class: input.error_class,
-            method: input.method,
-            path: input.target.path().to_owned(),
-            query: input.target.query().map(str::to_owned),
-            request_body_blake3: input.request_body_blake3,
-            request_bytes: input.request_bytes,
-            request_id: input.request_id,
-            response_body_blake3: input.response_body_blake3,
-            response_bytes: input.response_bytes,
-            status: input.status,
+            decision,
+            error_class,
+            method,
+            path: target.path().to_owned(),
+            query: target.query().map(str::to_owned),
+            request_body_blake3: request_body.blake3,
+            request_bytes: request_body.bytes,
+            request_id,
+            response_body_blake3: response_body.blake3,
+            response_bytes: response_body.bytes,
+            status,
             timestamp,
-            upstream_origin: input.upstream_origin,
-            upstream_path: input.upstream_path,
-            upstream_query: input.upstream_query,
+            upstream_origin,
+            upstream_path,
+            upstream_query,
             version: 1,
         }
     }
@@ -320,8 +556,8 @@ impl AuditTimestamp {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditTarget, AuditTimestamp,
-        AuditWriter, RequestId,
+        AuditBodySummary, AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditOutcome,
+        AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::config::GatewayConfig;
@@ -333,23 +569,42 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
 
+    /// Builds common request audit input for tests.
+    fn request_input(
+        method: &str,
+        target: AuditTarget,
+        body: AuditBodySummary,
+    ) -> AuditRequestInput {
+        AuditRequestInput::new(
+            method.to_owned(),
+            target,
+            RequestId::from_parts("run", 1),
+            body,
+            "https://api.openai.com".to_owned(),
+        )
+    }
+
+    /// Builds a denied audit input for tests.
+    fn denied_input(
+        method: &str,
+        target: AuditTarget,
+        error_class: &str,
+        status: u16,
+    ) -> AuditEventInput {
+        AuditEventInput::new(
+            request_input(method, target, AuditBodySummary::empty()),
+            AuditOutcome::denied(error_class, status),
+        )
+    }
+
     /// Builds a denied-decision event for writer tests.
     fn denied_event() -> AuditEvent {
-        AuditEvent::new(AuditEventInput {
-            decision: AuditDecision::Denied,
-            error_class: Some("method_denied".to_owned()),
-            method: "DELETE".to_owned(),
-            request_body_blake3: None,
-            request_bytes: 0,
-            request_id: RequestId::from_parts("run", 1),
-            response_body_blake3: None,
-            response_bytes: 0,
-            status: Some(403),
-            target: AuditTarget::from_uri_parts("/v1/models", None),
-            upstream_origin: "https://api.openai.com".to_owned(),
-            upstream_path: None,
-            upstream_query: None,
-        })
+        AuditEvent::new(denied_input(
+            "DELETE",
+            AuditTarget::from_uri_parts("/v1/models", None),
+            "method_denied",
+            403,
+        ))
     }
 
     /// A roomy audit event limit for tests that should not hit the bound.
@@ -359,22 +614,12 @@ mod tests {
 
     #[test]
     fn new_preserves_status() {
-        let target = AuditTarget::from_uri_parts("/v1/models", None);
-        let input = AuditEventInput {
-            request_id: RequestId::from_parts("run", 1),
-            decision: AuditDecision::Denied,
-            method: "CONNECT".to_owned(),
-            target,
-            upstream_origin: "https://api.openai.com".to_owned(),
-            upstream_path: None,
-            upstream_query: None,
-            status: Some(405),
-            request_bytes: 0,
-            response_bytes: 0,
-            request_body_blake3: None,
-            response_body_blake3: None,
-            error_class: Some("connect_unsupported".to_owned()),
-        };
+        let input = denied_input(
+            "CONNECT",
+            AuditTarget::from_uri_parts("/v1/models", None),
+            "connect_unsupported",
+            405,
+        );
 
         let event = AuditEvent::new(input);
         let expected = Some(405);
@@ -385,21 +630,7 @@ mod tests {
     #[test]
     fn new_preserves_rejected_raw_path() {
         let target = AuditTarget::from_uri_parts("/v1/responses/%2e%2e/models", Some("limit=1"));
-        let input = AuditEventInput {
-            request_id: RequestId::from_parts("run", 1),
-            decision: AuditDecision::Denied,
-            method: "GET".to_owned(),
-            target,
-            upstream_origin: "https://api.openai.com".to_owned(),
-            upstream_path: None,
-            upstream_query: None,
-            status: Some(400),
-            request_bytes: 0,
-            response_bytes: 0,
-            request_body_blake3: None,
-            response_body_blake3: None,
-            error_class: Some("dot_segment".to_owned()),
-        };
+        let input = denied_input("GET", target, "dot_segment", 400);
 
         let event = AuditEvent::new(input);
 
@@ -424,22 +655,12 @@ mod tests {
 
     #[test]
     fn event_serializes_documented_fields_and_null_semantics() {
-        let target = AuditTarget::from_uri_parts("/v1/models", None);
-        let input = AuditEventInput {
-            request_id: RequestId::from_parts("run", 1),
-            decision: AuditDecision::Denied,
-            method: "DELETE".to_owned(),
-            target,
-            upstream_origin: "https://api.openai.com".to_owned(),
-            upstream_path: None,
-            upstream_query: None,
-            status: Some(403),
-            request_bytes: 0,
-            response_bytes: 0,
-            request_body_blake3: None,
-            response_body_blake3: None,
-            error_class: Some("method_not_allowed".to_owned()),
-        };
+        let input = denied_input(
+            "DELETE",
+            AuditTarget::from_uri_parts("/v1/models", None),
+            "method_not_allowed",
+            403,
+        );
 
         let value = serde_json::to_value(AuditEvent::new(input)).expect("event should serialize");
 
@@ -652,22 +873,16 @@ mod tests {
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod proptests {
-    use super::{AuditDecision, AuditEvent, AuditEventInput, AuditTarget, RequestId};
+    use super::{
+        AuditBodySummary, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
+        AuditTarget, AuditUpstreamTarget, RequestId,
+    };
     use crate::allowlist::AcceptedTarget;
+    use core::num::NonZeroU64;
     use core::time::Duration;
     use proptest::option;
     use proptest::prelude::*;
     use std::time::UNIX_EPOCH;
-
-    /// Every member of the closed decision set.
-    fn decision_any() -> impl Strategy<Value = AuditDecision> {
-        prop_oneof![
-            Just(AuditDecision::Allowed),
-            Just(AuditDecision::Denied),
-            Just(AuditDecision::ResponseError),
-            Just(AuditDecision::UpstreamError),
-        ]
-    }
 
     /// BLAKE3 hex digest shaped strings.
     fn hex_digest() -> impl Strategy<Value = String> {
@@ -685,73 +900,107 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn event_serialization_preserves_option_semantics(
-            decision in decision_any(),
+        fn event_serialization_preserves_variant_semantics(
+            outcome_kind in 0_u8..4,
             method in "[A-Z]{3,8}",
             path in raw_path(),
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
-            upstream in option::of((
-                "/[A-Za-z0-9/_-]{0,20}",
-                option::of("[a-z]{1,5}=[a-z]{1,5}"),
-            )),
-            status in option::of(any::<u16>()),
-            request_bytes in any::<u64>(),
-            response_bytes in any::<u64>(),
-            request_digest in option::of(hex_digest()),
-            response_digest in option::of(hex_digest()),
-            error_class in option::of("[a-z_]{1,20}"),
+            upstream_path in "/[A-Za-z0-9/_-]{0,20}",
+            upstream_query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
+            status in any::<u16>(),
+            request_bytes in 1_u64..=u64::MAX,
+            response_bytes in 1_u64..=u64::MAX,
+            request_digest in hex_digest(),
+            response_digest in hex_digest(),
+            error_class in "[a-z_]{1,20}",
             run_token in "[0-9a-f]{1,16}",
             sequence in any::<u64>(),
         ) {
-            let (upstream_path, upstream_query) = match upstream {
-                Some((upstream_path, upstream_query)) => (Some(upstream_path), upstream_query),
-                None => (None, None),
+            let request_body = AuditBodySummary::non_empty(
+                request_digest.clone(),
+                NonZeroU64::new(request_bytes)
+                    .expect("generated request byte count should be non-zero"),
+            );
+            let response_body = AuditBodySummary::non_empty(
+                response_digest.clone(),
+                NonZeroU64::new(response_bytes)
+                    .expect("generated response byte count should be non-zero"),
+            );
+            let upstream =
+                AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
+            let (outcome, decision, expected_error, expected_response_digest, expected_response_bytes, expected_upstream) = match outcome_kind {
+                0 => (
+                    AuditOutcome::allowed(response_body, status, upstream),
+                    "allowed",
+                    None,
+                    Some(response_digest.as_str()),
+                    response_bytes,
+                    Some((upstream_path.as_str(), upstream_query.as_deref())),
+                ),
+                1 => (
+                    AuditOutcome::denied(error_class.clone(), status),
+                    "denied",
+                    Some(error_class.as_str()),
+                    None,
+                    0,
+                    None,
+                ),
+                2 => (
+                    AuditOutcome::response_error(
+                        error_class.clone(),
+                        response_body,
+                        status,
+                        upstream,
+                    ),
+                    "response_error",
+                    Some(error_class.as_str()),
+                    Some(response_digest.as_str()),
+                    response_bytes,
+                    Some((upstream_path.as_str(), upstream_query.as_deref())),
+                ),
+                _ => (
+                    AuditOutcome::upstream_error(error_class.clone(), status, upstream),
+                    "upstream_error",
+                    Some(error_class.as_str()),
+                    None,
+                    0,
+                    Some((upstream_path.as_str(), upstream_query.as_deref())),
+                ),
             };
-            let input = AuditEventInput {
-                request_id: RequestId::from_parts(&run_token, sequence),
-                decision,
+            let request = AuditRequestInput::new(
                 method,
-                target: AuditTarget::from_uri_parts(&path, query.as_deref()),
-                upstream_origin: "https://api.openai.com".to_owned(),
-                upstream_path: upstream_path.clone(),
-                upstream_query: upstream_query.clone(),
-                status,
-                request_bytes,
-                response_bytes,
-                request_body_blake3: request_digest.clone(),
-                response_body_blake3: response_digest.clone(),
-                error_class: error_class.clone(),
-            };
+                AuditTarget::from_uri_parts(&path, query.as_deref()),
+                RequestId::from_parts(&run_token, sequence),
+                request_body,
+                "https://api.openai.com".to_owned(),
+            );
+            let input = AuditEventInput::new(request, outcome);
 
             let value = serde_json::to_value(AuditEvent::new(input))
                 .expect("event should serialize");
             let object = value.as_object().expect("event should be a JSON object");
 
             prop_assert_eq!(object.len(), 16);
-            let decision_text = object["decision"]
-                .as_str()
-                .expect("decision should be a string");
-            prop_assert!(
-                ["allowed", "denied", "response_error", "upstream_error"]
-                    .contains(&decision_text)
-            );
+            prop_assert_eq!(object["decision"].as_str(), Some(decision));
             let expected_path = if path.is_empty() { "/" } else { path.as_str() };
             prop_assert_eq!(object["path"].as_str(), Some(expected_path));
-            prop_assert_eq!(object["upstream_path"].is_null(), upstream_path.is_none());
-            prop_assert_eq!(object["upstream_query"].is_null(), upstream_query.is_none());
+            if let Some((expected_upstream_path, expected_upstream_query)) = expected_upstream {
+                prop_assert_eq!(object["upstream_path"].as_str(), Some(expected_upstream_path));
+                prop_assert_eq!(object["upstream_query"].as_str(), expected_upstream_query);
+            } else {
+                prop_assert!(object["upstream_path"].is_null());
+                prop_assert!(object["upstream_query"].is_null());
+            }
             prop_assert_eq!(object["query"].is_null(), query.is_none());
-            prop_assert_eq!(object["status"].is_null(), status.is_none());
+            prop_assert_eq!(object["status"].as_u64(), Some(u64::from(status)));
             prop_assert_eq!(
-                object["request_body_blake3"].is_null(),
-                request_digest.is_none()
+                object["request_body_blake3"].as_str(),
+                Some(request_digest.as_str())
             );
-            prop_assert_eq!(
-                object["response_body_blake3"].is_null(),
-                response_digest.is_none()
-            );
-            prop_assert_eq!(object["error_class"].is_null(), error_class.is_none());
+            prop_assert_eq!(object["response_body_blake3"].as_str(), expected_response_digest);
+            prop_assert_eq!(object["error_class"].as_str(), expected_error);
             prop_assert_eq!(object["request_bytes"].as_u64(), Some(request_bytes));
-            prop_assert_eq!(object["response_bytes"].as_u64(), Some(response_bytes));
+            prop_assert_eq!(object["response_bytes"].as_u64(), Some(expected_response_bytes));
         }
 
         #[test]
