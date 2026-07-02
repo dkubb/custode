@@ -186,9 +186,10 @@ mod tests {
         ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_client_build_error,
         upstream_error_kind_from_reqwest,
     };
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
-    use crate::config::UpstreamOrigin;
+    use crate::config::{GatewayConfig, UpstreamOrigin};
+    use crate::headers::forward_request_headers;
     use crate::ports::{Clock as _, UpstreamClient as _, UpstreamErrorKind, UpstreamRequest};
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
@@ -197,6 +198,7 @@ mod tests {
     use core::time::Duration;
     use futures_util::StreamExt as _;
     use pretty_assertions::assert_eq;
+    use std::path::PathBuf;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
     use tokio::time::sleep;
@@ -219,20 +221,23 @@ mod tests {
 
     async fn empty_upstream_request(origin_text: &str) -> UpstreamRequest {
         let origin = UpstreamOrigin::parse(origin_text).expect("test origin should parse");
-        let target = AcceptedTarget::new("/v1/models", None).expect("target should parse");
+        let config =
+            GatewayConfig::for_runtime_test(PathBuf::from("/unused/audit.ndjson"), origin_text);
+        let accepted_target = AcceptedTarget::new("/v1/models", None).expect("target should parse");
+        let allowed_target =
+            allow_target(&config, &Method::GET, accepted_target).expect("target should be allowed");
+        let headers = forward_request_headers(
+            &HeaderMap::new(),
+            NonZeroUsize::new(1024).expect("limit should be non-zero"),
+        )
+        .expect("headers should be forwarded");
         let request_body = AccountedBody::read_request(
             Body::empty(),
             NonZeroUsize::new(1).expect("limit should be non-zero"),
         )
         .await
         .expect("request body should be accounted");
-        UpstreamRequest::from_target(
-            Method::GET,
-            &origin,
-            &target,
-            HeaderMap::new(),
-            &request_body,
-        )
+        UpstreamRequest::from_target(&origin, &allowed_target, headers, &request_body)
     }
 
     async fn released_origin() -> String {

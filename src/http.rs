@@ -3,16 +3,18 @@
 use crate::adapters::{
     ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
 };
-use crate::allowlist::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
+use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
 use crate::audit::{AuditDecision, AuditTarget, AuditWriter, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput};
-use crate::headers::{HeaderError, forward_request_headers, forward_response_headers};
+use crate::headers::{
+    ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
+};
 use crate::ports::{
     UpstreamClient, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
-use ::http::{HeaderMap, Method, Uri};
+use ::http::{Method, Uri};
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{Request, Response, StatusCode};
@@ -134,7 +136,7 @@ async fn accept_allowed_target(
     request_id: &RequestId,
     method: &Method,
     uri: &Uri,
-) -> Result<Result<AcceptedTarget, Response<Body>>, GatewayError> {
+) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
         let target = synthetic_target(uri);
         gateway
@@ -183,22 +185,22 @@ async fn accept_allowed_target(
         }
     };
 
-    if !is_allowed(gateway.config(), method, &target) {
-        let reason = rejection_for(gateway.config(), method);
-        gateway
-            .audit_denial(
-                request_id.clone(),
-                method,
-                target.into(),
-                None,
-                reason.error_class(),
-                StatusCode::FORBIDDEN.as_u16(),
-            )
-            .await?;
-        return Ok(Err(status_response(StatusCode::FORBIDDEN)));
+    match allow_target(gateway.config(), method, target.clone()) {
+        Ok(allowed_target) => Ok(Ok(allowed_target)),
+        Err(reason) => {
+            gateway
+                .audit_denial(
+                    request_id.clone(),
+                    method,
+                    target.into(),
+                    None,
+                    reason.error_class(),
+                    StatusCode::FORBIDDEN.as_u16(),
+                )
+                .await?;
+            Ok(Err(status_response(StatusCode::FORBIDDEN)))
+        }
     }
-
-    Ok(Ok(target))
 }
 
 /// Handles one proxied request.
@@ -269,7 +271,7 @@ async fn handle_request(
                     .audit_denial(
                         request_id,
                         &method,
-                        target.into(),
+                        target.target().clone().into(),
                         None,
                         request_header_error_class(error),
                         status.as_u16(),
@@ -288,7 +290,7 @@ async fn handle_request(
                     .audit_denial(
                         request_id,
                         &method,
-                        target.into(),
+                        target.target().clone().into(),
                         None,
                         error.error_class(),
                         status.as_u16(),
@@ -303,7 +305,6 @@ async fn handle_request(
         gateway,
         client,
         request_id,
-        method,
         target,
         request_headers,
         request_body,
@@ -312,24 +313,20 @@ async fn handle_request(
 }
 
 /// Forwards an accepted request to the configured upstream.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the forwarding step threads every accepted request component"
-)]
 async fn forward_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
     client: Arc<dyn UpstreamClient>,
     request_id: RequestId,
-    method: Method,
-    target: AcceptedTarget,
-    request_headers: HeaderMap,
+    target: AllowedTarget,
+    request_headers: ForwardedRequestHeaders,
     request_body: AccountedBody,
 ) -> Result<Response<Body>, GatewayError> {
-    let upstream_path = target.path().to_owned();
-    let upstream_query = target.query().map(str::to_owned);
+    let method = target.method().clone();
+    let accepted_target = target.target().clone();
+    let upstream_path = accepted_target.path().to_owned();
+    let upstream_query = accepted_target.query().map(str::to_owned);
     let upstream_request = UpstreamRequest::from_target(
-        method.clone(),
         gateway.config().upstream_origin(),
         &target,
         request_headers,
@@ -347,7 +344,7 @@ async fn forward_request(
                 request_id,
                 response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
                 status: Some(status.as_u16()),
-                target,
+                target: accepted_target,
                 upstream_path,
                 upstream_query,
             };
@@ -372,7 +369,7 @@ async fn forward_request(
                 // The audited status is what the harness receives, not the
                 // discarded upstream status.
                 status: Some(StatusCode::BAD_GATEWAY.as_u16()),
-                target,
+                target: accepted_target,
                 upstream_path,
                 upstream_query,
             };
@@ -389,7 +386,7 @@ async fn forward_request(
         request_id,
         response_account,
         status: status.as_u16(),
-        target,
+        target: accepted_target,
         upstream_path,
         upstream_query,
     };

@@ -17,6 +17,28 @@ pub(crate) enum HeaderError {
     TooLarge,
 }
 
+/// Request headers proven safe for upstream forwarding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForwardedRequestHeaders {
+    /// Filtered request headers.
+    headers: HeaderMap,
+}
+
+impl ForwardedRequestHeaders {
+    /// Returns the filtered request headers for tests and composition.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn as_header_map(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Consumes the witness and returns the filtered header map.
+    #[must_use]
+    pub(crate) fn into_header_map(self) -> HeaderMap {
+        self.headers
+    }
+}
+
 /// Returns the dynamic header names listed by `Connection`.
 fn connection_header_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, HeaderError> {
     let mut names = Vec::new();
@@ -64,7 +86,7 @@ fn enforce_header_limit(
 pub(crate) fn forward_request_headers(
     incoming: &HeaderMap,
     max_header_bytes: NonZeroUsize,
-) -> Result<HeaderMap, HeaderError> {
+) -> Result<ForwardedRequestHeaders, HeaderError> {
     enforce_header_limit(incoming, max_header_bytes)?;
     let connection_headers = connection_header_names(incoming)?;
 
@@ -75,7 +97,7 @@ pub(crate) fn forward_request_headers(
         }
     }
 
-    Ok(outgoing)
+    Ok(ForwardedRequestHeaders { headers: outgoing })
 }
 
 /// Applies response header filtering before returning to the harness.
@@ -146,7 +168,7 @@ mod tests {
         )
         .expect("headers should fit");
 
-        assert_eq!(forwarded.get("x-trace"), None);
+        assert_eq!(forwarded.as_header_map().get("x-trace"), None);
     }
 
     #[test]
@@ -163,15 +185,15 @@ mod tests {
         .expect("headers should fit");
 
         assert_eq!(
-            forwarded.get(AUTHORIZATION),
+            forwarded.as_header_map().get(AUTHORIZATION),
             Some(&HeaderValue::from_static("Bearer harness")),
         );
         assert_eq!(
-            forwarded.get("x-api-key"),
+            forwarded.as_header_map().get("x-api-key"),
             Some(&HeaderValue::from_static("harness-key")),
         );
         assert_eq!(
-            forwarded.get(COOKIE),
+            forwarded.as_header_map().get(COOKIE),
             Some(&HeaderValue::from_static("session=bad")),
         );
     }
@@ -190,11 +212,11 @@ mod tests {
         .expect("headers should fit");
 
         assert_eq!(
-            forwarded.get("x-visible"),
+            forwarded.as_header_map().get("x-visible"),
             Some(&HeaderValue::from_static("ok")),
         );
-        assert_eq!(forwarded.get(HOST), None);
-        assert_eq!(forwarded.get(PROXY_AUTHORIZATION), None);
+        assert_eq!(forwarded.as_header_map().get(HOST), None);
+        assert_eq!(forwarded.as_header_map().get(PROXY_AUTHORIZATION), None);
     }
 
     #[test]
@@ -224,7 +246,7 @@ mod tests {
         .expect("headers at the exact limit should fit");
 
         assert_eq!(
-            forwarded.get("x-wide"),
+            forwarded.as_header_map().get("x-wide"),
             Some(&HeaderValue::from_static("0123456789")),
         );
     }
@@ -379,11 +401,11 @@ mod proptests {
             let forwarded = forward_request_headers(&incoming, roomy_limit())
                 .expect("generated headers should fit");
 
-            prop_assert!(forwarded.get(HOST).is_none());
-            prop_assert!(forwarded.get(CONNECTION).is_none());
+            prop_assert!(forwarded.as_header_map().get(HOST).is_none());
+            prop_assert!(forwarded.as_header_map().get(CONNECTION).is_none());
             for name in hop_by_hop.iter().map(|entry| entry.0.as_str()) {
                 let message = format!("hop-by-hop {name} should be stripped");
-                prop_assert!(!forwarded.contains_key(name), "{}", message);
+                prop_assert!(!forwarded.as_header_map().contains_key(name), "{}", message);
             }
             for name in end_to_end.iter().map(|entry| entry.0.as_str()) {
                 let stripped = connection_named.iter().any(|token| token == name);
@@ -392,7 +414,8 @@ mod proptests {
                 } else {
                     incoming.get_all(name).iter().collect()
                 };
-                let actual: Vec<&HeaderValue> = forwarded.get_all(name).iter().collect();
+                let actual: Vec<&HeaderValue> =
+                    forwarded.as_header_map().get_all(name).iter().collect();
                 prop_assert_eq!(actual, expected);
             }
         }

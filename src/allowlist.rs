@@ -12,6 +12,15 @@ pub(crate) struct AcceptedTarget {
     query: Option<String>,
 }
 
+/// Request target proven to match the configured allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AllowedTarget {
+    /// Allowed request method.
+    method: Method,
+    /// Accepted target matched by the method.
+    target: AcceptedTarget,
+}
+
 impl AcceptedTarget {
     /// Creates a target from an origin-form request path and optional query.
     ///
@@ -46,6 +55,20 @@ impl AcceptedTarget {
     #[must_use]
     pub(crate) fn query(&self) -> Option<&str> {
         self.query.as_deref()
+    }
+}
+
+impl AllowedTarget {
+    /// Returns the allowed request method.
+    #[must_use]
+    pub(crate) const fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Returns the allowlist-matched target.
+    #[must_use]
+    pub(crate) const fn target(&self) -> &AcceptedTarget {
+        &self.target
     }
 }
 
@@ -121,7 +144,7 @@ impl RejectionReason {
 
 /// Checks whether a request is allowed by the configured method and path sets.
 #[must_use]
-pub(crate) fn is_allowed(config: &GatewayConfig, method: &Method, target: &AcceptedTarget) -> bool {
+fn is_allowed(config: &GatewayConfig, method: &Method, target: &AcceptedTarget) -> bool {
     config
         .allowed_operations()
         .iter()
@@ -130,7 +153,7 @@ pub(crate) fn is_allowed(config: &GatewayConfig, method: &Method, target: &Accep
 
 /// Returns the rejection reason for a denied method.
 #[must_use]
-pub(crate) fn rejection_for(config: &GatewayConfig, method: &Method) -> RejectionReason {
+fn rejection_for(config: &GatewayConfig, method: &Method) -> RejectionReason {
     if config
         .allowed_operations()
         .iter()
@@ -139,6 +162,27 @@ pub(crate) fn rejection_for(config: &GatewayConfig, method: &Method) -> Rejectio
         RejectionReason::PathDenied
     } else {
         RejectionReason::MethodDenied
+    }
+}
+
+/// Proves that an accepted target is allowed for the supplied method.
+///
+/// # Errors
+///
+/// Returns a rejection reason when the method or path is outside the
+/// configured allowlist.
+pub(crate) fn allow_target(
+    config: &GatewayConfig,
+    method: &Method,
+    target: AcceptedTarget,
+) -> Result<AllowedTarget, RejectionReason> {
+    if is_allowed(config, method, &target) {
+        Ok(AllowedTarget {
+            method: method.clone(),
+            target,
+        })
+    } else {
+        Err(rejection_for(config, method))
     }
 }
 

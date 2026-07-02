@@ -1,9 +1,10 @@
 //! Runtime port traits and values.
 
-use crate::allowlist::AcceptedTarget;
+use crate::allowlist::AllowedTarget;
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp, RequestId};
 use crate::body::AccountedBody;
 use crate::config::UpstreamOrigin;
+use crate::headers::ForwardedRequestHeaders;
 use axum::body::Bytes;
 use core::fmt;
 use core::future::Future;
@@ -138,20 +139,19 @@ impl UpstreamRequest {
         &self.body
     }
 
-    /// Creates an upstream request from the configured origin and accepted target.
+    /// Creates an upstream request from proof-carrying forwarding inputs.
     #[must_use]
     pub(crate) fn from_target(
-        method: Method,
         origin: &UpstreamOrigin,
-        target: &AcceptedTarget,
-        headers: HeaderMap,
+        target: &AllowedTarget,
+        headers: ForwardedRequestHeaders,
         body: &AccountedBody,
     ) -> Self {
         Self {
             body: body.bytes().to_vec(),
-            headers,
-            method,
-            url: origin.join_path_query(target.path(), target.query()),
+            headers: headers.into_header_map(),
+            method: target.method().clone(),
+            url: origin.join_path_query(target.target().path(), target.target().query()),
         }
     }
 
@@ -249,13 +249,15 @@ mod tests {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod proptests {
     use super::UpstreamRequest;
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
-    use crate::config::UpstreamOrigin;
+    use crate::config::{GatewayConfig, UpstreamOrigin};
+    use crate::headers::forward_request_headers;
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::num::NonZeroUsize;
     use proptest::prelude::*;
+    use std::path::PathBuf;
     use tokio::runtime::Runtime;
 
     proptest! {
@@ -270,18 +272,28 @@ mod proptests {
                 .expect("request body should be accounted");
             let origin = UpstreamOrigin::parse("https://api.openai.com")
                 .expect("origin should parse");
+            let config = GatewayConfig::for_runtime_test(
+                PathBuf::from("/unused/audit.ndjson"),
+                origin.as_str(),
+            );
             let target = AcceptedTarget::new("/v1/models", query.as_deref())
                 .expect("target should parse");
+            let allowed = allow_target(&config, &Method::GET, target.clone())
+                .expect("target should be allowed");
+            let headers = forward_request_headers(
+                &HeaderMap::new(),
+                NonZeroUsize::new(1024).expect("limit should be non-zero"),
+            )
+                .expect("headers should be forwarded");
 
             let request = UpstreamRequest::from_target(
-                Method::POST,
                 &origin,
-                &target,
-                HeaderMap::new(),
+                &allowed,
+                headers,
                 &body,
             );
 
-            prop_assert_eq!(request.method(), &Method::POST);
+            prop_assert_eq!(request.method(), &Method::GET);
             prop_assert_eq!(request.url().path(), target.path());
             prop_assert_eq!(request.url().query(), target.query());
             prop_assert_eq!(request.body(), b"payload");
