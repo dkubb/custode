@@ -23,12 +23,15 @@ docs:
 deny:
     cargo deny check --config .cargo/deny.toml
 
+dockerfile-check:
+    docker buildx build --check .
+
 docker-build:
     docker compose build proxy harness
 
 docker-test:
     scripts/container-test.sh
 
-check: fmt-check lint test
+check: fmt-check lint test dockerfile-check
 
 ci: check deny
