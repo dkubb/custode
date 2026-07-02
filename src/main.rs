@@ -7,6 +7,7 @@ use custode::Cli;
 use futures_util as _;
 use http as _;
 use http_body_util as _;
+use humantime as _;
 use reqwest as _;
 use serde as _;
 use serde_json as _;

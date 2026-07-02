@@ -6,7 +6,7 @@ use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::AsyncWriteExt as _;
@@ -82,9 +82,9 @@ pub(crate) struct AuditEvent {
     response_body_blake3: Option<String>,
     /// Response body bytes.
     response_bytes: u64,
-    /// Response status, when one exists.
+    /// Response status returned to the harness, when one exists.
     status: Option<u16>,
-    /// Unix timestamp string.
+    /// RFC 3339 UTC timestamp.
     timestamp: String,
     /// Configured upstream origin.
     upstream_origin: String,
@@ -115,7 +115,7 @@ pub(crate) struct AuditEventInput {
     pub response_body_blake3: Option<String>,
     /// Response body byte count.
     pub response_bytes: u64,
-    /// Response status, when one exists.
+    /// Response status returned to the harness, when one exists.
     pub status: Option<u16>,
     /// Accepted or raw audit target.
     pub target: AuditTarget,
@@ -201,7 +201,7 @@ impl AuditEvent {
             response_body_blake3: input.response_body_blake3,
             response_bytes: input.response_bytes,
             status: input.status,
-            timestamp: unix_timestamp(),
+            timestamp: rfc3339_timestamp(),
             upstream_origin: input.upstream_origin,
             upstream_path: input.upstream_path,
             upstream_query: input.upstream_query,
@@ -274,12 +274,9 @@ impl RequestId {
     }
 }
 
-/// Returns the current Unix timestamp for audit events.
-fn unix_timestamp() -> String {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should not be before the Unix epoch");
-    format!("{}.{:09}Z", duration.as_secs(), duration.subsec_nanos())
+/// Returns the current RFC 3339 UTC timestamp for audit events.
+fn rfc3339_timestamp() -> String {
+    humantime::format_rfc3339_nanos(SystemTime::now()).to_string()
 }
 
 #[cfg(test)]
