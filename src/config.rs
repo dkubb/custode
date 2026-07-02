@@ -536,17 +536,18 @@ fn non_zero_usize(name: &'static str, value: usize) -> Result<NonZeroUsize, Conf
 
 /// Parses allowed operation strings and rejects an empty operation set.
 fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperation>, ConfigError> {
-    let parsed = operations
-        .into_iter()
-        .filter(|operation| !operation.is_empty())
-        .map(|operation| AllowedOperation::parse(&operation))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if parsed.is_empty() {
+    // An entirely empty list (no entries, or the single empty entry an unset
+    // environment variable produces) is a missing allowlist. An empty entry
+    // mixed with real entries is an invalid operation, not something to skip
+    // silently.
+    if operations.iter().all(String::is_empty) {
         return Err(ConfigError::EmptyOperations);
     }
 
-    Ok(parsed)
+    operations
+        .into_iter()
+        .map(|operation| AllowedOperation::parse(&operation))
+        .collect()
 }
 
 /// Parses an allowed path string.

@@ -47,3 +47,13 @@ fn empty_operations_fail_closed() {
         ));
     }
 }
+
+#[test]
+fn operations_with_a_stray_empty_entry_fail_closed() {
+    let operations = vec!["GET:exact:/v1/models".to_owned(), String::new()];
+
+    assert!(matches!(
+        parse_allowed_operations(operations),
+        Err(ConfigError::InvalidAllowedOperation { .. }),
+    ));
+}
