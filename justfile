@@ -26,6 +26,9 @@ deny:
 docker-build:
     docker compose build proxy harness
 
+docker-test:
+    scripts/container-test.sh
+
 check: fmt-check lint test
 
 ci: check deny
