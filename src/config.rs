@@ -136,7 +136,7 @@ pub(crate) struct GatewayConfig {
     /// Maximum upstream response header bytes.
     max_response_header_bytes: NonZeroUsize,
     /// Upstream request timeout.
-    request_timeout: Duration,
+    request_timeout: RequestTimeout,
     /// Configured upstream origin.
     upstream_origin: UpstreamOrigin,
 }
@@ -206,6 +206,13 @@ pub(crate) struct ServeArgs {
     /// Provider origin containing scheme, host, and optional port only.
     #[arg(long, env = "CUSTODE_UPSTREAM_ORIGIN")]
     upstream_origin: String,
+}
+
+/// Non-zero upstream request timeout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestTimeout {
+    /// Timeout duration.
+    duration: Duration,
 }
 
 /// Configured upstream origin.
@@ -305,6 +312,32 @@ impl AllowedPath {
     }
 }
 
+impl RequestTimeout {
+    /// Returns the timeout as a duration.
+    #[must_use]
+    pub(crate) const fn as_duration(&self) -> Duration {
+        self.duration
+    }
+
+    /// Creates a timeout from a non-zero duration for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_duration(duration: Duration) -> Self {
+        assert!(
+            !duration.is_zero(),
+            "request timeout duration should be non-zero"
+        );
+        Self { duration }
+    }
+
+    /// Parses timeout seconds from a raw numeric configuration value.
+    fn parse_seconds(name: &'static str, seconds: u64) -> Result<Self, ConfigError> {
+        Ok(Self {
+            duration: Duration::from_secs(non_zero_u64(name, seconds)?.get()),
+        })
+    }
+}
+
 impl GatewayConfig {
     /// Returns the allowed operations.
     #[must_use]
@@ -342,7 +375,7 @@ impl GatewayConfig {
             max_request_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
             max_response_bytes: NonZeroU64::new(0x0010_0000).expect("limit should be non-zero"),
             max_response_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
-            request_timeout: Duration::from_secs(5),
+            request_timeout: RequestTimeout::from_duration(Duration::from_secs(5)),
             upstream_origin: UpstreamOrigin::parse(upstream_origin).expect("origin should parse"),
         }
     }
@@ -363,7 +396,7 @@ impl GatewayConfig {
             max_request_header_bytes: NonZeroUsize::new(1).expect("limit should be non-zero"),
             max_response_bytes: NonZeroU64::new(1_024).expect("limit should be non-zero"),
             max_response_header_bytes: NonZeroUsize::new(1).expect("limit should be non-zero"),
-            request_timeout: Duration::from_secs(1),
+            request_timeout: RequestTimeout::from_duration(Duration::from_secs(1)),
             upstream_origin: UpstreamOrigin::parse("https://api.openai.com")
                 .expect("origin should parse"),
         }
@@ -407,7 +440,7 @@ impl GatewayConfig {
 
     /// Returns the upstream request timeout.
     #[must_use]
-    pub(crate) const fn request_timeout(&self) -> Duration {
+    pub(crate) const fn request_timeout(&self) -> RequestTimeout {
         self.request_timeout
     }
 
@@ -423,9 +456,10 @@ impl TryFrom<ServeArgs> for GatewayConfig {
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
         let allowed_operations = parse_allowed_operations(args.allowed_operations)?;
-        let request_timeout = Duration::from_secs(
-            non_zero_u64("CUSTODE_REQUEST_TIMEOUT_SECS", args.request_timeout_secs)?.get(),
-        );
+        let request_timeout = RequestTimeout::parse_seconds(
+            "CUSTODE_REQUEST_TIMEOUT_SECS",
+            args.request_timeout_secs,
+        )?;
 
         Ok(Self {
             allowed_operations,
@@ -730,7 +764,10 @@ mod tests {
         assert_eq!(config.max_request_header_bytes().get(), 0x8000);
         assert_eq!(config.max_response_bytes().get(), 104_857_600);
         assert_eq!(config.max_response_header_bytes().get(), 0x0001_0000);
-        assert_eq!(config.request_timeout(), Duration::from_secs(120));
+        assert_eq!(
+            config.request_timeout().as_duration(),
+            Duration::from_secs(120)
+        );
         assert_eq!(config.upstream_origin().as_str(), "https://api.openai.com");
     }
 
@@ -1160,7 +1197,7 @@ mod proptests {
                 max_response_header_bytes
             );
             prop_assert_eq!(
-                config.request_timeout(),
+                config.request_timeout().as_duration(),
                 Duration::from_secs(request_timeout_secs)
             );
             let expected_origin = UpstreamOrigin::parse(&origin)

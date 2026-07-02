@@ -3,7 +3,7 @@
 use crate::allowlist::AllowedTarget;
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp, RequestId};
 use crate::body::AccountedBody;
-use crate::config::UpstreamOrigin;
+use crate::config::{RequestTimeout, UpstreamOrigin};
 use crate::headers::ForwardedRequestHeaders;
 use axum::body::Bytes;
 use core::fmt;
@@ -117,8 +117,10 @@ pub(crate) struct UpstreamBodyError {
 impl UpstreamDeadline {
     /// Creates a deadline from a configured timeout duration.
     #[must_use]
-    pub(crate) const fn from_timeout(timeout: Duration) -> Self {
-        Self { timeout }
+    pub(crate) const fn from_timeout(timeout: RequestTimeout) -> Self {
+        Self {
+            timeout: timeout.as_duration(),
+        }
     }
 
     /// Returns the timeout duration.
@@ -345,7 +347,10 @@ mod proptests {
             prop_assert_eq!(request.url().path(), target.path());
             prop_assert_eq!(request.url().query(), target.query());
             prop_assert_eq!(request.body(), b"payload");
-            prop_assert_eq!(request.deadline().timeout(), config.request_timeout());
+            prop_assert_eq!(
+                request.deadline().timeout(),
+                config.request_timeout().as_duration()
+            );
         }
     }
 }
