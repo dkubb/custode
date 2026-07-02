@@ -453,7 +453,9 @@ as `http://evil.example/steal` or `evil.example:443`.
 `upstream_path` and `upstream_query` are null when no upstream request is
 attempted. When an upstream request is attempted, `upstream_query` equals the
 accepted incoming query. `status` is the response status returned to the
-harness, and is null when no response status exists.
+harness. Every decision records one: each closed audit outcome variant
+carries a mandatory status. The serialized `status` field is structurally
+nullable but always populated.
 `request_body_blake3` is null when the request has no body.
 `response_body_blake3` is null when the response has no body.
 
