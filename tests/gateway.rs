@@ -40,6 +40,9 @@ use tokio::fs::read_to_string;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
+/// POSIX `EEXIST` returned when another process holds the lock directory.
+const ALREADY_EXISTS_OS_ERROR: i32 = 17;
+
 /// One request observed by the recording upstream.
 #[derive(Clone, Debug)]
 struct RecordedRequest {
@@ -152,7 +155,7 @@ impl GatewayTestLock {
         for _attempt in 0_u32..200 {
             match DirBuilder::new().create(&path) {
                 Ok(()) => return Ok(Self { path }),
-                Err(_error) if path.is_dir() => {
+                Err(error) if error.raw_os_error() == Some(ALREADY_EXISTS_OS_ERROR) => {
                     sleep(Duration::from_millis(50)).await;
                 }
                 Err(error) => return Err(error),
