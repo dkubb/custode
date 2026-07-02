@@ -693,8 +693,8 @@ Unit tests live inline in each source file's `tests` module and cover:
 - adapter classification of Reqwest errors against real local sockets:
   connection refusal, timeout, protocol garbage, and body-stream failure;
 - the deterministic handler with injected ports (fixed clock, in-memory
-  audit sink, scripted upstream client), asserting the exact full audit
-  event.
+  audit sink, scripted upstream client), run on a paused current-thread Tokio
+  runtime and asserting exact full audit events for success and timeout paths.
 
 Property-based tests live inline in each source file's `proptests` module
 and cover the parsers, constructors, and serializers with paired

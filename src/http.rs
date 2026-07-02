@@ -906,7 +906,7 @@ mod tests {
         audit_events(path).await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_uses_injected_ports_for_allowed_requests() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let (client, upstream_requests) = ScriptedUpstreamClient::new();
@@ -975,7 +975,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_uses_injected_ports_for_upstream_timeouts() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let (client, upstream_requests) = ScriptedUpstreamClient::stalling(Duration::from_secs(10));
