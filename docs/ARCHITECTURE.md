@@ -419,8 +419,20 @@ The `harness` service depends on the `proxy` service healthcheck.
 The `harness` service mounts the operator workspace at `/workspace`.
 
 The checked-in `harness` service environment contains only explicit non-secret
-values. It MUST NOT import the host environment wholesale through `env_file`,
-bare variable interpolation, or unscoped environment pass-through.
+defaults and one explicit harness environment file. The file defaults to
+`./secrets/env.example`; operators can set `CUSTODE_HARNESS_ENV_FILE` to point
+at a real ignored harness-local environment file such as `./secrets/env`.
+
+The harness environment file is also mounted read-only at `/etc/environment`
+for harnesses and operators that inspect that path. Compose `env_file` is what
+loads the values into the harness process environment; the mount alone does
+not make shell commands inherit the values.
+
+The `harness` service MUST NOT import the host environment wholesale through
+bare variable interpolation or unscoped environment pass-through. Values in
+the harness environment file are readable by the untrusted harness. Provider
+credentials, Docker credentials, and broad host ambient secrets MUST NOT be
+placed there.
 
 The `proxy` service mounts an audit log volume at `/var/log/custode` and a
 provider token secret at `/run/secrets/provider_token`. The Compose secret file
@@ -463,6 +475,11 @@ The harness command is supplied by the operator through Compose override,
 `CUSTODE_HARNESS_COMMAND`, `docker compose run`, or an explicit command in the
 checked-in Compose file.
 
+Harness-specific environment variables are supplied through the file named by
+`CUSTODE_HARNESS_ENV_FILE`. The default points at `./secrets/env.example`.
+Operators SHOULD copy it to `./secrets/env`, edit that ignored file, and run
+Compose with `CUSTODE_HARNESS_ENV_FILE=./secrets/env`.
+
 The operator can build a Claude Code harness without changing the Dockerfile:
 
 ```sh
@@ -504,8 +521,9 @@ CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token
 ```
 
 Claude Code may still require a non-secret placeholder `ANTHROPIC_API_KEY` in
-the harness environment so the client chooses API-key mode. The gateway strips
-the harness-supplied `x-api-key` and injects the secret-backed provider key.
+the harness environment so the client chooses API-key mode. That placeholder
+belongs in the harness environment file. The gateway strips the
+harness-supplied `x-api-key` and injects the secret-backed provider key.
 
 The operator can run a non-interactive Claude Code prompt through the gateway:
 
@@ -516,20 +534,19 @@ CUSTODE_AUTHORIZATION_BEARER_FILE= \
 CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token \
 CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com \
 CUSTODE_ALLOWED_OPERATIONS='POST:prefix:/v1/messages,GET:prefix:/v1/models' \
-CUSTODE_HARNESS_COMMAND='env \
-ANTHROPIC_API_KEY=sk-ant-api03-placeholder \
-ANTHROPIC_BASE_URL=http://proxy:8080 \
-claude --bare -p "what is 2+2?" \
+CUSTODE_HARNESS_ENV_FILE=./secrets/env \
+CUSTODE_HARNESS_COMMAND='claude --bare -p "what is 2+2?" \
 --output-format text --max-budget-usd 0.01' \
 docker compose up --abort-on-container-exit --exit-code-from harness
 ```
 
-The placeholder key is not a provider secret. It only keeps the client in
-API-key mode; the gateway removes the harness credential header and injects the
-real key from `CUSTODE_PROVIDER_TOKEN_FILE`.
+The placeholder key in `./secrets/env` is not a provider secret. It only keeps
+the client in API-key mode; the gateway removes the harness credential header
+and injects the real key from `CUSTODE_PROVIDER_TOKEN_FILE`.
 
-Provider API keys MUST NOT be set in the harness environment for the initial
-product. The gateway injects provider authorization from its own secret.
+Real provider API keys MUST NOT be set in the harness environment for the
+initial product. The gateway injects provider authorization from its own
+secret.
 
 Harnesses that cannot set a provider base URL are not compatible with the
 initial architecture.

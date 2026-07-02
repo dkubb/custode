@@ -237,10 +237,15 @@ Docker secret or mounted file. Environment variables MAY point to gateway-only
 credential files, but MUST NOT contain raw provider credentials.
 
 The default Compose file MUST NOT pass host environment variables wholesale
-into the harness container.
+into the harness container. It MAY load one explicit operator-selected harness
+environment file for harness-local settings. Every value in that file MUST be
+treated as readable by the untrusted harness.
 
 The harness container MAY receive non-secret configuration such as provider
-base URLs that point at the gateway.
+base URLs that point at the gateway. It MAY also receive harness-local secrets
+only when the operator intentionally accepts that the untrusted harness can
+read them. Provider credentials, Docker credentials, and broad host ambient
+secrets MUST NOT be placed in the harness environment file.
 
 The audit log MUST NOT include provider credentials. Authorization and cookie
 headers MUST be redacted or omitted.
@@ -382,7 +387,7 @@ Custode does not support `HTTPS_PROXY` or `CONNECT` tunneling in the initial
 product.
 
 Custode does not install Claude, Codex, or any specific harness by default.
-The operator supplies the harness command and any required non-secret
+The operator supplies the harness command and any required harness-local
 configuration.
 
 Custode does not provide full data-loss prevention. It narrows and records the

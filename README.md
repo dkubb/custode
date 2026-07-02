@@ -22,21 +22,31 @@ provider credential from the Docker secret.
 
 - Docker with Compose v2.
 - A provider API token in `secrets/provider_token`.
+- Optional harness-local settings in `secrets/env`.
 - Rust and Cargo for local development gates.
 - `cargo-deny`, `cargo-mutants`, and `mado` for the optional full gate set.
 
-## Create Provider Secret
+## Create Local Secrets
 
-Create the local secret and workspace directories:
+Create the local provider secret, harness environment file, and workspace
+directories:
 
 ```sh
 mkdir -p secrets workspace
 ${EDITOR:-vi} secrets/provider_token
 chmod 600 secrets/provider_token
+cp secrets/env.example secrets/env
+chmod 600 secrets/env
 ```
 
 The token file may contain one trailing newline. `secrets/provider_token` is
 ignored by Git.
+
+`secrets/env` is also ignored by Git. It is loaded into the harness process
+environment and mounted read-only at `/etc/environment` inside the harness
+container. Values in that file are visible to the untrusted harness. Do not put
+provider credentials there; provider credentials belong in
+`secrets/provider_token`.
 
 ## Build
 
@@ -44,6 +54,7 @@ Build both images with the local provider token:
 
 ```sh
 export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 docker compose build proxy harness
 ```
 
@@ -62,6 +73,7 @@ First build and smoke-test the CLI:
 
 ```sh
 export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 docker compose build harness
 
@@ -71,20 +83,25 @@ docker compose run --rm harness
 
 Then run Claude through the proxy:
 
+Add or uncomment this non-secret Claude placeholder in `secrets/env`:
+
+```text
+ANTHROPIC_API_KEY=sk-ant-api03-placeholder
+```
+
 ```sh
 anthropic_ops='POST:prefix:/v1/messages'
 anthropic_ops="${anthropic_ops},GET:prefix:/v1/models"
 
 export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_UPSTREAM_ORIGIN=https://api.anthropic.com
 export CUSTODE_ALLOWED_OPERATIONS="${anthropic_ops}"
 export CUSTODE_AUTHORIZATION_BEARER_FILE=
 export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=/run/secrets/provider_token
 export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 
-claude_cmd='env ANTHROPIC_API_KEY=sk-ant-api03-placeholder'
-claude_cmd="${claude_cmd} ANTHROPIC_BASE_URL=http://proxy:8080"
-claude_cmd="${claude_cmd} claude --bare -p 'what is 2+2?'"
+claude_cmd="claude --bare -p 'what is 2+2?'"
 export CUSTODE_HARNESS_COMMAND="${claude_cmd}"
 
 docker compose up --abort-on-container-exit --exit-code-from harness
@@ -103,6 +120,7 @@ Build and smoke-test the CLI:
 
 ```sh
 export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
 docker compose build harness
 
@@ -118,19 +136,25 @@ overrides with `-c`, and the OpenAI provider base URL key is
 
 A non-interactive command should use the proxy URL as the OpenAI API base URL:
 
+Add or uncomment this non-secret OpenAI placeholder in `secrets/env`:
+
+```text
+OPENAI_API_KEY=sk-placeholder
+```
+
 ```sh
 openai_ops='GET:exact:/v1/models,POST:prefix:/v1/responses'
 openai_ops="${openai_ops},POST:prefix:/v1/chat/completions"
 
 export CUSTODE_PROVIDER_TOKEN_FILE=./secrets/provider_token
+export CUSTODE_HARNESS_ENV_FILE=./secrets/env
 export CUSTODE_UPSTREAM_ORIGIN=https://api.openai.com
 export CUSTODE_ALLOWED_OPERATIONS="${openai_ops}"
 export CUSTODE_AUTHORIZATION_BEARER_FILE=/run/secrets/provider_token
 export CUSTODE_AUTHORIZATION_X_API_KEY_FILE=
 export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
 
-codex_cmd='env OPENAI_API_KEY=sk-placeholder'
-codex_cmd="${codex_cmd} codex exec"
+codex_cmd='codex exec'
 codex_cmd="${codex_cmd} --dangerously-bypass-approvals-and-sandbox"
 codex_cmd="${codex_cmd} --skip-git-repo-check --ephemeral"
 codex_cmd="${codex_cmd} -c 'openai_base_url=\"http://proxy:8080/v1\"'"

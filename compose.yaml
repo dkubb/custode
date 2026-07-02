@@ -45,6 +45,8 @@ services:
         HARNESS_NPM_PACKAGES: "${CUSTODE_HARNESS_NPM_PACKAGES-}"
     image: custode-harness:local
     command: ["bash", "-c", "${CUSTODE_HARNESS_COMMAND-sleep infinity}"]
+    env_file:
+      - "${CUSTODE_HARNESS_ENV_FILE-./secrets/env.example}"
     environment:
       ANTHROPIC_BASE_URL: http://proxy:8080
       OPENAI_BASE_URL: http://proxy:8080
@@ -55,6 +57,10 @@ services:
         condition: service_healthy
     volumes:
       - ./workspace:/workspace
+      - type: bind
+        source: "${CUSTODE_HARNESS_ENV_FILE-./secrets/env.example}"
+        target: /etc/environment
+        read_only: true
     read_only: true
     tmpfs:
       - /home/harness:mode=700,uid=1000,gid=1000
