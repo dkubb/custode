@@ -229,6 +229,7 @@ const fn hex_value(byte: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{AcceptedTarget, RejectionReason};
     use crate::config::AllowedPath;

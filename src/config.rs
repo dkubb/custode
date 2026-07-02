@@ -524,6 +524,7 @@ fn parse_allowed_path(path: &str) -> Result<String, ConfigError> {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
         AllowedOperation, AllowedPath, ConfigError, UpstreamOrigin, parse_allowed_operations,

@@ -283,6 +283,7 @@ fn rfc3339_timestamp() -> String {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{AuditDecision, AuditEvent, AuditEventInput, AuditTarget, RequestId};
     use core::time::Duration;

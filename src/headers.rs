@@ -126,6 +126,7 @@ fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderNa
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
     use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};

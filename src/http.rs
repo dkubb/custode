@@ -615,6 +615,7 @@ fn upstream_error_status(error: &reqwest::Error) -> StatusCode {
 }
 
 #[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{ResponseAuditContext, ServeError, run_until_server_stops};
     use crate::allowlist::AcceptedTarget;

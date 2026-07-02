@@ -1,3 +1,4 @@
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 //! Library crate for Custode.
 //!
 //! Custode runs an untrusted harness behind a small provider gateway. The
