@@ -37,6 +37,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use tempfile::{TempDir, tempdir};
 use tokio::fs::read_to_string;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::sleep;
 
@@ -278,6 +279,34 @@ fn spawn_gateway_command(
         .expect("gateway binary should spawn")
 }
 
+/// Writes a raw HTTP/1.1 request and returns the response status line.
+async fn raw_response_status_line(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr)
+        .await
+        .expect("gateway should accept raw connections");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("raw request should be written");
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 1_024];
+    while !response.windows(2).any(|pair| pair == b"\r\n") {
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .expect("raw response should be readable");
+        if read == 0 {
+            break;
+        }
+        response.extend_from_slice(chunk.get(..read).expect("read should fit the chunk"));
+    }
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .expect("raw response should include a status line")
+        .to_owned()
+}
+
 /// Waits for a child process to exit, returning true when it failed.
 fn wait_for_failure(mut child: Child) -> bool {
     for _attempt in 0_u32..100 {
@@ -295,7 +324,7 @@ fn wait_for_failure(mut child: Child) -> bool {
 mod tests {
     use super::{
         Command, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio, free_local_addr,
-        spawn_gateway_command, start_upstream, tempdir, wait_for_failure,
+        raw_response_status_line, spawn_gateway_command, start_upstream, tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
 
@@ -460,6 +489,92 @@ mod tests {
         let event = events.first().expect("one audit event should exist");
         assert_eq!(event["decision"], "denied");
         assert_eq!(event["error_class"], "path_denied");
+    }
+
+    #[tokio::test]
+    async fn absolute_form_request_line_is_denied_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let status_line = raw_response_status_line(
+            gateway.addr,
+            "GET http://evil.example/v1/models HTTP/1.1\r\n\
+             Host: evil.example\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+
+        assert_eq!(status_line, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "denied targets must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "absolute_form_unsupported");
+        assert_eq!(event["path"], "http://evil.example/v1/models");
+    }
+
+    #[tokio::test]
+    async fn authority_form_request_line_is_denied_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let status_line = raw_response_status_line(
+            gateway.addr,
+            "GET evil.example:443 HTTP/1.1\r\n\
+             Host: evil.example:443\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+
+        assert_eq!(status_line, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "denied targets must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "absolute_form_unsupported");
+        assert_eq!(event["path"], "evil.example:443");
+    }
+
+    #[tokio::test]
+    async fn connect_request_line_is_denied_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let status_line = raw_response_status_line(
+            gateway.addr,
+            "CONNECT evil.example:443 HTTP/1.1\r\n\
+             Host: evil.example:443\r\n\r\n",
+        )
+        .await;
+
+        assert_eq!(status_line, "HTTP/1.1 405 Method Not Allowed");
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "denied targets must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "connect_unsupported");
+        assert_eq!(event["path"], "evil.example:443");
     }
 
     #[tokio::test]
