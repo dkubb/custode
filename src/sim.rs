@@ -15,6 +15,8 @@ use core::future;
 use core::time::Duration;
 use futures_util::{StreamExt as _, stream};
 use http::{Method, StatusCode};
+use proptest::prelude::{Just, Strategy, any};
+use proptest::{collection, prop_oneof};
 use serde_json::Value;
 use std::sync::{Arc, Mutex};
 
@@ -282,4 +284,69 @@ impl UpstreamClient for ScriptedUpstreamClient {
         );
         Box::pin(future::ready(Ok(response)))
     }
+}
+
+/// Generates deterministic gateway scenarios.
+pub(super) fn scenario_any() -> impl Strategy<Value = Scenario> {
+    (
+        scenario_body_any(),
+        scenario_headers_any(),
+        scenario_target_any(),
+        scenario_upstream_any(),
+    )
+        .prop_map(|(body, headers, target, upstream)| {
+            Scenario::new(
+                ScenarioRequest::new(body, headers, Method::GET, target),
+                upstream,
+            )
+        })
+}
+
+/// Generates bounded request bodies.
+fn scenario_body_any() -> impl Strategy<Value = Vec<u8>> {
+    collection::vec(any::<u8>(), 0..9)
+}
+
+/// Generates bounded request header sets.
+fn scenario_headers_any() -> impl Strategy<Value = Vec<(String, String)>> {
+    prop_oneof![
+        Just(Vec::new()),
+        Just(vec![
+            ("authorization".to_owned(), "Bearer harness".to_owned()),
+            ("x-request-id".to_owned(), "trace-1".to_owned()),
+        ]),
+        Just(vec![
+            ("authorization".to_owned(), "Bearer harness".to_owned()),
+            ("connection".to_owned(), "x-drop".to_owned()),
+            ("host".to_owned(), "proxy:8080".to_owned()),
+            ("proxy-authorization".to_owned(), "Basic leak".to_owned()),
+            ("x-drop".to_owned(), "secret".to_owned()),
+            ("x-request-id".to_owned(), "trace-1".to_owned()),
+        ]),
+        Just(vec![
+            ("connection".to_owned(), "te, x-drop".to_owned()),
+            ("cookie".to_owned(), "session=visible".to_owned()),
+            ("te".to_owned(), "trailers".to_owned()),
+            ("x-drop".to_owned(), "secret".to_owned()),
+            ("x-visible".to_owned(), "ok".to_owned()),
+        ]),
+    ]
+}
+
+/// Generates allowed request targets.
+fn scenario_target_any() -> impl Strategy<Value = String> {
+    prop_oneof![
+        Just("/v1/models".to_owned()),
+        Just("/v1/models?limit=1".to_owned()),
+    ]
+}
+
+/// Generates deterministic upstream outcomes.
+fn scenario_upstream_any() -> impl Strategy<Value = ScenarioUpstream> {
+    prop_oneof![
+        Just(ScenarioUpstream::Respond),
+        Just(ScenarioUpstream::Stall {
+            duration: Duration::from_secs(10),
+        }),
+    ]
 }

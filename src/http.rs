@@ -641,6 +641,217 @@ const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[expect(
+        clippy::inline_modules,
+        reason = "inline proptests keep scenario runner ownership explicit"
+    )]
+    mod proptests {
+        use super::{ScenarioRun, run_scenario};
+        use crate::ports::UpstreamDeadline;
+        use crate::sim::{RecordedUpstreamRequest, Scenario, ScenarioUpstream, scenario_any};
+        use axum::body::Bytes;
+        use http::{Method, StatusCode};
+        use proptest::prelude::*;
+        use serde_json::{Map, Value};
+        use tokio::runtime::Builder;
+
+        /// Expected observations for one generated gateway scenario.
+        #[derive(Debug, Eq, PartialEq)]
+        struct ScenarioOracle {
+            /// Expected audit events.
+            audit_events: Vec<Value>,
+            /// Expected response body.
+            response_body: Bytes,
+            /// Expected response status.
+            status: StatusCode,
+            /// Expected upstream requests.
+            upstream_requests: Vec<RecordedUpstreamRequest>,
+        }
+
+        /// Returns a digest field for an optional body.
+        fn body_digest_value(body: &[u8]) -> Value {
+            if body.is_empty() {
+                Value::Null
+            } else {
+                Value::String(blake3::hash(body).to_hex().to_string())
+            }
+        }
+
+        /// Returns lower-case headers named by generated connection headers.
+        fn connection_header_names(headers: &[(String, String)]) -> Vec<String> {
+            headers
+                .iter()
+                .filter(|header| header.0 == "connection")
+                .flat_map(|header| {
+                    header
+                        .1
+                        .split(',')
+                        .map(|raw| raw.trim().to_ascii_lowercase())
+                })
+                .collect()
+        }
+
+        /// Returns the expected audit event for a generated scenario.
+        fn expected_audit_event(
+            scenario: &Scenario,
+            response_body: &[u8],
+            status: StatusCode,
+        ) -> Value {
+            let path = request_path(scenario.request().target());
+            let query = query_value(scenario.request().target());
+            let (decision, error_class) = match scenario.upstream() {
+                ScenarioUpstream::Respond => ("allowed", Value::Null),
+                ScenarioUpstream::Stall { .. } => (
+                    "upstream_error",
+                    Value::String("upstream_timeout".to_owned()),
+                ),
+            };
+            Value::Object(Map::from_iter([
+                ("decision".to_owned(), Value::String(decision.to_owned())),
+                ("error_class".to_owned(), error_class),
+                (
+                    "method".to_owned(),
+                    Value::String(scenario.request().method().as_str().to_owned()),
+                ),
+                ("path".to_owned(), Value::String(path.to_owned())),
+                ("query".to_owned(), query.clone()),
+                (
+                    "request_body_blake3".to_owned(),
+                    body_digest_value(scenario.request().body()),
+                ),
+                (
+                    "request_bytes".to_owned(),
+                    Value::from(
+                        u64::try_from(scenario.request().body().len())
+                            .expect("request body length should fit u64"),
+                    ),
+                ),
+                (
+                    "request_id".to_owned(),
+                    Value::String("req-test-0000000000000001".to_owned()),
+                ),
+                (
+                    "response_body_blake3".to_owned(),
+                    body_digest_value(response_body),
+                ),
+                (
+                    "response_bytes".to_owned(),
+                    Value::from(
+                        u64::try_from(response_body.len())
+                            .expect("response body length should fit u64"),
+                    ),
+                ),
+                ("status".to_owned(), Value::from(status.as_u16())),
+                (
+                    "timestamp".to_owned(),
+                    Value::String("2026-07-02T00:00:00.000000000Z".to_owned()),
+                ),
+                (
+                    "upstream_origin".to_owned(),
+                    Value::String("https://api.openai.com".to_owned()),
+                ),
+                ("upstream_path".to_owned(), Value::String(path.to_owned())),
+                ("upstream_query".to_owned(), query),
+                ("version".to_owned(), Value::from(1_u64)),
+            ]))
+        }
+
+        /// Returns the expected forwarded headers for generated headers.
+        fn expected_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+            let connection_headers = connection_header_names(headers);
+            let mut forwarded = headers
+                .iter()
+                .filter(|header| request_header_is_forwarded(&header.0, &connection_headers))
+                .cloned()
+                .collect::<Vec<_>>();
+            forwarded.sort();
+            forwarded
+        }
+
+        /// Returns the expected observations for a generated scenario.
+        fn expected_run(scenario: &Scenario, deadline: UpstreamDeadline) -> ScenarioOracle {
+            let response_body = match scenario.upstream() {
+                ScenarioUpstream::Respond => Bytes::from_static(b"scripted"),
+                ScenarioUpstream::Stall { .. } => Bytes::new(),
+            };
+            let status = match scenario.upstream() {
+                ScenarioUpstream::Respond => StatusCode::CREATED,
+                ScenarioUpstream::Stall { .. } => StatusCode::GATEWAY_TIMEOUT,
+            };
+            ScenarioOracle {
+                audit_events: vec![expected_audit_event(scenario, &response_body, status)],
+                response_body: response_body.clone(),
+                status,
+                upstream_requests: vec![RecordedUpstreamRequest::new(
+                    scenario.request().body().to_vec(),
+                    deadline,
+                    expected_forwarded_headers(scenario.request().headers()),
+                    Method::GET,
+                    format!("https://api.openai.com{}", scenario.request().target()),
+                )],
+            }
+        }
+
+        /// Returns the request query field from a generated target.
+        fn query_value(target: &str) -> Value {
+            target
+                .split_once('?')
+                .map_or(Value::Null, |(_path, query)| {
+                    Value::String(query.to_owned())
+                })
+        }
+
+        /// Returns true when a generated request header should be forwarded.
+        fn request_header_is_forwarded(name: &str, connection_headers: &[String]) -> bool {
+            !matches!(
+                name,
+                "connection"
+                    | "host"
+                    | "keep-alive"
+                    | "proxy-authenticate"
+                    | "proxy-authorization"
+                    | "te"
+                    | "trailer"
+                    | "transfer-encoding"
+                    | "upgrade"
+            ) && !connection_headers.iter().any(|dynamic| dynamic == name)
+        }
+
+        /// Returns the request path from a generated target.
+        fn request_path(target: &str) -> &str {
+            target.split_once('?').map_or(target, |(path, _query)| path)
+        }
+
+        /// Runs a generated scenario on a paused single-thread runtime.
+        fn run_generated_scenario(scenario: Scenario) -> ScenarioRun {
+            Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("paused scenario runtime should build")
+                .block_on(run_scenario(scenario))
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 32,
+                ..ProptestConfig::default()
+            })]
+
+            #[test]
+            fn generated_scenarios_match_the_gateway_oracle(scenario in scenario_any()) {
+                let run = run_generated_scenario(scenario.clone());
+                let expected = expected_run(&scenario, run.deadline);
+
+                prop_assert_eq!(run.status, expected.status);
+                prop_assert_eq!(run.response_body, expected.response_body);
+                prop_assert_eq!(run.upstream_requests, expected.upstream_requests);
+                prop_assert_eq!(run.audit_events, expected.audit_events);
+            }
+        }
+    }
+
     use super::{
         AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, production_gateway,
         proxy, report_fatal_error, request_body_error_status, request_header_error_class,
