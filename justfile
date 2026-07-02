@@ -32,6 +32,12 @@ docker-build:
 docker-test:
     scripts/container-test.sh
 
+coverage:
+    cargo llvm-cov --workspace --all-features --summary-only
+
+mutants:
+    cargo mutants
+
 check: fmt-check lint test dockerfile-check
 
 ci: check deny
