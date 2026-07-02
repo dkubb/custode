@@ -39,7 +39,7 @@ async fn audit_after_response_started_reports_fatal_error() {
         gateway,
         method: Method::GET,
         request_body,
-        request_id: RequestId::from_sequence(1),
+        request_id: RequestId::from_parts("test", 1),
         response_account,
         status: 200,
         target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),

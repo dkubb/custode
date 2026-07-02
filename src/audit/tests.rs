@@ -6,7 +6,7 @@ use std::time::UNIX_EPOCH;
 fn new_preserves_status() {
     let target = AuditTarget::from_uri_parts("/v1/models", None);
     let input = AuditEventInput {
-        request_id: RequestId::from_sequence(1),
+        request_id: RequestId::from_parts("run", 1),
         decision: AuditDecision::Denied,
         method: "CONNECT".to_owned(),
         target,
@@ -31,7 +31,7 @@ fn new_preserves_status() {
 fn new_preserves_rejected_raw_path() {
     let target = AuditTarget::from_uri_parts("/v1/responses/%2e%2e/models", Some("limit=1"));
     let input = AuditEventInput {
-        request_id: RequestId::from_sequence(1),
+        request_id: RequestId::from_parts("run", 1),
         decision: AuditDecision::Denied,
         method: "GET".to_owned(),
         target,

@@ -267,10 +267,13 @@ impl AuditWriter {
 }
 
 impl RequestId {
-    /// Creates a request identity from a monotonic sequence number.
+    /// Creates a request identity from a run token and sequence number.
+    ///
+    /// The run token keeps identities unique across gateway runs that append
+    /// to the same audit log.
     #[must_use]
-    pub(crate) fn from_sequence(sequence: u64) -> Self {
-        Self(format!("req-{sequence:016x}"))
+    pub(crate) fn from_parts(run_token: &str, sequence: u64) -> Self {
+        Self(format!("req-{run_token}-{sequence:016x}"))
     }
 }
 

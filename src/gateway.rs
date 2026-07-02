@@ -11,7 +11,9 @@ use ::http::{Error as HttpError, Method};
 use core::sync::atomic::{AtomicU64, Ordering};
 use reqwest::Client;
 use std::io;
+use std::process;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 /// Shared gateway state.
@@ -25,6 +27,8 @@ pub(crate) struct Gateway {
     config: Arc<GatewayConfig>,
     /// Monotonic request sequence.
     request_sequence: Arc<AtomicU64>,
+    /// Per-process run token embedded in request identities.
+    run_token: Arc<str>,
 }
 
 /// Gateway runtime error.
@@ -173,18 +177,29 @@ impl Gateway {
             .timeout(config.request_timeout())
             .build()
             .map_err(GatewayError::Client)?;
+        let run_nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should not be before the Unix epoch")
+            .as_nanos();
+        // The process id disambiguates runs whose wall clocks collide, such
+        // as restored snapshots or stepped clocks.
+        let run_token = format!("{:x}-{run_nanos:x}", process::id());
         Ok(Self {
             audit,
             client,
             config: Arc::new(config),
             request_sequence: Arc::new(AtomicU64::new(1)),
+            run_token: Arc::from(run_token),
         })
     }
 
-    /// Allocates a request identity.
+    /// Allocates a request identity unique within the audit log.
+    ///
+    /// The identity embeds a per-process run token so identities from
+    /// different gateway runs appended to the same audit log do not collide.
     #[must_use]
     pub(crate) fn next_request_id(&self) -> RequestId {
         let sequence = self.request_sequence.fetch_add(1, Ordering::Relaxed);
-        RequestId::from_sequence(sequence)
+        RequestId::from_parts(&self.run_token, sequence)
     }
 }
