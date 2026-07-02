@@ -16,16 +16,40 @@ use core::convert::Infallible;
 use core::future::IntoFuture;
 use futures_util::StreamExt as _;
 use futures_util::future::{self, Either};
+use reqwest::Client;
 use std::io;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+/// Serving runtime error.
+#[derive(Debug, Error)]
+pub(crate) enum ServeError {
+    /// Upstream client could not be built.
+    #[error("failed to build upstream client: {0}")]
+    Client(reqwest::Error),
+
+    /// Gateway request handling failed fatally.
+    #[error("{0}")]
+    Gateway(#[from] GatewayError),
+
+    /// Gateway server failed.
+    #[error("gateway server failed: {0}")]
+    Server(io::Error),
+
+    /// Gateway listener could not bind.
+    #[error("failed to bind gateway listener: {0}")]
+    ServerBind(io::Error),
+}
+
 /// Shared Axum application state.
 #[derive(Clone, Debug)]
 struct AppState {
+    /// Upstream HTTP client.
+    client: Client,
     /// Request concurrency limiter.
     concurrency: Arc<Semaphore>,
     /// Fatal error channel for failures detected after responses start.
@@ -203,7 +227,7 @@ async fn proxy(
     };
 
     Ok(
-        match handle_request(state.fatal_errors, state.gateway, request).await {
+        match handle_request(state.fatal_errors, state.gateway, state.client, request).await {
             Ok(response) => response,
             Err(error) => {
                 tracing::error!(%error, "request failed");
@@ -217,6 +241,7 @@ async fn proxy(
 async fn handle_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
+    client: Client,
     request: Request<Body>,
 ) -> Result<Response<Body>, GatewayError> {
     let request_id = gateway.next_request_id();
@@ -271,6 +296,7 @@ async fn handle_request(
     forward_request(
         fatal_errors,
         gateway,
+        client,
         request_id,
         method,
         target,
@@ -281,9 +307,14 @@ async fn handle_request(
 }
 
 /// Forwards an accepted request to the configured upstream.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the forwarding step threads every accepted request component"
+)]
 async fn forward_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
+    client: Client,
     request_id: RequestId,
     method: Method,
     target: AcceptedTarget,
@@ -298,8 +329,7 @@ async fn forward_request(
     let upstream_query = target.query().map(str::to_owned);
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
         .expect("http and reqwest method parsing should agree");
-    let upstream_response = match gateway
-        .client()
+    let upstream_response = match client
         .request(reqwest_method, upstream)
         .headers(request_headers)
         .body(request_body.bytes().to_vec())
@@ -472,12 +502,17 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
 /// # Errors
 ///
 /// Returns an error when the gateway cannot bind or serve.
-pub(crate) async fn serve(config: GatewayConfig) -> Result<(), GatewayError> {
+pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
     let bind = config.bind();
     let max_concurrent_requests = config.max_concurrent_requests().get();
-    let gateway = Gateway::new(config).await?;
+    let client = Client::builder()
+        .timeout(config.request_timeout())
+        .build()
+        .map_err(ServeError::Client)?;
+    let gateway = Gateway::new(config).await.map_err(ServeError::Gateway)?;
     let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
     let state = AppState {
+        client,
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
         fatal_errors,
         gateway,
@@ -485,7 +520,7 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), GatewayError> {
     let app = Router::new().fallback(any(proxy)).with_state(state);
     let listener = TcpListener::bind(bind)
         .await
-        .map_err(GatewayError::ServerBind)?;
+        .map_err(ServeError::ServerBind)?;
 
     run_until_server_stops(axum::serve(listener, app), fatal_receiver).await
 }
@@ -494,14 +529,15 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), GatewayError> {
 async fn run_until_server_stops(
     server_task: impl IntoFuture<Output = Result<(), io::Error>>,
     mut fatal_receiver: mpsc::UnboundedReceiver<GatewayError>,
-) -> Result<(), GatewayError> {
-    let server = Box::pin(async move {
-        server_task
-            .into_future()
+) -> Result<(), ServeError> {
+    let server =
+        Box::pin(async move { server_task.into_future().await.map_err(ServeError::Server) });
+    let fatal = Box::pin(async move {
+        fatal_receiver
+            .recv()
             .await
-            .map_err(GatewayError::Server)
+            .map_or_else(|| Ok(()), |error| Err(ServeError::Gateway(error)))
     });
-    let fatal = Box::pin(async move { fatal_receiver.recv().await.map_or_else(|| Ok(()), Err) });
 
     match future::select(server, fatal).await {
         Either::Left((result, _)) | Either::Right((result, _)) => result,

@@ -1,9 +1,8 @@
 //! Binary process edge: command-line interface, dispatch, and exit codes.
 
 use crate::config::{ConfigError, ServeArgs};
-use crate::gateway::GatewayError;
 use crate::health::{self, HealthcheckError};
-use crate::http;
+use crate::http::{self, ServeError};
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 use thiserror::Error;
@@ -73,12 +72,12 @@ impl From<ConfigError> for RunError {
     }
 }
 
-impl From<GatewayError> for RunError {
+impl From<ServeError> for RunError {
     #[inline]
-    fn from(error: GatewayError) -> Self {
+    fn from(error: ServeError) -> Self {
         Self {
             code: ExitCode::from(70),
-            kind: RunErrorKind::Gateway(error),
+            kind: RunErrorKind::Serve(error),
         }
     }
 }
@@ -100,11 +99,11 @@ enum RunErrorKind {
     #[error("configuration error: {0}")]
     Config(#[from] ConfigError),
 
-    /// The gateway failed while serving requests.
-    #[error("gateway error: {0}")]
-    Gateway(#[from] GatewayError),
-
     /// The healthcheck command failed.
     #[error("healthcheck error: {0}")]
     Healthcheck(#[from] HealthcheckError),
+
+    /// The gateway failed while serving requests.
+    #[error("gateway error: {0}")]
+    Serve(#[from] ServeError),
 }

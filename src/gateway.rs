@@ -9,8 +9,6 @@ use crate::config::{ConfigError, GatewayConfig};
 use crate::headers::HeaderError;
 use ::http::{Error as HttpError, Method};
 use core::sync::atomic::{AtomicU64, Ordering};
-use reqwest::Client;
-use std::io;
 use std::process;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,8 +19,6 @@ use thiserror::Error;
 pub(crate) struct Gateway {
     /// Audit log writer.
     audit: AuditWriter,
-    /// Upstream HTTP client.
-    client: Client,
     /// Parsed gateway configuration.
     config: Arc<GatewayConfig>,
     /// Monotonic request sequence.
@@ -42,10 +38,6 @@ pub(crate) enum GatewayError {
     #[error("{0}")]
     Body(#[from] BodyError),
 
-    /// Upstream client could not be built.
-    #[error("failed to build upstream client: {0}")]
-    Client(reqwest::Error),
-
     /// Upstream URL construction failed.
     #[error("{0}")]
     Config(#[from] ConfigError),
@@ -57,14 +49,6 @@ pub(crate) enum GatewayError {
     /// Gateway response could not be built.
     #[error("failed to build response: {0}")]
     ResponseBuild(HttpError),
-
-    /// Gateway server failed.
-    #[error("gateway server failed: {0}")]
-    Server(io::Error),
-
-    /// Gateway listener could not bind.
-    #[error("failed to bind gateway listener: {0}")]
-    ServerBind(io::Error),
 }
 
 /// Input for response audit events.
@@ -154,12 +138,6 @@ impl Gateway {
         Ok(())
     }
 
-    /// Returns the upstream HTTP client.
-    #[must_use]
-    pub(crate) const fn client(&self) -> &Client {
-        &self.client
-    }
-
     /// Returns the parsed configuration.
     #[must_use]
     pub(crate) fn config(&self) -> &GatewayConfig {
@@ -170,13 +148,9 @@ impl Gateway {
     ///
     /// # Errors
     ///
-    /// Returns an error when audit log or upstream client setup fails.
+    /// Returns an error when the audit log cannot be opened.
     pub(crate) async fn new(config: GatewayConfig) -> Result<Self, GatewayError> {
         let audit = AuditWriter::open(&config).await?;
-        let client = Client::builder()
-            .timeout(config.request_timeout())
-            .build()
-            .map_err(GatewayError::Client)?;
         let run_nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should not be before the Unix epoch")
@@ -186,7 +160,6 @@ impl Gateway {
         let run_token = format!("{:x}-{run_nanos:x}", process::id());
         Ok(Self {
             audit,
-            client,
             config: Arc::new(config),
             request_sequence: Arc::new(AtomicU64::new(1)),
             run_token: Arc::from(run_token),

@@ -1,4 +1,4 @@
-use super::{ResponseAuditContext, run_until_server_stops};
+use super::{ResponseAuditContext, ServeError, run_until_server_stops};
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{AuditDecision, AuditError, RequestId};
 use crate::body::{AccountedBody, ResponseAccount};
@@ -77,9 +77,8 @@ async fn run_until_server_stops_returns_fatal_error() {
 
     assert!(matches!(
         result,
-        Err(GatewayError::Audit(AuditError::EventTooLarge {
-            bytes: 2,
-            max: 1,
-        })),
+        Err(ServeError::Gateway(GatewayError::Audit(
+            AuditError::EventTooLarge { bytes: 2, max: 1 },
+        ))),
     ));
 }
