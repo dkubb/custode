@@ -316,7 +316,7 @@ async fn forward_request(
                 request_body,
                 request_id,
                 response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
-                status: None,
+                status: Some(status.as_u16()),
                 target,
                 upstream_path,
                 upstream_query,
@@ -339,7 +339,9 @@ async fn forward_request(
                 request_body,
                 request_id,
                 response_account: ResponseAccount::new(gateway.config().max_response_bytes()),
-                status: Some(status.as_u16()),
+                // The audited status is what the harness receives, not the
+                // discarded upstream status.
+                status: Some(StatusCode::BAD_GATEWAY.as_u16()),
                 target,
                 upstream_path,
                 upstream_query,
