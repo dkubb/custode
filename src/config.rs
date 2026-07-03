@@ -41,6 +41,30 @@ pub(crate) struct AllowedOperation {
     path: AllowedPath,
 }
 
+/// Parsed maximum serialized audit event bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuditEventBytes(NonZeroUsize);
+
+/// Parsed maximum concurrent gateway requests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConcurrentRequests(NonZeroUsize);
+
+/// Parsed maximum incoming request body bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestBodyBytes(NonZeroUsize);
+
+/// Parsed maximum incoming request header bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RequestHeaderBytes(NonZeroUsize);
+
+/// Parsed maximum upstream response body bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResponseBodyBytes(NonZeroU64);
+
+/// Parsed maximum upstream response header bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ResponseHeaderBytes(NonZeroUsize);
+
 /// A configured allowed path.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllowedPath {
@@ -190,17 +214,17 @@ pub(crate) struct GatewayConfig {
     /// Gateway bind address.
     bind: SocketAddr,
     /// Maximum serialized audit event bytes, including the NDJSON newline.
-    max_audit_event_bytes: NonZeroUsize,
+    max_audit_event_bytes: AuditEventBytes,
     /// Maximum concurrent gateway requests.
-    max_concurrent_requests: NonZeroUsize,
+    max_concurrent_requests: ConcurrentRequests,
     /// Maximum incoming request body bytes.
-    max_request_bytes: NonZeroUsize,
+    max_request_bytes: RequestBodyBytes,
     /// Maximum incoming request header bytes.
-    max_request_header_bytes: NonZeroUsize,
+    max_request_header_bytes: RequestHeaderBytes,
     /// Maximum upstream response body bytes.
-    max_response_bytes: NonZeroU64,
+    max_response_bytes: ResponseBodyBytes,
     /// Maximum upstream response header bytes.
-    max_response_header_bytes: NonZeroUsize,
+    max_response_header_bytes: ResponseHeaderBytes,
     /// Upstream request timeout.
     request_timeout: RequestTimeout,
     /// Configured upstream origin.
@@ -387,6 +411,114 @@ impl AllowedPath {
     }
 }
 
+impl AuditEventBytes {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero byte limit.
+    const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    /// Parses and bounds audit event bytes.
+    fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
+        bounded_non_zero_usize(name, raw_value, MAX_AUDIT_EVENT_BYTES).map(Self)
+    }
+}
+
+impl ConcurrentRequests {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero request limit.
+    const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    /// Parses and bounds concurrent requests.
+    fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
+        bounded_non_zero_usize(name, raw_value, MAX_CONCURRENT_REQUESTS).map(Self)
+    }
+}
+
+impl RequestBodyBytes {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero byte limit.
+    const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    /// Parses and bounds request body bytes.
+    fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
+        bounded_non_zero_usize(name, raw_value, MAX_REQUEST_BYTES).map(Self)
+    }
+}
+
+impl RequestHeaderBytes {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero byte limit.
+    const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    /// Parses and bounds request header bytes.
+    fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
+        bounded_non_zero_usize(name, raw_value, MAX_REQUEST_HEADER_BYTES).map(Self)
+    }
+}
+
+impl ResponseBodyBytes {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroU64) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero byte limit.
+    const fn get(self) -> NonZeroU64 {
+        self.0
+    }
+
+    /// Parses and bounds response body bytes.
+    fn parse(name: &'static str, raw_value: u64) -> Result<Self, ConfigError> {
+        bounded_non_zero_u64(name, raw_value, MAX_RESPONSE_BYTES).map(Self)
+    }
+}
+
+impl ResponseHeaderBytes {
+    /// Wraps a test limit that was already proven non-zero.
+    #[cfg(test)]
+    const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
+    }
+
+    /// Returns the parsed non-zero byte limit.
+    const fn get(self) -> NonZeroUsize {
+        self.0
+    }
+
+    /// Parses and bounds response header bytes.
+    fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
+        bounded_non_zero_usize(name, raw_value, MAX_RESPONSE_HEADER_BYTES).map(Self)
+    }
+}
+
 impl RequestTimeout {
     /// Returns the timeout as a duration.
     #[must_use]
@@ -445,12 +577,24 @@ impl GatewayConfig {
             ],
             audit_log,
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
-            max_audit_event_bytes: NonZeroUsize::new(0x4000).expect("limit should be non-zero"),
-            max_concurrent_requests: NonZeroUsize::new(8).expect("limit should be non-zero"),
-            max_request_bytes: NonZeroUsize::new(0x0010_0000).expect("limit should be non-zero"),
-            max_request_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
-            max_response_bytes: NonZeroU64::new(0x0010_0000).expect("limit should be non-zero"),
-            max_response_header_bytes: NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
+            max_audit_event_bytes: AuditEventBytes::for_test(
+                NonZeroUsize::new(0x4000).expect("limit should be non-zero"),
+            ),
+            max_concurrent_requests: ConcurrentRequests::for_test(
+                NonZeroUsize::new(8).expect("limit should be non-zero"),
+            ),
+            max_request_bytes: RequestBodyBytes::for_test(
+                NonZeroUsize::new(0x0010_0000).expect("limit should be non-zero"),
+            ),
+            max_request_header_bytes: RequestHeaderBytes::for_test(
+                NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
+            ),
+            max_response_bytes: ResponseBodyBytes::for_test(
+                NonZeroU64::new(0x0010_0000).expect("limit should be non-zero"),
+            ),
+            max_response_header_bytes: ResponseHeaderBytes::for_test(
+                NonZeroUsize::new(0x8000).expect("limit should be non-zero"),
+            ),
             request_timeout: RequestTimeout::from_duration(Duration::from_secs(5)),
             upstream_origin: UpstreamOrigin::parse(upstream_origin).expect("origin should parse"),
         }
@@ -466,12 +610,22 @@ impl GatewayConfig {
             ],
             audit_log,
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
-            max_audit_event_bytes,
-            max_concurrent_requests: NonZeroUsize::new(1).expect("limit should be non-zero"),
-            max_request_bytes: NonZeroUsize::new(1).expect("limit should be non-zero"),
-            max_request_header_bytes: NonZeroUsize::new(1).expect("limit should be non-zero"),
-            max_response_bytes: NonZeroU64::new(1_024).expect("limit should be non-zero"),
-            max_response_header_bytes: NonZeroUsize::new(1).expect("limit should be non-zero"),
+            max_audit_event_bytes: AuditEventBytes::for_test(max_audit_event_bytes),
+            max_concurrent_requests: ConcurrentRequests::for_test(
+                NonZeroUsize::new(1).expect("limit should be non-zero"),
+            ),
+            max_request_bytes: RequestBodyBytes::for_test(
+                NonZeroUsize::new(1).expect("limit should be non-zero"),
+            ),
+            max_request_header_bytes: RequestHeaderBytes::for_test(
+                NonZeroUsize::new(1).expect("limit should be non-zero"),
+            ),
+            max_response_bytes: ResponseBodyBytes::for_test(
+                NonZeroU64::new(1_024).expect("limit should be non-zero"),
+            ),
+            max_response_header_bytes: ResponseHeaderBytes::for_test(
+                NonZeroUsize::new(1).expect("limit should be non-zero"),
+            ),
             request_timeout: RequestTimeout::from_duration(Duration::from_secs(1)),
             upstream_origin: UpstreamOrigin::parse("https://api.openai.com")
                 .expect("origin should parse"),
@@ -482,37 +636,37 @@ impl GatewayConfig {
     /// newline.
     #[must_use]
     pub(crate) const fn max_audit_event_bytes(&self) -> NonZeroUsize {
-        self.max_audit_event_bytes
+        self.max_audit_event_bytes.get()
     }
 
     /// Returns the maximum concurrent requests.
     #[must_use]
     pub(crate) const fn max_concurrent_requests(&self) -> NonZeroUsize {
-        self.max_concurrent_requests
+        self.max_concurrent_requests.get()
     }
 
     /// Returns the maximum incoming request body bytes.
     #[must_use]
     pub(crate) const fn max_request_bytes(&self) -> NonZeroUsize {
-        self.max_request_bytes
+        self.max_request_bytes.get()
     }
 
     /// Returns the maximum incoming request header bytes.
     #[must_use]
     pub(crate) const fn max_request_header_bytes(&self) -> NonZeroUsize {
-        self.max_request_header_bytes
+        self.max_request_header_bytes.get()
     }
 
     /// Returns the maximum upstream response body bytes.
     #[must_use]
     pub(crate) const fn max_response_bytes(&self) -> NonZeroU64 {
-        self.max_response_bytes
+        self.max_response_bytes.get()
     }
 
     /// Returns the maximum upstream response header bytes.
     #[must_use]
     pub(crate) const fn max_response_header_bytes(&self) -> NonZeroUsize {
-        self.max_response_header_bytes
+        self.max_response_header_bytes.get()
     }
 
     /// Returns the upstream request timeout.
@@ -531,7 +685,7 @@ impl GatewayConfig {
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn with_max_response_bytes(mut self, max_response_bytes: NonZeroU64) -> Self {
-        self.max_response_bytes = max_response_bytes;
+        self.max_response_bytes = ResponseBodyBytes::for_test(max_response_bytes);
         self
     }
 }
@@ -550,35 +704,29 @@ impl TryFrom<ServeArgs> for GatewayConfig {
             allowed_operations,
             audit_log: args.audit_log,
             bind: args.bind,
-            max_audit_event_bytes: bounded_non_zero_usize(
+            max_audit_event_bytes: AuditEventBytes::parse(
                 "CUSTODE_MAX_AUDIT_EVENT_BYTES",
                 args.max_audit_event_bytes,
-                MAX_AUDIT_EVENT_BYTES,
             )?,
-            max_concurrent_requests: bounded_non_zero_usize(
+            max_concurrent_requests: ConcurrentRequests::parse(
                 "CUSTODE_MAX_CONCURRENT_REQUESTS",
                 args.max_concurrent_requests,
-                MAX_CONCURRENT_REQUESTS,
             )?,
-            max_request_bytes: bounded_non_zero_usize(
+            max_request_bytes: RequestBodyBytes::parse(
                 "CUSTODE_MAX_REQUEST_BYTES",
                 args.max_request_bytes,
-                MAX_REQUEST_BYTES,
             )?,
-            max_request_header_bytes: bounded_non_zero_usize(
+            max_request_header_bytes: RequestHeaderBytes::parse(
                 "CUSTODE_MAX_REQUEST_HEADER_BYTES",
                 args.max_request_header_bytes,
-                MAX_REQUEST_HEADER_BYTES,
             )?,
-            max_response_bytes: bounded_non_zero_u64(
+            max_response_bytes: ResponseBodyBytes::parse(
                 "CUSTODE_MAX_RESPONSE_BYTES",
                 args.max_response_bytes,
-                MAX_RESPONSE_BYTES,
             )?,
-            max_response_header_bytes: bounded_non_zero_usize(
+            max_response_header_bytes: ResponseHeaderBytes::parse(
                 "CUSTODE_MAX_RESPONSE_HEADER_BYTES",
                 args.max_response_header_bytes,
-                MAX_RESPONSE_HEADER_BYTES,
             )?,
             request_timeout,
             upstream_origin: UpstreamOrigin::parse(&args.upstream_origin)?,
