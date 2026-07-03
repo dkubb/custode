@@ -361,7 +361,7 @@ pub(crate) struct AuditTarget {
 pub(crate) struct AuditWriter {
     /// Audit log file guarded for append writes.
     file: Arc<Mutex<File>>,
-    /// Maximum serialized event bytes.
+    /// Maximum serialized event bytes, including the NDJSON newline.
     max_event_bytes: NonZeroUsize,
 }
 
@@ -1135,6 +1135,7 @@ fn serialize_event(
     max_event_bytes: NonZeroUsize,
 ) -> Result<Vec<u8>, AuditError> {
     let mut serialized = serialize_json_event(event);
+    serialized.push(b'\n');
     let max = max_event_bytes.get();
     if serialized.len() > max {
         return Err(AuditError::EventTooLarge {
@@ -1142,7 +1143,6 @@ fn serialize_event(
             max,
         });
     }
-    serialized.push(b'\n');
     Ok(serialized)
 }
 
@@ -1394,6 +1394,16 @@ mod tests {
     }
 
     #[test]
+    fn run_token_accepts_the_maximum_supported_length() {
+        let text = format!("{}-{}", "a".repeat(31), "b".repeat(32));
+        assert_eq!(text.len(), MAX_RUN_TOKEN_BYTES);
+
+        let token = RunToken::new(text.clone()).expect("maximum-length token should parse");
+
+        assert_eq!(token.as_str(), text);
+    }
+
+    #[test]
     fn decisions_serialize_as_snake_case_strings() {
         let decisions = [
             (AuditDecision::Allowed, "allowed"),
@@ -1581,7 +1591,9 @@ mod tests {
         let event = denied_event();
         let exact_size = serde_json::to_vec(&event)
             .expect("event should serialize")
-            .len();
+            .len()
+            .checked_add(1)
+            .expect("test event length should fit usize");
         let config = GatewayConfig::for_test(
             audit_log.clone(),
             NonZeroUsize::new(exact_size).expect("serialized events are non-empty"),
@@ -1603,19 +1615,27 @@ mod tests {
     async fn write_event_rejects_events_over_the_configured_maximum() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
-        let config = GatewayConfig::for_test(
-            audit_log.clone(),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        );
+        let event = denied_event();
+        let exact_size = serde_json::to_vec(&event)
+            .expect("event should serialize")
+            .len()
+            .checked_add(1)
+            .expect("test event length should fit usize");
+        let too_small = exact_size
+            .checked_sub(1)
+            .and_then(NonZeroUsize::new)
+            .expect("test event should be longer than one byte");
+        let config = GatewayConfig::for_test(audit_log.clone(), too_small);
         let writer = AuditWriter::open(&config)
             .await
             .expect("audit writer should open");
 
-        let result = writer.write_event(&denied_event()).await;
+        let result = writer.write_event(&event).await;
 
         assert!(matches!(
             result,
-            Err(AuditError::EventTooLarge { max: 1, .. }),
+            Err(AuditError::EventTooLarge { bytes, max })
+                if bytes == exact_size && max == too_small.get(),
         ));
         let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
         assert_eq!(contents, "");

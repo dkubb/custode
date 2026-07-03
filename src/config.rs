@@ -11,7 +11,7 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
-/// Maximum serialized audit event bytes.
+/// Maximum serialized audit event bytes, including the NDJSON newline.
 const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
 /// Maximum configured allowed operation bytes.
 const MAX_ALLOWED_OPERATION_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES + 64;
@@ -189,7 +189,7 @@ pub(crate) struct GatewayConfig {
     audit_log: PathBuf,
     /// Gateway bind address.
     bind: SocketAddr,
-    /// Maximum serialized audit event bytes.
+    /// Maximum serialized audit event bytes, including the NDJSON newline.
     max_audit_event_bytes: NonZeroUsize,
     /// Maximum concurrent gateway requests.
     max_concurrent_requests: NonZeroUsize,
@@ -229,7 +229,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "CUSTODE_BIND", default_value = "0.0.0.0:8080")]
     bind: SocketAddr,
 
-    /// Maximum serialized audit event bytes.
+    /// Maximum serialized audit event bytes, including the NDJSON newline.
     #[arg(long, env = "CUSTODE_MAX_AUDIT_EVENT_BYTES", default_value_t = 16_384)]
     max_audit_event_bytes: usize,
 
@@ -478,7 +478,8 @@ impl GatewayConfig {
         }
     }
 
-    /// Returns the maximum serialized audit event bytes.
+    /// Returns the maximum serialized audit event bytes, including the NDJSON
+    /// newline.
     #[must_use]
     pub(crate) const fn max_audit_event_bytes(&self) -> NonZeroUsize {
         self.max_audit_event_bytes

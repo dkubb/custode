@@ -373,12 +373,13 @@ Configuration parsing is fail-closed:
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
   `/v1/responses` and `/v1/responses/{id}`, but not `/v1/responses-other`.
 - Size, concurrency, and duration bounds MUST be positive and MUST NOT exceed
-  the implementation maxima: audit event bytes 1,048,576; concurrent requests
-  Tokio `Semaphore::MAX_PERMITS`; request bytes 1,073,741,824; request header
-  name/value bytes 1,048,576; response bytes 1,073,741,824; response header
-  name/value bytes 1,048,576; incoming path bytes 4,096; incoming query bytes
-  8,192; allowed operation bytes 4,160; allowed operations 256; upstream
-  origin bytes 255; request timeout 3,600 seconds.
+  the implementation maxima: audit event bytes 1,048,576, including the NDJSON
+  newline; concurrent requests Tokio `Semaphore::MAX_PERMITS`; request bytes
+  1,073,741,824; request header name/value bytes 1,048,576; response bytes
+  1,073,741,824; response header name/value bytes 1,048,576; incoming path
+  bytes 4,096; incoming query bytes 8,192; allowed operation bytes 4,160;
+  allowed operations 256; upstream origin bytes 255; request timeout 3,600
+  seconds.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.
