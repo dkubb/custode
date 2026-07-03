@@ -24,8 +24,30 @@ pub(crate) struct ForwardedRequestHeaders {
     headers: HeaderMap,
 }
 
+/// Response headers proven safe for downstream forwarding.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ForwardedResponseHeaders {
+    /// Filtered response headers.
+    headers: HeaderMap,
+}
+
 impl ForwardedRequestHeaders {
     /// Returns the filtered request headers for tests and composition.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn as_header_map(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    /// Consumes the witness and returns the filtered header map.
+    #[must_use]
+    pub(crate) fn into_header_map(self) -> HeaderMap {
+        self.headers
+    }
+}
+
+impl ForwardedResponseHeaders {
+    /// Returns the filtered response headers for tests and composition.
     #[cfg(test)]
     #[must_use]
     pub(crate) const fn as_header_map(&self) -> &HeaderMap {
@@ -126,7 +148,7 @@ pub(crate) fn forward_request_headers(
 pub(crate) fn forward_response_headers(
     incoming: &HeaderMap,
     max_header_bytes: NonZeroUsize,
-) -> Result<HeaderMap, HeaderError> {
+) -> Result<ForwardedResponseHeaders, HeaderError> {
     enforce_header_limit(incoming, max_header_bytes)?;
     let connection_headers = connection_header_names(incoming)?;
 
@@ -136,7 +158,7 @@ pub(crate) fn forward_response_headers(
             outgoing.append(name, value.clone());
         }
     }
-    Ok(outgoing)
+    Ok(ForwardedResponseHeaders { headers: outgoing })
 }
 
 /// Returns true when the header is hop-by-hop or named by `Connection`.
@@ -350,8 +372,8 @@ mod tests {
         .expect("headers should fit");
         let expected = Some(&HeaderValue::from_static("ok"));
 
-        assert_eq!(forwarded.get("x-trace"), None);
-        assert_eq!(forwarded.get("x-visible"), expected);
+        assert_eq!(forwarded.as_header_map().get("x-trace"), None);
+        assert_eq!(forwarded.as_header_map().get("x-visible"), expected);
     }
 
     #[test]
@@ -366,9 +388,9 @@ mod tests {
         )
         .expect("headers should fit");
 
-        assert_eq!(forwarded.get(CONTENT_LENGTH), None);
+        assert_eq!(forwarded.as_header_map().get(CONTENT_LENGTH), None);
         assert_eq!(
-            forwarded.get("x-visible"),
+            forwarded.as_header_map().get("x-visible"),
             Some(&HeaderValue::from_static("ok"))
         );
     }
@@ -517,12 +539,12 @@ mod proptests {
             let forwarded = forward_response_headers(&incoming, roomy_limit())
                 .expect("generated headers should fit");
 
-            prop_assert_eq!(forwarded.get(HOST), incoming.get(HOST));
-            prop_assert!(forwarded.get(CONNECTION).is_none());
-            prop_assert!(forwarded.get(CONTENT_LENGTH).is_none());
+            prop_assert_eq!(forwarded.as_header_map().get(HOST), incoming.get(HOST));
+            prop_assert!(forwarded.as_header_map().get(CONNECTION).is_none());
+            prop_assert!(forwarded.as_header_map().get(CONTENT_LENGTH).is_none());
             for name in hop_by_hop.iter().map(|entry| entry.0.as_str()) {
                 let message = format!("hop-by-hop {name} should be stripped");
-                prop_assert!(!forwarded.contains_key(name), "{}", message);
+                prop_assert!(!forwarded.as_header_map().contains_key(name), "{}", message);
             }
             for name in end_to_end.iter().map(|entry| entry.0.as_str()) {
                 let stripped =
@@ -532,7 +554,8 @@ mod proptests {
                 } else {
                     incoming.get_all(name).iter().collect()
                 };
-                let actual: Vec<&HeaderValue> = forwarded.get_all(name).iter().collect();
+                let actual: Vec<&HeaderValue> =
+                    forwarded.as_header_map().get_all(name).iter().collect();
                 prop_assert_eq!(actual, expected);
             }
         }

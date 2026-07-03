@@ -402,9 +402,10 @@ async fn forward_request(
         target,
     };
     let stream = response_stream(context, upstream_response);
+    let response_header_map = response_headers.into_header_map();
 
     let mut response = Response::builder().status(status);
-    for (name, value) in &response_headers {
+    for (name, value) in &response_header_map {
         response = response.header(name, value);
     }
     response
