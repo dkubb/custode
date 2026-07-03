@@ -92,8 +92,8 @@ enum AuditResponseErrorKind {
 
     /// Response body exceeded the configured byte limit.
     ResponseBodyTooLarge {
-        /// Response body summary.
-        response_body: ObservedBodySummary,
+        /// Accepted response body prefix.
+        response_body: ResponseBodyPrefix,
         /// Response status returned to the harness.
         status: StatusCode,
     },
@@ -232,6 +232,16 @@ enum AuditBodySummaryKind {
 pub(crate) struct ObservedBodySummary {
     /// Observed body summary.
     summary: AuditBodySummary,
+}
+
+/// Accepted response prefix for oversized response-body failures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseBodyPrefix {
+    /// A non-empty response prefix was accepted before the limit failure.
+    Accepted(ObservedBodySummary),
+
+    /// No response bytes were accepted before the limit failure.
+    NoneAccepted,
 }
 
 /// Input used to construct an audit event.
@@ -403,6 +413,32 @@ impl ObservedBodySummary {
     }
 }
 
+impl ResponseBodyPrefix {
+    /// Creates a prefix summary from accepted response bytes.
+    #[must_use]
+    pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
+        let (byte_count, response_digest) = response_account.into_digest_parts();
+        response_digest.map_or(Self::NoneAccepted, |digest| {
+            Self::Accepted(ObservedBodySummary {
+                summary: AuditBodySummary::non_empty(
+                    digest,
+                    NonZeroU64::new(byte_count)
+                        .expect("response body digest requires non-zero bytes"),
+                ),
+            })
+        })
+    }
+
+    /// Consumes the prefix into its audit body summary.
+    #[must_use]
+    const fn into_summary(self) -> AuditBodySummary {
+        match self {
+            Self::NoneAccepted => AuditBodySummary::not_observed(),
+            Self::Accepted(summary) => summary.into_summary(),
+        }
+    }
+}
+
 impl AuditDenialReason {
     /// Returns the stable audit error class.
     #[must_use]
@@ -492,7 +528,7 @@ impl AuditResponseError {
     /// Creates a response-body-too-large response error.
     #[must_use]
     pub(crate) const fn response_body_too_large(
-        response_body: ObservedBodySummary,
+        response_body: ResponseBodyPrefix,
         status: StatusCode,
     ) -> Self {
         Self {
@@ -1323,6 +1359,7 @@ mod proptests {
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, ObservedBodySummary, RequestId,
+        ResponseBodyPrefix,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1502,7 +1539,7 @@ mod proptests {
                         ),
                         1 => (
                             AuditResponseError::response_body_too_large(
-                                observed_response_body,
+                                ResponseBodyPrefix::Accepted(observed_response_body),
                                 status,
                             ),
                             body_value(response_bytes, &response_digest),

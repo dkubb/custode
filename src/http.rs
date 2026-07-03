@@ -753,7 +753,7 @@ mod tests {
                     Value::String("response_body_too_large".to_owned()),
                     StatusCode::CREATED,
                     0,
-                    empty_body_value(),
+                    not_observed_body_value(),
                     true,
                 )),
                 (
@@ -2024,6 +2024,7 @@ mod tests {
         let event = events.first().expect("failure should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "response_body_too_large");
+        assert_eq!(event["response_body"], not_observed_body_value());
     }
 
     #[tokio::test]

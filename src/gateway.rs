@@ -5,6 +5,7 @@ use crate::audit::{
     AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
     AuditResponseError, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
     AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary, RequestId,
+    ResponseBodyPrefix,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -88,8 +89,8 @@ enum ResponseAuditOutcomeKind {
 
     /// Response body exceeded the configured limit.
     ResponseBodyTooLarge {
-        /// Response body summary.
-        response_body: ObservedBodySummary,
+        /// Accepted response body prefix.
+        response_body: ResponseBodyPrefix,
         /// Response status returned to the harness.
         status: StatusCode,
     },
@@ -152,7 +153,7 @@ impl ResponseAuditOutcome {
     ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseBodyTooLarge {
-                response_body: ObservedBodySummary::from_response_account(response_account),
+                response_body: ResponseBodyPrefix::from_response_account(response_account),
                 status,
             },
         }
