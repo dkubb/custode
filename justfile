@@ -23,6 +23,10 @@ docs:
 deny:
     cargo deny-check
 
+shell-check:
+    shfmt -d -i 2 -ci scripts/*.sh
+    shellcheck -S style -x scripts/*.sh
+
 dockerfile-check:
     docker buildx build --check .
 
@@ -53,6 +57,6 @@ coverage-proptests:
 mutants:
     cargo mutants-all
 
-check: fmt-check lint test dockerfile-check
+check: fmt-check lint shell-check test dockerfile-check
 
 ci: check deny

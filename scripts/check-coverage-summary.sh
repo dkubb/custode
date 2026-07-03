@@ -2,115 +2,115 @@
 # Checks a cargo-llvm-cov JSON summary against missed-state limits.
 
 main() {
-	local max_regions=0
-	local max_functions=0
-	local max_lines=0
-	local max_branches=0
-	local summary_path=""
-	local exclude_test_mods=0
+  local max_regions=0
+  local max_functions=0
+  local max_lines=0
+  local max_branches=0
+  local summary_path=""
+  local exclude_test_mods=0
 
-	while [[ "${#}" -gt 0 ]]; do
-		case "${1}" in
-		--exclude-test-mods)
-			exclude_test_mods=1
-			shift
-			;;
-		--max-missed-regions)
-			require_count_option "${1}" "${2-}"
-			max_regions="${2}"
-			shift 2
-			;;
-		--max-missed-functions)
-			require_count_option "${1}" "${2-}"
-			max_functions="${2}"
-			shift 2
-			;;
-		--max-missed-lines)
-			require_count_option "${1}" "${2-}"
-			max_lines="${2}"
-			shift 2
-			;;
-		--max-missed-branches)
-			require_count_option "${1}" "${2-}"
-			max_branches="${2}"
-			shift 2
-			;;
-		--help | -h)
-			usage
-			return 0
-			;;
-		--*)
-			printf 'unknown option: %s\n' "${1}" >&2
-			usage >&2
-			return 2
-			;;
-		*)
-			if [[ -n "${summary_path}" ]]; then
-				printf 'unexpected argument: %s\n' "${1}" >&2
-				usage >&2
-				return 2
-			fi
-			summary_path="${1}"
-			shift
-			;;
-		esac
-	done
+  while [[ "${#}" -gt 0 ]]; do
+    case "${1}" in
+      --exclude-test-mods)
+        exclude_test_mods=1
+        shift
+        ;;
+      --max-missed-regions)
+        require_count_option "${1}" "${2-}"
+        max_regions="${2}"
+        shift 2
+        ;;
+      --max-missed-functions)
+        require_count_option "${1}" "${2-}"
+        max_functions="${2}"
+        shift 2
+        ;;
+      --max-missed-lines)
+        require_count_option "${1}" "${2-}"
+        max_lines="${2}"
+        shift 2
+        ;;
+      --max-missed-branches)
+        require_count_option "${1}" "${2-}"
+        max_branches="${2}"
+        shift 2
+        ;;
+      --help | -h)
+        usage
+        return 0
+        ;;
+      --*)
+        printf 'unknown option: %s\n' "${1}" >&2
+        usage >&2
+        return 2
+        ;;
+      *)
+        if [[ -n "${summary_path}" ]]; then
+          printf 'unexpected argument: %s\n' "${1}" >&2
+          usage >&2
+          return 2
+        fi
+        summary_path="${1}"
+        shift
+        ;;
+    esac
+  done
 
-	if [[ -z "${summary_path}" ]]; then
-		usage >&2
-		return 2
-	fi
+  if [[ -z "${summary_path}" ]]; then
+    usage >&2
+    return 2
+  fi
 
-	if [[ ! -f "${summary_path}" ]]; then
-		printf 'coverage summary not found: %s\n' "${summary_path}" >&2
-		return 2
-	fi
+  if [[ ! -f "${summary_path}" ]]; then
+    printf 'coverage summary not found: %s\n' "${summary_path}" >&2
+    return 2
+  fi
 
-	local report_path
-	report_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-report.XXXXXX")
-	if [[ "${exclude_test_mods}" -eq 0 ]]; then
-		summary_report "${summary_path}" \
-			"${max_regions}" \
-			"${max_functions}" \
-			"${max_lines}" \
-			"${max_branches}" >"${report_path}"
-	else
-		detailed_report_excluding_test_modules "${summary_path}" \
-			"${max_regions}" \
-			"${max_functions}" \
-			"${max_lines}" \
-			"${max_branches}" >"${report_path}"
-	fi
+  local report_path
+  report_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-report.XXXXXX")
+  if [[ "${exclude_test_mods}" -eq 0 ]]; then
+    summary_report "${summary_path}" \
+      "${max_regions}" \
+      "${max_functions}" \
+      "${max_lines}" \
+      "${max_branches}" >"${report_path}"
+  else
+    detailed_report_excluding_test_modules "${summary_path}" \
+      "${max_regions}" \
+      "${max_functions}" \
+      "${max_lines}" \
+      "${max_branches}" >"${report_path}"
+  fi
 
-	local failed=0
-	local metric
-	local missed
-	local maximum
-	while IFS=$'\t' read -r metric missed maximum; do
-		if ((missed > maximum)); then
-			printf 'coverage metric %s has %s missed states; max is %s\n' \
-				"${metric}" "${missed}" "${maximum}" >&2
-			failed=1
-		fi
-	done <"${report_path}"
+  local failed=0
+  local metric
+  local missed
+  local maximum
+  while IFS=$'\t' read -r metric missed maximum; do
+    if ((missed > maximum)); then
+      printf 'coverage metric %s has %s missed states; max is %s\n' \
+        "${metric}" "${missed}" "${maximum}" >&2
+      failed=1
+    fi
+  done <"${report_path}"
 
-	rm -f "${report_path}"
+  rm -f "${report_path}"
 
-	if [[ "${failed}" -ne 0 ]]; then
-		return 1
-	fi
+  if [[ "${failed}" -ne 0 ]]; then
+    return 1
+  fi
 
-	printf 'coverage summary is within missed-state limits\n'
+  printf 'coverage summary is within missed-state limits\n'
 }
 
 summary_report() {
-	local summary_path="${1}"
-	local max_regions="${2}"
-	local max_functions="${3}"
-	local max_lines="${4}"
-	local max_branches="${5}"
+  local summary_path="${1}"
+  local max_regions="${2}"
+  local max_functions="${3}"
+  local max_lines="${4}"
+  local max_branches="${5}"
 
-	jq --raw-output '
+  jq --raw-output '
     def require_number($metric; $field):
       .data[0].totals[$metric][$field] as $value |
       if ($value | type) == "number" then
@@ -144,35 +144,35 @@ summary_report() {
     .[] |
     @tsv
   ' \
-		--argjson max_regions "${max_regions}" \
-		--argjson max_functions "${max_functions}" \
-		--argjson max_lines "${max_lines}" \
-		--argjson max_branches "${max_branches}" \
-		"${summary_path}"
+    --argjson max_regions "${max_regions}" \
+    --argjson max_functions "${max_functions}" \
+    --argjson max_lines "${max_lines}" \
+    --argjson max_branches "${max_branches}" \
+    "${summary_path}"
 }
 
 detailed_report_excluding_test_modules() {
-	local summary_path="${1}"
-	local max_regions="${2}"
-	local max_functions="${3}"
-	local max_lines="${4}"
-	local max_branches="${5}"
-	local exclusions_path
-	local events_path
+  local summary_path="${1}"
+  local max_regions="${2}"
+  local max_functions="${3}"
+  local max_lines="${4}"
+  local max_branches="${5}"
+  local exclusions_path
+  local events_path
 
-	if ! jq --exit-status '
+  if ! jq --exit-status '
     .data[0].functions != null
       and (.data[0].files | all(.segments != null and .branches != null))
   ' "${summary_path}" >/dev/null; then
-		printf 'detailed coverage JSON is required with --exclude-test-mods\n' >&2
-		return 2
-	fi
+    printf 'detailed coverage JSON is required with --exclude-test-mods\n' >&2
+    return 2
+  fi
 
-	exclusions_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-exclusions.XXXXXX")
-	events_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-events.XXXXXX")
-	build_exclusion_table "${summary_path}" >"${exclusions_path}"
+  exclusions_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-exclusions.XXXXXX")
+  events_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-events.XXXXXX")
+  build_exclusion_table "${summary_path}" >"${exclusions_path}"
 
-	jq --raw-output '
+  jq --raw-output '
     def as_bool:
       if type == "boolean" then . else . != 0 end;
 
@@ -239,7 +239,7 @@ detailed_report_excluding_test_modules() {
     @tsv
   ' "${summary_path}" >"${events_path}"
 
-	awk -F '\t' '
+  awk -F '\t' '
       FILENAME == ARGV[1] {
         excluded_from[$1] = $2
         next
@@ -272,64 +272,64 @@ detailed_report_excluding_test_modules() {
         printf "branches\t%d\t%s\n", missed["branch"], max_branches
       }
     ' \
-		max_regions="${max_regions}" \
-		max_functions="${max_functions}" \
-		max_lines="${max_lines}" \
-		max_branches="${max_branches}" \
-		"${exclusions_path}" "${events_path}"
+    max_regions="${max_regions}" \
+    max_functions="${max_functions}" \
+    max_lines="${max_lines}" \
+    max_branches="${max_branches}" \
+    "${exclusions_path}" "${events_path}"
 
-	rm -f "${exclusions_path}" "${events_path}"
+  rm -f "${exclusions_path}" "${events_path}"
 }
 
 build_exclusion_table() {
-	local summary_path="${1}"
-	local filenames_path
-	local filename
-	local line
+  local summary_path="${1}"
+  local filenames_path
+  local filename
+  local line
 
-	filenames_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-files.XXXXXX")
-	jq --raw-output '.data[0].files[].filename' "${summary_path}" >"${filenames_path}"
-	while IFS= read -r filename; do
-		if [[ ! -f "${filename}" ]]; then
-			continue
-		fi
-		line=$(awk '
+  filenames_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-files.XXXXXX")
+  jq --raw-output '.data[0].files[].filename' "${summary_path}" >"${filenames_path}"
+  while IFS= read -r filename; do
+    if [[ ! -f "${filename}" ]]; then
+      continue
+    fi
+    line=$(awk '
       /^[[:space:]]*mod[[:space:]]+(tests|proptests)[[:space:]]*\{/ {
         print NR
         exit
       }
     ' "${filename}")
-		if [[ -n "${line}" ]]; then
-			printf '%s\t%s\n' "${filename}" "${line}"
-		fi
-	done <"${filenames_path}"
-	rm -f "${filenames_path}"
+    if [[ -n "${line}" ]]; then
+      printf '%s\t%s\n' "${filename}" "${line}"
+    fi
+  done <"${filenames_path}"
+  rm -f "${filenames_path}"
 }
 
 usage() {
-	printf 'usage: %s [options] <cargo-llvm-cov-summary.json>\n' "${0}"
-	printf 'options:\n'
-	printf '  --exclude-test-mods\n'
-	printf '  --max-missed-regions <count>\n'
-	printf '  --max-missed-functions <count>\n'
-	printf '  --max-missed-lines <count>\n'
-	printf '  --max-missed-branches <count>\n'
+  printf 'usage: %s [options] <cargo-llvm-cov-summary.json>\n' "${0}"
+  printf 'options:\n'
+  printf '  --exclude-test-mods\n'
+  printf '  --max-missed-regions <count>\n'
+  printf '  --max-missed-functions <count>\n'
+  printf '  --max-missed-lines <count>\n'
+  printf '  --max-missed-branches <count>\n'
 }
 
 require_count_option() {
-	local option="${1}"
-	local value="${2}"
+  local option="${1}"
+  local value="${2}"
 
-	if [[ -z "${value}" ]]; then
-		printf '%s requires a value\n' "${option}" >&2
-		return 2
-	fi
+  if [[ -z "${value}" ]]; then
+    printf '%s requires a value\n' "${option}" >&2
+    return 2
+  fi
 
-	if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
-		printf '%s requires a non-negative integer, got: %s\n' \
-			"${option}" "${value}" >&2
-		return 2
-	fi
+  if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
+    printf '%s requires a non-negative integer, got: %s\n' \
+      "${option}" "${value}" >&2
+    return 2
+  fi
 }
 
 main "${@}"
