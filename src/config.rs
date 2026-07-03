@@ -105,6 +105,13 @@ pub(crate) enum ConfigError {
         path: String,
     },
 
+    /// Prefix path was not a supported segment-bounded prefix.
+    #[error("allowed prefix {path:?} must be non-root and must not end with `/`")]
+    InvalidAllowedPrefix {
+        /// Invalid prefix.
+        path: String,
+    },
+
     /// Method could not be parsed.
     #[error("invalid HTTP method {method:?}")]
     InvalidMethod {
@@ -370,11 +377,12 @@ impl AllowedPath {
     ///
     /// # Errors
     ///
-    /// Returns an error when the path does not begin with `/`.
+    /// Returns an error when the prefix is not a supported segment-bounded
+    /// prefix.
     pub(crate) fn prefix(raw: &str) -> Result<Self, ConfigError> {
         Ok(Self {
             kind: AllowedPathKind::Prefix,
-            value: parse_allowed_path(raw)?,
+            value: parse_allowed_prefix(raw)?,
         })
     }
 }
@@ -719,6 +727,17 @@ fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
     })
 }
 
+/// Parses an allowed path prefix string.
+fn parse_allowed_prefix(prefix: &str) -> Result<OriginFormPath, ConfigError> {
+    let path = parse_allowed_path(prefix)?;
+    if path.as_str() == "/" || path.as_str().ends_with('/') {
+        return Err(ConfigError::InvalidAllowedPrefix {
+            path: prefix.to_owned(),
+        });
+    }
+    Ok(path)
+}
+
 /// Returns true when configured path text includes non-path syntax.
 fn has_forbidden_allowed_path_character(path: &str) -> bool {
     path.as_bytes()
@@ -839,6 +858,29 @@ mod tests {
                 ),
                 "path {path:?} should fail closed",
             );
+        }
+    }
+
+    #[test]
+    fn allowed_prefix_rejects_root_and_trailing_slash() {
+        for prefix in ["/", "/v1/"] {
+            assert!(
+                matches!(
+                    AllowedPath::prefix(prefix),
+                    Err(ConfigError::InvalidAllowedPrefix { path }) if path == prefix,
+                ),
+                "prefix {prefix:?} should fail closed",
+            );
+        }
+    }
+
+    #[test]
+    fn exact_path_accepts_root_and_trailing_slash() {
+        for path in ["/", "/v1/"] {
+            let allowed = AllowedPath::exact(path).expect("exact path should parse");
+            let incoming = origin_form_path(path);
+
+            assert!(allowed.matches(&incoming));
         }
     }
 
@@ -1461,6 +1503,14 @@ mod proptests {
         ]
     }
 
+    /// Paths outside the configured prefix grammar but valid as exact paths.
+    fn allowed_prefix_invalid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("/".to_owned()),
+            allowed_path_valid().prop_map(|path| format!("{path}/")),
+        ]
+    }
+
     /// Allowed operation strings longer than the supported byte limit.
     fn operation_too_long() -> impl Strategy<Value = String> {
         (MAX_ALLOWED_OPERATION_BYTES..=MAX_ALLOWED_OPERATION_BYTES + 64)
@@ -1551,6 +1601,16 @@ mod proptests {
             path in allowed_path_invalid(),
         ) {
             let raw = format!("{method}:{kind}:{path}");
+
+            prop_assert!(AllowedOperation::parse(&raw).is_err());
+        }
+
+        #[test]
+        fn parse_rejects_invalid_prefix_operations(
+            method in method_valid(),
+            path in allowed_prefix_invalid(),
+        ) {
+            let raw = format!("{method}:prefix:{path}");
 
             prop_assert!(AllowedOperation::parse(&raw).is_err());
         }

@@ -368,6 +368,8 @@ Configuration parsing is fail-closed:
   `METHOD:prefix:/path`.
 - Every configured path or prefix MUST begin with `/` and MUST NOT contain a
   query delimiter, fragment delimiter, or literal backslash.
+- Every configured prefix MUST be non-root and MUST NOT end with `/`; use an
+  exact path for `/` or a trailing-slash resource.
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
   `/v1/responses` and `/v1/responses/{id}`, but not `/v1/responses-other`.
 - Size, concurrency, and duration bounds MUST be positive and MUST NOT exceed
