@@ -76,8 +76,6 @@ struct ResponseAuditContext {
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     /// Gateway state.
     gateway: Gateway,
-    /// Request method.
-    method: Method,
     /// Accounted request body.
     request_body: AccountedBody,
     /// Request identity.
@@ -86,8 +84,8 @@ struct ResponseAuditContext {
     response_account: ResponseAccount,
     /// Upstream response status.
     status: StatusCode,
-    /// Accepted target.
-    target: AcceptedTarget,
+    /// Allowlist witness for the accepted method and target.
+    target: AllowedTarget,
 }
 
 /// Terminal response stream outcome.
@@ -111,7 +109,6 @@ impl ResponseAuditContext {
     async fn audit(self, stream_outcome: ResponseStreamOutcome) -> Result<(), GatewayError> {
         let Self {
             gateway,
-            method,
             request_body,
             request_id,
             response_account,
@@ -133,13 +130,7 @@ impl ResponseAuditContext {
                 ResponseAuditOutcome::upstream_response_stream_failed(response_account, status)
             }
         };
-        let input = ResponseAuditInput {
-            method: method.to_string(),
-            outcome: audit_outcome,
-            request_body,
-            request_id,
-            target,
-        };
+        let input = ResponseAuditInput::new(target, audit_outcome, request_body, request_id);
         gateway.audit_response(input).await
     }
 
@@ -347,8 +338,6 @@ async fn forward_request(
     request_headers: ForwardedRequestHeaders,
     request_body: AccountedBody,
 ) -> Result<Response<Body>, GatewayError> {
-    let method = target.method().clone();
-    let accepted_target = target.target().clone();
     let upstream_request = UpstreamRequest::from_target(
         gateway.config().upstream_origin(),
         &target,
@@ -360,13 +349,8 @@ async fn forward_request(
         Ok(upstream_response) => upstream_response,
         Err(error) => {
             let audit_error = audit_upstream_error(&error);
-            let input = ResponseAuditInput {
-                method: method.to_string(),
-                outcome: ResponseAuditOutcome::upstream_error(audit_error),
-                request_body,
-                request_id,
-                target: accepted_target,
-            };
+            let outcome = ResponseAuditOutcome::upstream_error(audit_error);
+            let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
             gateway.audit_response(input).await?;
             return Ok(status_response(audit_error.status()));
         }
@@ -379,13 +363,8 @@ async fn forward_request(
         Ok(response_headers) => response_headers,
         Err(error) => {
             let audit_error = audit_response_header_error(error);
-            let input = ResponseAuditInput {
-                method: method.to_string(),
-                outcome: ResponseAuditOutcome::response_header_error(audit_error),
-                request_body,
-                request_id,
-                target: accepted_target,
-            };
+            let outcome = ResponseAuditOutcome::response_header_error(audit_error);
+            let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
             gateway.audit_response(input).await?;
             return Ok(status_response(audit_error.status()));
         }
@@ -394,12 +373,11 @@ async fn forward_request(
     let context = ResponseAuditContext {
         fatal_errors,
         gateway,
-        method,
         request_body,
         request_id,
         response_account,
         status,
-        target: accepted_target,
+        target,
     };
     let stream = response_stream(context, upstream_response);
 
@@ -1173,7 +1151,7 @@ mod tests {
         response_stream, run_until_server_stops, send_stream_error, serve, synthetic_target,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
     use crate::audit::{
         AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
     };
@@ -1314,6 +1292,12 @@ mod tests {
             .uri(target)
             .body(Body::empty())
             .expect("request should build")
+    }
+
+    /// Builds an allowlist witness for response audit tests.
+    fn allowed_target(config: &GatewayConfig, path: &str) -> AllowedTarget {
+        let target = AcceptedTarget::new(path, None).expect("target should parse");
+        allow_target(config, &Method::GET, target).expect("target should be allowed")
     }
 
     /// Returns the origin of a bound-then-released local port.
@@ -2491,6 +2475,7 @@ mod tests {
             PathBuf::from("unused-audit.ndjson"),
             "https://api.openai.com",
         );
+        let target = allowed_target(&config, "/v1/models");
         let gateway =
             Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
         let request_body = AccountedBody::read_request(
@@ -2505,12 +2490,11 @@ mod tests {
         let context = ResponseAuditContext {
             fatal_errors,
             gateway,
-            method: Method::GET,
             request_body,
             request_id: RequestId::from_parts("test", 1),
             response_account,
             status: StatusCode::OK,
-            target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
+            target,
         };
         let upstream_body = stream::unfold(0_u8, |step| async move {
             match step {
@@ -2582,6 +2566,7 @@ mod tests {
             directory.path().join("audit.ndjson"),
             NonZeroUsize::new(1).expect("limit should be non-zero"),
         );
+        let target = allowed_target(&config, "/v1/models");
         let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
@@ -2600,12 +2585,11 @@ mod tests {
         let context = ResponseAuditContext {
             fatal_errors,
             gateway,
-            method: Method::GET,
             request_body,
             request_id: RequestId::from_parts("test", 1),
             response_account,
             status: StatusCode::OK,
-            target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
+            target,
         };
 
         let result = context

@@ -1,6 +1,6 @@
 //! Request handling state machine.
 
-use crate::allowlist::AcceptedTarget;
+use crate::allowlist::AllowedTarget;
 use crate::audit::{
     AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
     AuditResponseError, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
@@ -50,16 +50,14 @@ pub(crate) enum GatewayError {
 /// Input for response audit events.
 #[derive(Debug)]
 pub(crate) struct ResponseAuditInput {
-    /// Method.
-    pub method: String,
     /// Closed response audit outcome.
-    pub outcome: ResponseAuditOutcome,
+    outcome: ResponseAuditOutcome,
     /// Accounted request body.
-    pub request_body: AccountedBody,
+    request_body: AccountedBody,
     /// Request identity.
-    pub request_id: RequestId,
-    /// Accepted target.
-    pub target: AcceptedTarget,
+    request_id: RequestId,
+    /// Allowlist witness for the accepted method and target.
+    target: AllowedTarget,
 }
 
 /// Closed response audit outcome.
@@ -191,6 +189,24 @@ impl ResponseAuditOutcome {
     }
 }
 
+impl ResponseAuditInput {
+    /// Creates response audit input from an accepted method-target witness.
+    #[must_use]
+    pub(crate) const fn new(
+        target: AllowedTarget,
+        outcome: ResponseAuditOutcome,
+        request_body: AccountedBody,
+        request_id: RequestId,
+    ) -> Self {
+        Self {
+            outcome,
+            request_body,
+            request_id,
+            target,
+        }
+    }
+}
+
 impl Gateway {
     /// Writes an audit event for a denied request.
     ///
@@ -206,11 +222,11 @@ impl Gateway {
         reason: AuditDenialReason,
     ) -> Result<(), GatewayError> {
         let request = AuditRequestInput::for_denial(
-            method.to_string(),
+            method.clone(),
             target,
             request_id,
             request_body,
-            self.config.upstream_origin().as_str().to_owned(),
+            self.config.upstream_origin().clone(),
         );
         let event = AuditEvent::new_at(AuditEventInput::denied(request, reason), self.clock.now());
         self.audit.append_event(&event).await?;
@@ -226,13 +242,13 @@ impl Gateway {
         &self,
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
-        let upstream = AuditUpstreamTarget::from(&input.target);
+        let upstream = AuditUpstreamTarget::from(input.target.target());
         let request = ObservedAuditRequestInput::new(
-            input.method,
-            input.target.into(),
+            input.target.method().clone(),
+            AuditTarget::from(input.target.target()),
             input.request_id,
             &input.request_body,
-            self.config.upstream_origin().as_str().to_owned(),
+            self.config.upstream_origin().clone(),
         );
         let event_input = match input.outcome.into_kind() {
             ResponseAuditOutcomeKind::Allowed {
@@ -315,7 +331,7 @@ impl Gateway {
 mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
     use crate::audit::{AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
@@ -373,6 +389,12 @@ mod tests {
         )
         .await
         .expect("request body should be accounted")
+    }
+
+    /// Builds an allowlist witness for response audit tests.
+    fn allowed_target(gateway: &Gateway, path: &str, query: Option<&str>) -> AllowedTarget {
+        let target = AcceptedTarget::new(path, query).expect("target should parse");
+        allow_target(gateway.config(), &Method::GET, target).expect("target should be allowed")
     }
 
     /// Expected serialized empty body summary.
@@ -490,13 +512,12 @@ mod tests {
         let gateway = runtime_gateway(directory.path()).await;
         let request_body = accounted_body(Body::empty()).await;
         let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
-        let input = ResponseAuditInput {
-            method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
+        let input = ResponseAuditInput::new(
+            allowed_target(&gateway, "/v1/models", None),
+            ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            request_id: RequestId::from_parts("run", 1),
-            target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
-        };
+            RequestId::from_parts("run", 1),
+        );
 
         gateway
             .audit_response(input)
@@ -518,14 +539,12 @@ mod tests {
         response_account
             .add_chunk(b"world")
             .expect("response chunk should be accounted");
-        let input = ResponseAuditInput {
-            method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
+        let input = ResponseAuditInput::new(
+            allowed_target(&gateway, "/v1/models", Some("limit=1")),
+            ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            request_id: RequestId::from_parts("run", 1),
-            target: AcceptedTarget::new("/v1/models", Some("limit=1"))
-                .expect("target should parse"),
-        };
+            RequestId::from_parts("run", 1),
+        );
 
         gateway
             .audit_response(input)

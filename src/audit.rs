@@ -2,8 +2,8 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
-use crate::config::GatewayConfig;
-use ::http::StatusCode;
+use crate::config::{GatewayConfig, UpstreamOrigin};
+use ::http::{Method, StatusCode};
 use core::num::NonZeroU64;
 use serde::Serialize;
 use std::io;
@@ -292,13 +292,13 @@ pub(crate) struct AuditRequestInput {
     /// Request body summary.
     body: AuditBodySummary,
     /// Request method.
-    method: String,
+    method: Method,
     /// Request identity.
     request_id: RequestId,
     /// Accepted or raw audit target.
     target: AuditTarget,
     /// Configured upstream origin.
-    upstream_origin: String,
+    upstream_origin: UpstreamOrigin,
 }
 
 /// Request context for an audit event after the request body was observed.
@@ -677,11 +677,11 @@ impl AuditRequestInput {
     /// Creates request context for denial events.
     #[must_use]
     pub(crate) fn for_denial(
-        method: String,
+        method: Method,
         target: AuditTarget,
         request_id: RequestId,
         body: Option<&AccountedBody>,
-        upstream_origin: String,
+        upstream_origin: UpstreamOrigin,
     ) -> Self {
         Self::new(
             method,
@@ -698,11 +698,11 @@ impl AuditRequestInput {
     /// Creates request context common to every audit event.
     #[must_use]
     const fn new(
-        method: String,
+        method: Method,
         target: AuditTarget,
         request_id: RequestId,
         body: AuditBodySummary,
-        upstream_origin: String,
+        upstream_origin: UpstreamOrigin,
     ) -> Self {
         Self {
             body,
@@ -724,11 +724,11 @@ impl ObservedAuditRequestInput {
     /// Creates request context after the request body was observed.
     #[must_use]
     pub(crate) fn new(
-        method: String,
+        method: Method,
         target: AuditTarget,
         request_id: RequestId,
         body: &AccountedBody,
-        upstream_origin: String,
+        upstream_origin: UpstreamOrigin,
     ) -> Self {
         let request = AuditRequestInput::new(
             method,
@@ -788,6 +788,15 @@ impl From<&AcceptedTarget> for AuditUpstreamTarget {
 
 impl From<AcceptedTarget> for AuditTarget {
     fn from(target: AcceptedTarget) -> Self {
+        Self {
+            path: target.path().to_owned(),
+            query: target.query().map(str::to_owned),
+        }
+    }
+}
+
+impl From<&AcceptedTarget> for AuditTarget {
+    fn from(target: &AcceptedTarget) -> Self {
         Self {
             path: target.path().to_owned(),
             query: target.query().map(str::to_owned),
@@ -858,7 +867,7 @@ impl AuditEvent {
         Self {
             decision,
             error_class,
-            method,
+            method: method.to_string(),
             path: target.path().to_owned(),
             query: target.query().map(str::to_owned),
             request_body,
@@ -866,7 +875,7 @@ impl AuditEvent {
             response_body,
             status,
             timestamp,
-            upstream_origin,
+            upstream_origin: upstream_origin.as_str().to_owned(),
             upstream_path,
             upstream_query,
             version: 3,
@@ -981,7 +990,8 @@ mod tests {
         RequestId,
     };
     use crate::allowlist::AcceptedTarget;
-    use crate::config::GatewayConfig;
+    use crate::config::{GatewayConfig, UpstreamOrigin};
+    use ::http::Method;
     use core::num::NonZeroUsize;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
@@ -998,11 +1008,11 @@ mod tests {
         body: AuditBodySummary,
     ) -> AuditRequestInput {
         AuditRequestInput::new(
-            method.to_owned(),
+            Method::from_bytes(method.as_bytes()).expect("test method should parse"),
             target,
             RequestId::from_parts("run", 1),
             body,
-            "https://api.openai.com".to_owned(),
+            UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
         )
     }
 
@@ -1316,6 +1326,8 @@ mod proptests {
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
+    use crate::config::UpstreamOrigin;
+    use ::http::Method;
     use ::http::StatusCode;
     use core::num::NonZeroU64;
     use core::time::Duration;
@@ -1356,6 +1368,11 @@ mod proptests {
     /// Generates observed non-empty body bytes.
     fn non_empty_body() -> impl Strategy<Value = Vec<u8>> {
         collection::vec(any::<u8>(), 1..33)
+    }
+
+    /// Returns a parsed method from generated method text.
+    fn method_value(method: &str) -> Method {
+        Method::from_bytes(method.as_bytes()).expect("generated method should parse")
     }
 
     /// Returns one closed denial reason from a generated index.
@@ -1413,6 +1430,11 @@ mod proptests {
     /// Returns a valid HTTP status code from a generated code.
     fn status_code(code: u16) -> StatusCode {
         StatusCode::from_u16(code).expect("generated status code should be valid")
+    }
+
+    /// Returns the fixed upstream origin used by serialization proptests.
+    fn upstream_origin() -> UpstreamOrigin {
+        UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse")
     }
 
     proptest! {
@@ -1524,11 +1546,11 @@ mod proptests {
                 }
             };
             let request = AuditRequestInput::new(
-                method,
+                method_value(&method),
                 AuditTarget::from_uri_parts(&path, query.as_deref()),
                 RequestId::from_parts(&run_token, sequence),
                 request_body,
-                "https://api.openai.com".to_owned(),
+                upstream_origin(),
             );
             let input = AuditEventInput::new(request, outcome);
 
