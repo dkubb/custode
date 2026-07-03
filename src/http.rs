@@ -381,10 +381,7 @@ async fn forward_request(
             let audit_error = audit_response_header_error(error);
             let input = ResponseAuditInput {
                 method: method.to_string(),
-                outcome: ResponseAuditOutcome::response_header_error(
-                    audit_error.error_class(),
-                    audit_error.status(),
-                ),
+                outcome: ResponseAuditOutcome::response_header_error(audit_error),
                 request_body,
                 request_id,
                 target: accepted_target,

@@ -2,9 +2,9 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
-    AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget,
-    AuditUpstreamError, AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary,
-    RequestId,
+    AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
+    AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
+    ObservedAuditRequestInput, ObservedBodySummary, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -98,10 +98,8 @@ enum ResponseAuditOutcomeKind {
 
     /// Response headers failed before response body bytes were observed.
     ResponseHeaderError {
-        /// Stable error class.
-        error_class: &'static str,
-        /// Response status returned to the harness.
-        status: StatusCode,
+        /// Response header error.
+        error: AuditResponseHeaderError,
     },
 
     /// Upstream request failed before a response completed.
@@ -164,15 +162,9 @@ impl ResponseAuditOutcome {
 
     /// Creates a response-header-error outcome.
     #[must_use]
-    pub(crate) const fn response_header_error(
-        error_class: &'static str,
-        status: StatusCode,
-    ) -> Self {
+    pub(crate) const fn response_header_error(error: AuditResponseHeaderError) -> Self {
         Self {
-            kind: ResponseAuditOutcomeKind::ResponseHeaderError {
-                error_class,
-                status,
-            },
+            kind: ResponseAuditOutcomeKind::ResponseHeaderError { error },
         }
     }
 
@@ -267,11 +259,13 @@ impl Gateway {
                 status,
                 upstream,
             ),
-            ResponseAuditOutcomeKind::ResponseHeaderError {
-                error_class,
-                status,
-            } => {
-                AuditEventInput::response_error_without_body(request, error_class, status, upstream)
+            ResponseAuditOutcomeKind::ResponseHeaderError { error } => {
+                AuditEventInput::response_error_without_body(
+                    request,
+                    error.error_class(),
+                    error.status(),
+                    upstream,
+                )
             }
             ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
                 response_body,
