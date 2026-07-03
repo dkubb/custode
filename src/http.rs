@@ -34,6 +34,7 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 
 /// Serving runtime error.
@@ -290,23 +291,41 @@ async fn handle_request(
             }
         };
 
-    let request_body =
-        match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
-            Ok(request_body) => request_body,
-            Err(error) => {
-                let reason = denial_reason_from_request_body(&error);
-                gateway
-                    .audit_denial(
-                        request_id,
-                        &method,
-                        target.target().clone().into(),
-                        None,
-                        reason,
-                    )
-                    .await?;
-                return Ok(status_response(reason.status()));
-            }
-        };
+    let request_body = match timeout(
+        gateway.config().request_timeout().as_duration(),
+        AccountedBody::read_request(body, gateway.config().max_request_bytes()),
+    )
+    .await
+    {
+        Ok(Ok(request_body)) => request_body,
+        Ok(Err(error)) => {
+            let reason = denial_reason_from_request_body(&error);
+            gateway
+                .audit_denial(
+                    request_id,
+                    &method,
+                    target.target().clone().into(),
+                    None,
+                    reason,
+                )
+                .await?;
+            return Ok(status_response(reason.status()));
+        }
+        Err(_elapsed) => {
+            gateway
+                .audit_denial(
+                    request_id,
+                    &method,
+                    target.target().clone().into(),
+                    None,
+                    AuditDenialReason::RequestBodyTimeout,
+                )
+                .await?;
+            return Ok(status_response(
+                AuditDenialReason::RequestBodyTimeout.status(),
+            ));
+        }
+    };
 
     forward_request(
         fatal_errors,
@@ -1393,6 +1412,38 @@ mod tests {
         ]))
     }
 
+    /// Returns the expected deterministic audit event for a body-read timeout.
+    fn injected_request_body_timeout_event() -> Value {
+        Value::Object(Map::from_iter([
+            ("decision".to_owned(), Value::String("denied".to_owned())),
+            (
+                "error_class".to_owned(),
+                Value::String("request_body_timeout".to_owned()),
+            ),
+            ("method".to_owned(), Value::String("POST".to_owned())),
+            ("path".to_owned(), Value::String("/v1/responses".to_owned())),
+            ("query".to_owned(), Value::Null),
+            ("request_body".to_owned(), not_observed_body_value()),
+            (
+                "request_id".to_owned(),
+                Value::String("req-test-0000000000000001".to_owned()),
+            ),
+            ("response_body".to_owned(), not_observed_body_value()),
+            ("status".to_owned(), Value::from(408_u64)),
+            (
+                "timestamp".to_owned(),
+                Value::String("2026-07-02T00:00:00.000000000Z".to_owned()),
+            ),
+            (
+                "upstream_origin".to_owned(),
+                Value::String("https://api.openai.com".to_owned()),
+            ),
+            ("upstream_path".to_owned(), Value::Null),
+            ("upstream_query".to_owned(), Value::Null),
+            ("version".to_owned(), Value::from(3_u64)),
+        ]))
+    }
+
     /// Builds the proxy router and fatal error channel around a configuration.
     async fn proxy_router(
         config: GatewayConfig,
@@ -1747,6 +1798,64 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert_eq!(events, [injected_timeout_event()]);
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn proxy_times_out_slow_request_bodies_before_upstream() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let (client, upstream_requests) = ScriptedUpstreamClient::new();
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        let slow_body = Body::from_stream(stream::once(async {
+            sleep(Duration::from_secs(10)).await;
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"late"))
+        }));
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .body(slow_body)
+            .expect("request should build");
+
+        let started_at = Instant::now();
+        let response = router.oneshot(request).await.expect("proxy should respond");
+
+        assert_eq!(Instant::now(), started_at + deadline.timeout());
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should stream");
+        assert_eq!(body, Bytes::new());
+        let requests = upstream_requests
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        assert_eq!(requests, []);
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events, [injected_request_body_timeout_event()]);
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(

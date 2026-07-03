@@ -62,6 +62,9 @@ pub(crate) enum AuditDenialReason {
     /// Request body could not be read.
     RequestBodyReadFailed,
 
+    /// Request body was not received before the configured timeout.
+    RequestBodyTimeout,
+
     /// Request body exceeded the configured limit.
     RequestBodyTooLarge,
 
@@ -453,6 +456,7 @@ impl AuditDenialReason {
             Self::NonOriginForm => "non_origin_form",
             Self::PathDenied => "path_denied",
             Self::RequestBodyReadFailed => "request_body_read_failed",
+            Self::RequestBodyTimeout => "request_body_timeout",
             Self::RequestBodyTooLarge => "request_body_too_large",
             Self::RequestHeadersTooLarge => "request_headers_too_large",
             Self::TooManyRequests => "too_many_requests",
@@ -471,6 +475,7 @@ impl AuditDenialReason {
             | Self::RequestBodyReadFailed => StatusCode::BAD_REQUEST,
             Self::ConnectUnsupported => StatusCode::METHOD_NOT_ALLOWED,
             Self::MethodDenied | Self::PathDenied => StatusCode::FORBIDDEN,
+            Self::RequestBodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestHeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
@@ -1446,8 +1451,9 @@ mod proptests {
             6 => AuditDenialReason::NonOriginForm,
             7 => AuditDenialReason::PathDenied,
             8 => AuditDenialReason::RequestBodyReadFailed,
-            9 => AuditDenialReason::RequestBodyTooLarge,
-            10 => AuditDenialReason::RequestHeadersTooLarge,
+            9 => AuditDenialReason::RequestBodyTimeout,
+            10 => AuditDenialReason::RequestBodyTooLarge,
+            11 => AuditDenialReason::RequestHeadersTooLarge,
             _ => AuditDenialReason::TooManyRequests,
         }
     }
@@ -1500,7 +1506,7 @@ mod proptests {
         #[test]
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
-            denial_kind in 0_u8..12,
+            denial_kind in 0_u8..13,
             response_error_kind in 0_u8..5,
             upstream_error_kind in 0_u8..3,
             method in "[A-Z]{3,8}",
