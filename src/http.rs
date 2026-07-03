@@ -647,27 +647,36 @@ mod tests {
         reason = "inline proptests keep scenario runner ownership explicit"
     )]
     mod proptests {
-        use super::{ScenarioRun, run_scenario};
-        use crate::ports::UpstreamDeadline;
-        use crate::sim::{RecordedUpstreamRequest, Scenario, ScenarioUpstream, scenario_any};
+        use super::{ScenarioBody, ScenarioRun, run_scenario};
+        use crate::sim::{
+            Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioUpstream,
+            scenario_any,
+        };
         use axum::body::Bytes;
-        use http::{Method, StatusCode};
+        use http::StatusCode;
         use proptest::prelude::*;
-        use serde_json::{Map, Value};
+        use serde_json::Value;
         use tokio::runtime::Builder;
 
-        /// Expected observations for one generated gateway scenario.
-        #[derive(Debug, Eq, PartialEq)]
-        struct ScenarioOracle {
-            /// Expected audit events.
-            audit_events: Vec<Value>,
-            /// Expected response body.
-            response_body: Bytes,
-            /// Expected response status.
-            status: StatusCode,
-            /// Expected upstream requests.
-            upstream_requests: Vec<RecordedUpstreamRequest>,
-        }
+        /// Serialized audit event field names.
+        const AUDIT_FIELDS: [&str; 16] = [
+            "decision",
+            "error_class",
+            "method",
+            "path",
+            "query",
+            "request_body_blake3",
+            "request_bytes",
+            "request_id",
+            "response_body_blake3",
+            "response_bytes",
+            "status",
+            "timestamp",
+            "upstream_origin",
+            "upstream_path",
+            "upstream_query",
+            "version",
+        ];
 
         /// Returns a digest field for an optional body.
         fn body_digest_value(body: &[u8]) -> Value {
@@ -692,71 +701,6 @@ mod tests {
                 .collect()
         }
 
-        /// Returns the expected audit event for a generated scenario.
-        fn expected_audit_event(
-            scenario: &Scenario,
-            response_body: &[u8],
-            status: StatusCode,
-        ) -> Value {
-            let path = request_path(scenario.request().target());
-            let query = query_value(scenario.request().target());
-            let (decision, error_class) = match scenario.upstream() {
-                ScenarioUpstream::Respond => ("allowed", Value::Null),
-                ScenarioUpstream::Timeout => (
-                    "upstream_error",
-                    Value::String("upstream_timeout".to_owned()),
-                ),
-            };
-            Value::Object(Map::from_iter([
-                ("decision".to_owned(), Value::String(decision.to_owned())),
-                ("error_class".to_owned(), error_class),
-                (
-                    "method".to_owned(),
-                    Value::String(scenario.request().method().as_str().to_owned()),
-                ),
-                ("path".to_owned(), Value::String(path.to_owned())),
-                ("query".to_owned(), query.clone()),
-                (
-                    "request_body_blake3".to_owned(),
-                    body_digest_value(scenario.request().body()),
-                ),
-                (
-                    "request_bytes".to_owned(),
-                    Value::from(
-                        u64::try_from(scenario.request().body().len())
-                            .expect("request body length should fit u64"),
-                    ),
-                ),
-                (
-                    "request_id".to_owned(),
-                    Value::String("req-test-0000000000000001".to_owned()),
-                ),
-                (
-                    "response_body_blake3".to_owned(),
-                    body_digest_value(response_body),
-                ),
-                (
-                    "response_bytes".to_owned(),
-                    Value::from(
-                        u64::try_from(response_body.len())
-                            .expect("response body length should fit u64"),
-                    ),
-                ),
-                ("status".to_owned(), Value::from(status.as_u16())),
-                (
-                    "timestamp".to_owned(),
-                    Value::String("2026-07-02T00:00:00.000000000Z".to_owned()),
-                ),
-                (
-                    "upstream_origin".to_owned(),
-                    Value::String("https://api.openai.com".to_owned()),
-                ),
-                ("upstream_path".to_owned(), Value::String(path.to_owned())),
-                ("upstream_query".to_owned(), query),
-                ("version".to_owned(), Value::from(1_u64)),
-            ]))
-        }
-
         /// Returns the expected forwarded headers for generated headers.
         fn expected_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
             let connection_headers = connection_header_names(headers);
@@ -769,27 +713,127 @@ mod tests {
             forwarded
         }
 
-        /// Returns the expected observations for a generated scenario.
-        fn expected_run(scenario: &Scenario, deadline: UpstreamDeadline) -> ScenarioOracle {
-            let response_body = match scenario.upstream() {
-                ScenarioUpstream::Respond => Bytes::from_static(b"scripted"),
-                ScenarioUpstream::Timeout => Bytes::new(),
-            };
-            let status = match scenario.upstream() {
-                ScenarioUpstream::Respond => StatusCode::CREATED,
-                ScenarioUpstream::Timeout => StatusCode::GATEWAY_TIMEOUT,
-            };
-            ScenarioOracle {
-                audit_events: vec![expected_audit_event(scenario, &response_body, status)],
-                response_body: response_body.clone(),
-                status,
-                upstream_requests: vec![RecordedUpstreamRequest::new(
-                    scenario.request().body().to_vec(),
-                    deadline,
-                    expected_forwarded_headers(scenario.request().headers()),
-                    Method::GET,
-                    format!("https://api.openai.com{}", scenario.request().target()),
-                )],
+        /// Returns the expected audit decision tuple for a recording scenario.
+        fn expected_audit_outcome(
+            scenario: &Scenario,
+        ) -> (&'static str, Value, StatusCode, u64, Value, bool) {
+            match (scenario.admission(), scenario.bounds(), scenario.upstream()) {
+                (ScenarioAdmission::Saturated, _, _) => (
+                    "denied",
+                    Value::String("too_many_requests".to_owned()),
+                    StatusCode::TOO_MANY_REQUESTS,
+                    0,
+                    Value::Null,
+                    false,
+                ),
+                (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => (
+                    "upstream_error",
+                    Value::String("upstream_timeout".to_owned()),
+                    StatusCode::GATEWAY_TIMEOUT,
+                    0,
+                    Value::Null,
+                    true,
+                ),
+                (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _) => (
+                    "response_error",
+                    Value::String("response_body_too_large".to_owned()),
+                    StatusCode::CREATED,
+                    0,
+                    Value::Null,
+                    true,
+                ),
+                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::StreamError) => {
+                    (
+                        "response_error",
+                        Value::String("upstream_response_stream_failed".to_owned()),
+                        StatusCode::CREATED,
+                        5,
+                        body_digest_value(b"first"),
+                        true,
+                    )
+                }
+                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => (
+                    "allowed",
+                    Value::Null,
+                    StatusCode::CREATED,
+                    8,
+                    body_digest_value(b"scripted"),
+                    true,
+                ),
+            }
+        }
+
+        /// Returns the expected body observation for a generated scenario.
+        fn expected_body(scenario: &Scenario) -> ScenarioBody {
+            match (
+                scenario.admission(),
+                scenario.audit(),
+                scenario.bounds(),
+                scenario.upstream(),
+            ) {
+                (ScenarioAdmission::Saturated, _, _, _)
+                | (ScenarioAdmission::Open, _, _, ScenarioUpstream::Timeout) => {
+                    ScenarioBody::Complete(Bytes::new())
+                }
+                (ScenarioAdmission::Open, _, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
+                    ScenarioBody::Complete(Bytes::from_static(b"scripted"))
+                }
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::FailFirst,
+                    _,
+                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                ) => ScenarioBody::Error(
+                    "failed to write audit event: scripted audit failure".to_owned(),
+                ),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::TinyResponse,
+                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                ) => ScenarioBody::Error("response_body_too_large".to_owned()),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    ScenarioUpstream::StreamError,
+                ) => ScenarioBody::Error("scripted upstream stream failed".to_owned()),
+            }
+        }
+
+        /// Returns true when the scenario should report a fatal post-start error.
+        fn expected_fatal_error(scenario: &Scenario) -> bool {
+            scenario.admission() == ScenarioAdmission::Open
+                && scenario.audit() == ScenarioAudit::FailFirst
+                && scenario.upstream() != ScenarioUpstream::Timeout
+        }
+
+        /// Returns the expected status for the harness response.
+        fn expected_status(scenario: &Scenario) -> StatusCode {
+            match (scenario.admission(), scenario.audit(), scenario.upstream()) {
+                (ScenarioAdmission::Saturated, ScenarioAudit::FailFirst, _)
+                | (ScenarioAdmission::Open, ScenarioAudit::FailFirst, ScenarioUpstream::Timeout) => {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                }
+                (ScenarioAdmission::Saturated, ScenarioAudit::Record, _) => {
+                    StatusCode::TOO_MANY_REQUESTS
+                }
+                (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => {
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+                (
+                    ScenarioAdmission::Open,
+                    _,
+                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                ) => StatusCode::CREATED,
+            }
+        }
+
+        /// Returns the configured response body bound for the scenario.
+        const fn max_response_bytes(scenario: &Scenario) -> u64 {
+            match scenario.bounds() {
+                ScenarioBounds::Roomy => 0x0010_0000,
+                ScenarioBounds::TinyResponse => 4,
             }
         }
 
@@ -818,9 +862,151 @@ mod tests {
             ) && !connection_headers.iter().any(|dynamic| dynamic == name)
         }
 
+        /// Returns the body bytes that should be represented in the audit log.
+        fn request_body_for_audit(scenario: &Scenario) -> &[u8] {
+            if scenario.admission() == ScenarioAdmission::Saturated {
+                &[]
+            } else {
+                scenario.request().body()
+            }
+        }
+
         /// Returns the request path from a generated target.
         fn request_path(target: &str) -> &str {
             target.split_once('?').map_or(target, |(path, _query)| path)
+        }
+
+        /// Asserts the audit event invariants for one generated scenario.
+        fn prop_assert_audit_event(
+            scenario: &Scenario,
+            run: &ScenarioRun,
+        ) -> Result<(), TestCaseError> {
+            let expected_events = usize::from(scenario.audit() == ScenarioAudit::Record);
+            prop_assert_eq!(run.audit_events.len(), expected_events);
+            if expected_events == 0 {
+                return Ok(());
+            }
+
+            let event = run
+                .audit_events
+                .first()
+                .expect("event count was asserted above");
+            let object = event
+                .as_object()
+                .ok_or_else(|| TestCaseError::fail("audit event should be an object"))?;
+            prop_assert_eq!(object.len(), AUDIT_FIELDS.len());
+            for field in AUDIT_FIELDS {
+                prop_assert!(object.contains_key(field), "missing audit field {field}");
+            }
+
+            let (decision, error_class, status, response_bytes, response_digest, has_upstream) =
+                expected_audit_outcome(scenario);
+            let path = request_path(scenario.request().target());
+            let query = query_value(scenario.request().target());
+            prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
+            prop_assert_eq!(&object["error_class"], &error_class);
+            prop_assert_eq!(
+                &object["method"],
+                &Value::String(scenario.request().method().as_str().to_owned())
+            );
+            prop_assert_eq!(&object["path"], &Value::String(path.to_owned()));
+            prop_assert_eq!(&object["query"], &query);
+            prop_assert_eq!(
+                &object["request_body_blake3"],
+                &body_digest_value(request_body_for_audit(scenario))
+            );
+            prop_assert_eq!(
+                &object["request_bytes"],
+                &Value::from(
+                    u64::try_from(request_body_for_audit(scenario).len()).map_err(|_error| {
+                        TestCaseError::fail("request body length should fit u64")
+                    })?
+                )
+            );
+            prop_assert_eq!(&object["response_body_blake3"], &response_digest);
+            prop_assert_eq!(&object["response_bytes"], &Value::from(response_bytes));
+            prop_assert!(
+                response_bytes <= max_response_bytes(scenario),
+                "audited response bytes exceeded scenario bound"
+            );
+            prop_assert_eq!(&object["status"], &Value::from(status.as_u16()));
+            prop_assert_eq!(
+                &object["timestamp"],
+                &Value::String("2026-07-02T00:00:00.000000000Z".to_owned())
+            );
+            prop_assert_eq!(
+                &object["upstream_origin"],
+                &Value::String("https://api.openai.com".to_owned())
+            );
+            if has_upstream {
+                prop_assert_eq!(&object["upstream_path"], &Value::String(path.to_owned()));
+                prop_assert_eq!(&object["upstream_query"], &query);
+            } else {
+                prop_assert_eq!(&object["upstream_path"], &Value::Null);
+                prop_assert_eq!(&object["upstream_query"], &Value::Null);
+            }
+            prop_assert_eq!(&object["version"], &Value::from(1_u64));
+            Ok(())
+        }
+
+        /// Asserts the body and fatal-channel invariants for one scenario.
+        fn prop_assert_response_outcome(
+            scenario: &Scenario,
+            run: &ScenarioRun,
+        ) -> Result<(), TestCaseError> {
+            prop_assert_eq!(run.status, expected_status(scenario));
+            prop_assert_eq!(&run.response_body, &expected_body(scenario));
+            prop_assert_eq!(run.fatal_error.is_some(), expected_fatal_error(scenario));
+            Ok(())
+        }
+
+        /// Asserts the upstream request invariants for one generated scenario.
+        fn prop_assert_upstream_request(
+            scenario: &Scenario,
+            run: &ScenarioRun,
+        ) -> Result<(), TestCaseError> {
+            if scenario.admission() == ScenarioAdmission::Saturated {
+                prop_assert!(run.upstream_requests.is_empty());
+                return Ok(());
+            }
+            prop_assert_eq!(run.upstream_requests.len(), 1);
+            let request = run
+                .upstream_requests
+                .first()
+                .expect("request count was asserted above");
+            prop_assert_eq!(request.body(), scenario.request().body());
+            prop_assert_eq!(request.deadline(), run.deadline);
+            prop_assert_eq!(
+                request.headers(),
+                expected_forwarded_headers(scenario.request().headers())
+            );
+            prop_assert_eq!(request.method(), scenario.request().method());
+            prop_assert_eq!(
+                request.url(),
+                format!("https://api.openai.com{}", scenario.request().target())
+            );
+            for header in request.headers() {
+                let name = &header.0;
+                prop_assert!(
+                    request_header_is_forwarded(
+                        name,
+                        &connection_header_names(scenario.request().headers())
+                    ),
+                    "forbidden header forwarded: {name}"
+                );
+            }
+            Ok(())
+        }
+
+        /// Asserts all generated gateway scenario invariants.
+        fn prop_assert_scenario(
+            scenario: &Scenario,
+            run: &ScenarioRun,
+        ) -> Result<(), TestCaseError> {
+            prop_assert_response_outcome(scenario, run)?;
+            prop_assert_upstream_request(scenario, run)?;
+            prop_assert_audit_event(scenario, run)?;
+            Ok(())
         }
 
         /// Runs a generated scenario on a paused single-thread runtime.
@@ -840,14 +1026,10 @@ mod tests {
             })]
 
             #[test]
-            fn generated_scenarios_match_the_gateway_oracle(scenario in scenario_any()) {
+            fn generated_scenarios_satisfy_gateway_invariants(scenario in scenario_any()) {
                 let run = run_generated_scenario(scenario.clone());
-                let expected = expected_run(&scenario, run.deadline);
 
-                prop_assert_eq!(run.status, expected.status);
-                prop_assert_eq!(run.response_body, expected.response_body);
-                prop_assert_eq!(run.upstream_requests, expected.upstream_requests);
-                prop_assert_eq!(run.audit_events, expected.audit_events);
+                prop_assert_scenario(&scenario, &run)?;
             }
         }
     }
@@ -867,8 +1049,8 @@ mod tests {
     use crate::headers::HeaderError;
     use crate::ports::{UpstreamDeadline, UpstreamError, UpstreamErrorKind};
     use crate::sim::{
-        FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioRequest,
-        ScenarioUpstream, ScriptedUpstreamClient,
+        FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
+        ScenarioBounds, ScenarioRequest, ScenarioUpstream, ScriptedUpstreamClient,
     };
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
@@ -894,7 +1076,8 @@ mod tests {
     use tokio::fs::read_to_string;
     use tokio::net::TcpListener;
     use tokio::sync::{Semaphore, mpsc};
-    use tokio::time::sleep;
+    use tokio::task::yield_now;
+    use tokio::time::{Instant, sleep};
     use tower::ServiceExt as _;
 
     /// Test wrapper that parses serve arguments.
@@ -912,12 +1095,24 @@ mod tests {
         audit_events: Vec<Value>,
         /// Upstream deadline used by the gateway.
         deadline: UpstreamDeadline,
-        /// Captured response body.
-        response_body: Bytes,
+        /// Fatal gateway error reported after response start.
+        fatal_error: Option<String>,
+        /// Captured response body outcome.
+        response_body: ScenarioBody,
         /// Captured response status.
         status: StatusCode,
         /// Captured upstream requests.
         upstream_requests: Vec<RecordedUpstreamRequest>,
+    }
+
+    /// Captured response body outcome for deterministic scenarios.
+    #[derive(Debug, Eq, PartialEq)]
+    enum ScenarioBody {
+        /// Response body completed successfully.
+        Complete(Bytes),
+
+        /// Response body ended with an error.
+        Error(String),
     }
 
     /// Reads and parses every event in the audit log.
@@ -1080,20 +1275,28 @@ mod tests {
     /// Runs one deterministic gateway scenario.
     async fn run_scenario(scenario: Scenario) -> ScenarioRun {
         let request_shape = scenario.request();
-        let (audit, audit_recorder) = MemoryAuditSink::new();
+        let (audit, audit_recorder) = MemoryAuditSink::from_audit(scenario.audit());
         let (client, upstream_recorder) =
             ScriptedUpstreamClient::from_upstream(scenario.upstream());
-        let config = GatewayConfig::for_runtime_test(
+        let mut config = GatewayConfig::for_runtime_test(
             PathBuf::from("unused-audit.ndjson"),
             "https://api.openai.com",
         );
+        if scenario.bounds() == ScenarioBounds::TinyResponse {
+            config = config
+                .with_max_response_bytes(NonZeroU64::new(4).expect("literal should be non-zero"));
+        }
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
         let gateway =
             Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let permits = match scenario.admission() {
+            ScenarioAdmission::Open => 1,
+            ScenarioAdmission::Saturated => 0,
+        };
         let state = AppState {
             client: Arc::new(client),
-            concurrency: Arc::new(Semaphore::new(1)),
+            concurrency: Arc::new(Semaphore::new(permits)),
             fatal_errors,
             gateway,
         };
@@ -1114,9 +1317,10 @@ mod tests {
             .expect("scenario proxy should respond");
 
         let status = response.status();
-        let response_body = to_bytes(response.into_body(), 1_024)
-            .await
-            .expect("scenario response body should stream");
+        let response_body = match to_bytes(response.into_body(), 1_024).await {
+            Ok(bytes) => ScenarioBody::Complete(bytes),
+            Err(error) => ScenarioBody::Error(error.to_string()),
+        };
         let captured_upstream_requests = upstream_recorder
             .lock()
             .expect("scripted upstream should not be poisoned")
@@ -1125,18 +1329,16 @@ mod tests {
             .lock()
             .expect("memory audit sink should not be poisoned")
             .clone();
-        let fatal_result = fatal_receiver.try_recv();
-        assert!(
-            matches!(
-                fatal_result,
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
-            ),
-            "unexpected fatal error: {fatal_result:?}"
-        );
+        yield_now().await;
+        let fatal_error = fatal_receiver
+            .try_recv()
+            .ok()
+            .map(|error| error.to_string());
 
         ScenarioRun {
             audit_events: captured_audit_events,
             deadline,
+            fatal_error,
             response_body,
             status,
             upstream_requests: captured_upstream_requests,
@@ -1220,7 +1422,11 @@ mod tests {
         let run = run_scenario(scenario).await;
 
         assert_eq!(run.status, StatusCode::CREATED);
-        assert_eq!(run.response_body, Bytes::from_static(b"scripted"));
+        assert_eq!(
+            run.response_body,
+            ScenarioBody::Complete(Bytes::from_static(b"scripted"))
+        );
+        assert_eq!(run.fatal_error, None);
         assert_eq!(
             run.upstream_requests,
             [RecordedUpstreamRequest::new(
@@ -1331,8 +1537,10 @@ mod tests {
             .body(Body::empty())
             .expect("request should build");
 
+        let started_at = Instant::now();
         let response = router.oneshot(request).await.expect("proxy should respond");
 
+        assert_eq!(Instant::now(), started_at + deadline.timeout());
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
         let body = to_bytes(response.into_body(), 1_024)
             .await

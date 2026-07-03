@@ -7,18 +7,21 @@
 
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp};
 use crate::ports::{
-    AuditSink, BoxFuture, Clock, UpstreamClient, UpstreamDeadline, UpstreamError,
-    UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
+    AuditSink, BoxFuture, Clock, UpstreamBodyError, UpstreamClient, UpstreamDeadline,
+    UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
 use axum::body::Bytes;
 use core::future;
+use core::num::NonZeroUsize;
 use core::time::Duration;
 use futures_util::{StreamExt as _, stream};
 use http::{Method, StatusCode};
 use proptest::prelude::{Just, Strategy, any};
 use proptest::{collection, prop_oneof};
 use serde_json::Value;
+use std::io;
 use std::sync::{Arc, Mutex};
+use tokio::time::{sleep, timeout};
 
 /// Fixed clock used by deterministic handler tests.
 #[derive(Clone, Copy, Debug)]
@@ -27,8 +30,12 @@ pub(super) struct FixedClock;
 /// In-memory audit sink used by deterministic handler tests.
 #[derive(Clone, Debug)]
 pub(super) struct MemoryAuditSink {
+    /// Number of audit events observed by this sink.
+    event_count: Arc<Mutex<usize>>,
     /// Captured serialized audit events.
     events: Arc<Mutex<Vec<Value>>>,
+    /// Audit event ordinal that should fail instead of recording.
+    fail_on_event: Option<NonZeroUsize>,
 }
 
 /// Request observed by the scripted upstream client.
@@ -49,10 +56,46 @@ pub(super) struct RecordedUpstreamRequest {
 /// One deterministic gateway scenario.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Scenario {
+    /// Gateway admission state.
+    admission: ScenarioAdmission,
+    /// Audit sink behavior.
+    audit: ScenarioAudit,
+    /// Scenario byte bounds.
+    bounds: ScenarioBounds,
     /// Harness request shape.
     request: ScenarioRequest,
     /// Scripted upstream behavior.
     upstream: ScenarioUpstream,
+}
+
+/// Gateway admission state for a deterministic scenario.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioAdmission {
+    /// Request permit is available.
+    Open,
+
+    /// Request permits are exhausted.
+    Saturated,
+}
+
+/// Audit sink behavior for a deterministic scenario.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioAudit {
+    /// Fail the first audit event.
+    FailFirst,
+
+    /// Record every audit event.
+    Record,
+}
+
+/// Scenario byte bounds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioBounds {
+    /// Use the roomy runtime-test bounds.
+    Roomy,
+
+    /// Configure a response limit smaller than the scripted success chunk.
+    TinyResponse,
 }
 
 /// Harness request shape for a deterministic gateway scenario.
@@ -74,6 +117,9 @@ pub(super) enum ScenarioUpstream {
     /// Return the fixed success response immediately.
     Respond,
 
+    /// Return an error after streaming one response chunk.
+    StreamError,
+
     /// Return a timeout error immediately.
     Timeout,
 }
@@ -89,6 +135,9 @@ enum ScriptedUpstreamBehavior {
         /// Simulated stall duration.
         duration: Duration,
     },
+
+    /// Return an error after streaming one response chunk.
+    StreamError,
 }
 
 /// Scripted upstream client for deterministic handler tests.
@@ -105,6 +154,25 @@ impl AuditSink for MemoryAuditSink {
         &'future self,
         event: &'future AuditEvent,
     ) -> BoxFuture<'future, Result<(), AuditError>> {
+        let event_number = {
+            let mut count = self
+                .event_count
+                .lock()
+                .expect("memory audit event count should not be poisoned");
+            let next = count
+                .checked_add(1)
+                .expect("memory audit event count should not overflow");
+            *count = next;
+            next
+        };
+        let should_fail = self
+            .fail_on_event
+            .is_some_and(|fail_on| fail_on.get() == event_number);
+        if should_fail {
+            return Box::pin(future::ready(Err(AuditError::Write(io::Error::other(
+                "scripted audit failure",
+            )))));
+        }
         let result = serde_json::to_value(event)
             .map_err(AuditError::Serialize)
             .map(|value| {
@@ -124,13 +192,40 @@ impl Clock for FixedClock {
 }
 
 impl MemoryAuditSink {
+    /// Builds an audit sink that fails on a specific event ordinal.
+    #[must_use]
+    pub(super) fn failing_on(event: NonZeroUsize) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                event_count: Arc::new(Mutex::new(0)),
+                events: Arc::clone(&events),
+                fail_on_event: Some(event),
+            },
+            events,
+        )
+    }
+
+    /// Builds an audit sink from scenario audit behavior.
+    #[must_use]
+    pub(super) fn from_audit(audit: ScenarioAudit) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        match audit {
+            ScenarioAudit::Record => Self::new(),
+            ScenarioAudit::FailFirst => {
+                Self::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"))
+            }
+        }
+    }
+
     /// Builds an audit sink and its event recorder.
     #[must_use]
     pub(super) fn new() -> (Self, Arc<Mutex<Vec<Value>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
+                event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
+                fail_on_event: None,
             },
             events,
         )
@@ -138,6 +233,30 @@ impl MemoryAuditSink {
 }
 
 impl RecordedUpstreamRequest {
+    /// Returns the recorded request body.
+    #[must_use]
+    pub(super) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Returns the recorded upstream deadline.
+    #[must_use]
+    pub(super) const fn deadline(&self) -> UpstreamDeadline {
+        self.deadline
+    }
+
+    /// Returns the recorded forwarded headers.
+    #[must_use]
+    pub(super) fn headers(&self) -> &[(String, String)] {
+        &self.headers
+    }
+
+    /// Returns the recorded request method.
+    #[must_use]
+    pub(super) const fn method(&self) -> &Method {
+        &self.method
+    }
+
     /// Builds an expected upstream request record.
     #[must_use]
     pub(super) fn new(
@@ -155,13 +274,43 @@ impl RecordedUpstreamRequest {
             url: url.into(),
         }
     }
+
+    /// Returns the recorded upstream URL.
+    #[must_use]
+    pub(super) fn url(&self) -> &str {
+        &self.url
+    }
 }
 
 impl Scenario {
+    /// Returns the gateway admission state.
+    #[must_use]
+    pub(super) const fn admission(&self) -> ScenarioAdmission {
+        self.admission
+    }
+
+    /// Returns the audit sink behavior.
+    #[must_use]
+    pub(super) const fn audit(&self) -> ScenarioAudit {
+        self.audit
+    }
+
+    /// Returns the scenario byte bounds.
+    #[must_use]
+    pub(super) const fn bounds(&self) -> ScenarioBounds {
+        self.bounds
+    }
+
     /// Builds a deterministic gateway scenario.
     #[must_use]
     pub(super) const fn new(request: ScenarioRequest, upstream: ScenarioUpstream) -> Self {
-        Self { request, upstream }
+        Self {
+            admission: ScenarioAdmission::Open,
+            audit: ScenarioAudit::Record,
+            bounds: ScenarioBounds::Roomy,
+            request,
+            upstream,
+        }
     }
 
     /// Returns the harness request shape.
@@ -174,6 +323,24 @@ impl Scenario {
     #[must_use]
     pub(super) const fn upstream(&self) -> ScenarioUpstream {
         self.upstream
+    }
+
+    /// Builds a deterministic gateway scenario from all generated parts.
+    #[must_use]
+    pub(super) const fn with_parts(
+        admission: ScenarioAdmission,
+        audit: ScenarioAudit,
+        bounds: ScenarioBounds,
+        request: ScenarioRequest,
+        upstream: ScenarioUpstream,
+    ) -> Self {
+        Self {
+            admission,
+            audit,
+            bounds,
+            request,
+            upstream,
+        }
     }
 }
 
@@ -227,8 +394,9 @@ impl ScriptedUpstreamClient {
     ) -> (Self, Arc<Mutex<Vec<RecordedUpstreamRequest>>>) {
         let behavior = match upstream {
             ScenarioUpstream::Respond => ScriptedUpstreamBehavior::Respond,
+            ScenarioUpstream::StreamError => ScriptedUpstreamBehavior::StreamError,
             ScenarioUpstream::Timeout => ScriptedUpstreamBehavior::Stall {
-                duration: Duration::MAX,
+                duration: Duration::from_secs(10),
             },
         };
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -291,43 +459,99 @@ impl UpstreamClient for ScriptedUpstreamClient {
             .lock()
             .expect("scripted upstream should not be poisoned")
             .push(recorded);
-        if let ScriptedUpstreamBehavior::Stall { duration } = self.behavior
-            && duration >= request.deadline().timeout()
-        {
-            let error = UpstreamError::new(
-                UpstreamErrorKind::Timeout,
-                format!("scripted upstream stalled for {duration:?}"),
-            );
-            return Box::pin(future::ready(Err(error)));
+        match self.behavior {
+            ScriptedUpstreamBehavior::Respond => Box::pin(future::ready(Ok(scripted_response()))),
+            ScriptedUpstreamBehavior::Stall { duration } => Box::pin(async move {
+                if timeout(request.deadline().timeout(), sleep(duration))
+                    .await
+                    .is_err()
+                {
+                    let error = UpstreamError::new(
+                        UpstreamErrorKind::Timeout,
+                        format!("scripted upstream stalled for {duration:?}"),
+                    );
+                    Err(error)
+                } else {
+                    Ok(scripted_response())
+                }
+            }),
+            ScriptedUpstreamBehavior::StreamError => {
+                Box::pin(future::ready(Ok(scripted_stream_error_response())))
+            }
         }
-        let response = UpstreamResponse::new(
-            StatusCode::CREATED,
-            ::http::HeaderMap::new(),
-            stream::iter([Ok(Bytes::from_static(b"scripted"))]).boxed(),
-        );
-        Box::pin(future::ready(Ok(response)))
     }
+}
+
+/// Returns the standard scripted success response.
+fn scripted_response() -> UpstreamResponse {
+    UpstreamResponse::new(
+        StatusCode::CREATED,
+        ::http::HeaderMap::new(),
+        stream::iter([Ok(Bytes::from_static(b"scripted"))]).boxed(),
+    )
+}
+
+/// Returns a response that fails after one body chunk.
+fn scripted_stream_error_response() -> UpstreamResponse {
+    UpstreamResponse::new(
+        StatusCode::CREATED,
+        ::http::HeaderMap::new(),
+        stream::iter([
+            Ok(Bytes::from_static(b"first")),
+            Err(UpstreamBodyError::new("scripted upstream stream failed")),
+        ])
+        .boxed(),
+    )
 }
 
 /// Generates deterministic gateway scenarios.
 pub(super) fn scenario_any() -> impl Strategy<Value = Scenario> {
     (
+        scenario_admission_any(),
+        scenario_audit_any(),
         scenario_body_any(),
+        scenario_bounds_any(),
         scenario_headers_any(),
         scenario_target_any(),
         scenario_upstream_any(),
     )
-        .prop_map(|(body, headers, target, upstream)| {
-            Scenario::new(
-                ScenarioRequest::new(body, headers, Method::GET, target),
-                upstream,
-            )
-        })
+        .prop_map(
+            |(admission, audit, body, bounds, headers, target, upstream)| {
+                Scenario::with_parts(
+                    admission,
+                    audit,
+                    bounds,
+                    ScenarioRequest::new(body, headers, Method::GET, target),
+                    upstream,
+                )
+            },
+        )
+}
+
+/// Generates gateway admission states.
+fn scenario_admission_any() -> impl Strategy<Value = ScenarioAdmission> {
+    prop_oneof![
+        Just(ScenarioAdmission::Open),
+        Just(ScenarioAdmission::Saturated),
+    ]
+}
+
+/// Generates audit sink behavior.
+fn scenario_audit_any() -> impl Strategy<Value = ScenarioAudit> {
+    prop_oneof![Just(ScenarioAudit::Record), Just(ScenarioAudit::FailFirst),]
 }
 
 /// Generates bounded request bodies.
 fn scenario_body_any() -> impl Strategy<Value = Vec<u8>> {
     collection::vec(any::<u8>(), 0..9)
+}
+
+/// Generates response byte bounds.
+fn scenario_bounds_any() -> impl Strategy<Value = ScenarioBounds> {
+    prop_oneof![
+        Just(ScenarioBounds::Roomy),
+        Just(ScenarioBounds::TinyResponse),
+    ]
 }
 
 /// Generates bounded request header sets.
@@ -368,6 +592,7 @@ fn scenario_target_any() -> impl Strategy<Value = String> {
 fn scenario_upstream_any() -> impl Strategy<Value = ScenarioUpstream> {
     prop_oneof![
         Just(ScenarioUpstream::Respond),
+        Just(ScenarioUpstream::StreamError),
         Just(ScenarioUpstream::Timeout),
     ]
 }

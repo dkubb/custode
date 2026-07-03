@@ -714,13 +714,18 @@ Simulation tests are test-only and live behind `#[cfg(test)]`. They run the
 real Axum handler on a paused current-thread Tokio runtime, with the
 production adapters replaced by deterministic ports from `src/sim.rs`:
 `FixedClock`, `MemoryAuditSink`, `ScriptedUpstreamClient`, and generated
-`Scenario` values. The current scenario generator covers allowed `GET`
-`/v1/models` requests with bounded bodies, representative harness headers,
-provider success, and deterministic upstream timeout. The oracle asserts the
-exact response status, response body, recorded upstream request, forwarded
-header set, and 16-field audit event. Simulation tests do not replace the
-real hyper parse-boundary tests, real Reqwest socket-classification tests, or
-container network-isolation tests.
+`Scenario` values. The current request grammar covers allowed `GET`
+`/v1/models` requests with bounded bodies and representative harness headers.
+The current fault grammar covers saturated admission permits, audit write
+failure on the terminal event, provider success, virtual-time upstream stalls
+past the carried deadline, upstream response stream failure after a body
+chunk, and response byte bounds smaller than the scripted response. The oracle
+asserts invariants over each scenario class: response status and stream
+outcome, fatal-channel behavior after response start, upstream request
+presence, forwarded-header safety, response byte bounds, and the 16-field
+audit event schema and closed decision set when auditing succeeds. Simulation
+tests do not replace the real hyper parse-boundary tests, real Reqwest
+socket-classification tests, or container network-isolation tests.
 
 Integration tests in `tests/gateway.rs` run the compiled `custode-proxy`
 binary against a local recording upstream and cover:

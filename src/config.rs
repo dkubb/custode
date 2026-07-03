@@ -449,6 +449,14 @@ impl GatewayConfig {
     pub(crate) const fn upstream_origin(&self) -> &UpstreamOrigin {
         &self.upstream_origin
     }
+
+    /// Returns this config with a replacement response body byte limit.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_max_response_bytes(mut self, max_response_bytes: NonZeroU64) -> Self {
+        self.max_response_bytes = max_response_bytes;
+        self
+    }
 }
 
 impl TryFrom<ServeArgs> for GatewayConfig {
