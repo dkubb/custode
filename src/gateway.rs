@@ -2,8 +2,8 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
-    AuditBodySummary, AuditError, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
-    AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
+    AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget, AuditUpstreamTarget,
+    ObservedAuditRequestInput, ObservedBodySummary, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -171,19 +171,17 @@ impl Gateway {
         error_class: &'static str,
         status: u16,
     ) -> Result<(), GatewayError> {
-        let request_summary = request_body.map_or_else(
-            AuditBodySummary::not_observed,
-            AuditBodySummary::from_request_body,
-        );
-        let request = AuditRequestInput::new(
+        let request = AuditRequestInput::for_denial(
             method.to_string(),
             target,
             request_id,
-            request_summary,
+            request_body,
             self.config.upstream_origin().as_str().to_owned(),
         );
-        let outcome = AuditOutcome::denied(error_class, status);
-        let event = AuditEvent::new_at(AuditEventInput::new(request, outcome), self.clock.now());
+        let event = AuditEvent::new_at(
+            AuditEventInput::denied(request, error_class, status),
+            self.clock.now(),
+        );
         self.audit.append_event(&event).await?;
         Ok(())
     }
@@ -198,18 +196,26 @@ impl Gateway {
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
         let upstream = AuditUpstreamTarget::from(&input.target);
-        let outcome = match input.outcome.into_kind() {
+        let request = ObservedAuditRequestInput::new(
+            input.method,
+            input.target.into(),
+            input.request_id,
+            &input.request_body,
+            self.config.upstream_origin().as_str().to_owned(),
+        );
+        let event_input = match input.outcome.into_kind() {
             ResponseAuditOutcomeKind::Allowed {
                 response_body,
                 status,
-            } => AuditOutcome::allowed(response_body, status, upstream),
+            } => AuditEventInput::allowed(request, response_body, status, upstream),
             ResponseAuditOutcomeKind::ResponseError {
                 error_class,
                 response_body: Some(response_body),
                 status,
-            } => AuditOutcome::response_error(
+            } => AuditEventInput::response_error(
+                request,
                 error_class,
-                response_body.into_summary(),
+                response_body,
                 status,
                 upstream,
             ),
@@ -217,25 +223,15 @@ impl Gateway {
                 error_class,
                 response_body: None,
                 status,
-            } => AuditOutcome::response_error(
-                error_class,
-                AuditBodySummary::not_observed(),
-                status,
-                upstream,
-            ),
+            } => {
+                AuditEventInput::response_error_without_body(request, error_class, status, upstream)
+            }
             ResponseAuditOutcomeKind::UpstreamError {
                 error_class,
                 status,
-            } => AuditOutcome::upstream_error(error_class, status, upstream),
+            } => AuditEventInput::upstream_error(request, error_class, status, upstream),
         };
-        let request = AuditRequestInput::new(
-            input.method,
-            input.target.into(),
-            input.request_id,
-            AuditBodySummary::from_request_body(&input.request_body),
-            self.config.upstream_origin().as_str().to_owned(),
-        );
-        let event = AuditEvent::new_at(AuditEventInput::new(request, outcome), self.clock.now());
+        let event = AuditEvent::new_at(event_input, self.clock.now());
         self.audit.append_event(&event).await?;
         Ok(())
     }

@@ -140,7 +140,14 @@ pub(crate) struct AuditEventInput {
 
 /// Closed audit outcome.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AuditOutcome {
+struct AuditOutcome {
+    /// Closed audit outcome kind.
+    kind: AuditOutcomeKind,
+}
+
+/// Closed audit outcome variants.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuditOutcomeKind {
     /// Request was allowed and completed normally.
     Allowed {
         /// Response body summary.
@@ -195,6 +202,13 @@ pub(crate) struct AuditRequestInput {
     target: AuditTarget,
     /// Configured upstream origin.
     upstream_origin: String,
+}
+
+/// Request context for an audit event after the request body was observed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedAuditRequestInput {
+    /// Request context common to every audit event.
+    request: AuditRequestInput,
 }
 
 /// Upstream target recorded when upstream I/O was attempted.
@@ -290,78 +304,203 @@ impl ObservedBodySummary {
 
     /// Returns the underlying audit body summary.
     #[must_use]
-    pub(crate) const fn into_summary(self) -> AuditBodySummary {
+    const fn into_summary(self) -> AuditBodySummary {
         self.summary
     }
 }
 
 impl AuditEventInput {
-    /// Creates an audit event input from request context and outcome.
+    /// Creates an allowed audit event input.
     #[must_use]
-    pub(crate) const fn new(request: AuditRequestInput, outcome: AuditOutcome) -> Self {
+    pub(crate) fn allowed(
+        request: ObservedAuditRequestInput,
+        response_body: ObservedBodySummary,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        let outcome = AuditOutcome::allowed(response_body, status, upstream);
+        Self {
+            outcome,
+            request: request.into_request(),
+        }
+    }
+
+    /// Creates a denied audit event input.
+    #[must_use]
+    pub(crate) fn denied(
+        request: AuditRequestInput,
+        error_class: impl Into<String>,
+        status: u16,
+    ) -> Self {
+        let outcome = AuditOutcome::denied(error_class, status);
         Self { outcome, request }
+    }
+
+    /// Creates an audit event input from request context and outcome.
+    #[cfg(test)]
+    #[must_use]
+    const fn new(request: AuditRequestInput, outcome: AuditOutcome) -> Self {
+        Self { outcome, request }
+    }
+
+    /// Creates a response-error audit event input.
+    #[must_use]
+    pub(crate) fn response_error(
+        request: ObservedAuditRequestInput,
+        error_class: impl Into<String>,
+        response_body: ObservedBodySummary,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        let outcome = AuditOutcome::response_error(error_class, response_body, status, upstream);
+        Self {
+            outcome,
+            request: request.into_request(),
+        }
+    }
+
+    /// Creates a response-error audit event input without observed body bytes.
+    #[must_use]
+    pub(crate) fn response_error_without_body(
+        request: ObservedAuditRequestInput,
+        error_class: impl Into<String>,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        let outcome = AuditOutcome::response_error_without_body(error_class, status, upstream);
+        Self {
+            outcome,
+            request: request.into_request(),
+        }
+    }
+
+    /// Creates an upstream-error audit event input.
+    #[must_use]
+    pub(crate) fn upstream_error(
+        request: ObservedAuditRequestInput,
+        error_class: impl Into<String>,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        let outcome = AuditOutcome::upstream_error(error_class, status, upstream);
+        Self {
+            outcome,
+            request: request.into_request(),
+        }
     }
 }
 
 impl AuditOutcome {
     /// Creates an allowed outcome.
     #[must_use]
-    pub(crate) const fn allowed(
+    const fn allowed(
         response_body: ObservedBodySummary,
         status: u16,
         upstream: AuditUpstreamTarget,
     ) -> Self {
-        Self::Allowed {
-            response_body,
-            status,
-            upstream,
+        Self {
+            kind: AuditOutcomeKind::Allowed {
+                response_body,
+                status,
+                upstream,
+            },
         }
     }
 
     /// Creates a denied outcome.
     #[must_use]
-    pub(crate) fn denied(error_class: impl Into<String>, status: u16) -> Self {
-        Self::Denied {
-            error_class: error_class.into(),
-            status,
+    fn denied(error_class: impl Into<String>, status: u16) -> Self {
+        Self {
+            kind: AuditOutcomeKind::Denied {
+                error_class: error_class.into(),
+                status,
+            },
         }
+    }
+
+    /// Consumes the outcome into its closed variant.
+    #[must_use]
+    fn into_kind(self) -> AuditOutcomeKind {
+        self.kind
     }
 
     /// Creates a response-error outcome.
     #[must_use]
-    pub(crate) fn response_error(
+    fn response_error(
         error_class: impl Into<String>,
-        response_body: AuditBodySummary,
+        response_body: ObservedBodySummary,
         status: u16,
         upstream: AuditUpstreamTarget,
     ) -> Self {
-        Self::ResponseError {
-            error_class: error_class.into(),
-            response_body,
-            status,
-            upstream,
+        Self {
+            kind: AuditOutcomeKind::ResponseError {
+                error_class: error_class.into(),
+                response_body: response_body.into_summary(),
+                status,
+                upstream,
+            },
+        }
+    }
+
+    /// Creates a response-error outcome without observed response body bytes.
+    #[must_use]
+    fn response_error_without_body(
+        error_class: impl Into<String>,
+        status: u16,
+        upstream: AuditUpstreamTarget,
+    ) -> Self {
+        Self {
+            kind: AuditOutcomeKind::ResponseError {
+                error_class: error_class.into(),
+                response_body: AuditBodySummary::not_observed(),
+                status,
+                upstream,
+            },
         }
     }
 
     /// Creates an upstream-error outcome.
     #[must_use]
-    pub(crate) fn upstream_error(
+    fn upstream_error(
         error_class: impl Into<String>,
         status: u16,
         upstream: AuditUpstreamTarget,
     ) -> Self {
-        Self::UpstreamError {
-            error_class: error_class.into(),
-            status,
-            upstream,
+        Self {
+            kind: AuditOutcomeKind::UpstreamError {
+                error_class: error_class.into(),
+                status,
+                upstream,
+            },
         }
     }
 }
 
 impl AuditRequestInput {
+    /// Creates request context for denial events.
+    #[must_use]
+    pub(crate) fn for_denial(
+        method: String,
+        target: AuditTarget,
+        request_id: RequestId,
+        body: Option<&AccountedBody>,
+        upstream_origin: String,
+    ) -> Self {
+        Self::new(
+            method,
+            target,
+            request_id,
+            body.map_or_else(
+                AuditBodySummary::not_observed,
+                AuditBodySummary::from_request_body,
+            ),
+            upstream_origin,
+        )
+    }
+
     /// Creates request context common to every audit event.
     #[must_use]
-    pub(crate) const fn new(
+    const fn new(
         method: String,
         target: AuditTarget,
         request_id: RequestId,
@@ -375,6 +514,33 @@ impl AuditRequestInput {
             target,
             upstream_origin,
         }
+    }
+}
+
+impl ObservedAuditRequestInput {
+    /// Consumes the observed wrapper into generic request context.
+    #[must_use]
+    fn into_request(self) -> AuditRequestInput {
+        self.request
+    }
+
+    /// Creates request context after the request body was observed.
+    #[must_use]
+    pub(crate) fn new(
+        method: String,
+        target: AuditTarget,
+        request_id: RequestId,
+        body: &AccountedBody,
+        upstream_origin: String,
+    ) -> Self {
+        let request = AuditRequestInput::new(
+            method,
+            target,
+            request_id,
+            AuditBodySummary::from_request_body(body),
+            upstream_origin,
+        );
+        Self { request }
     }
 }
 
@@ -451,8 +617,8 @@ impl AuditEvent {
             target,
             upstream_origin,
         } = request;
-        let (decision, error_class, response_body, status, upstream) = match outcome {
-            AuditOutcome::Allowed {
+        let (decision, error_class, response_body, status, upstream) = match outcome.into_kind() {
+            AuditOutcomeKind::Allowed {
                 response_body,
                 status,
                 upstream,
@@ -463,7 +629,7 @@ impl AuditEvent {
                 Some(status),
                 Some(upstream),
             ),
-            AuditOutcome::Denied {
+            AuditOutcomeKind::Denied {
                 error_class,
                 status,
             } => (
@@ -473,7 +639,7 @@ impl AuditEvent {
                 Some(status),
                 None,
             ),
-            AuditOutcome::ResponseError {
+            AuditOutcomeKind::ResponseError {
                 error_class,
                 response_body,
                 status,
@@ -485,7 +651,7 @@ impl AuditEvent {
                 Some(status),
                 Some(upstream),
             ),
-            AuditOutcome::UpstreamError {
+            AuditOutcomeKind::UpstreamError {
                 error_class,
                 status,
                 upstream,
@@ -1041,7 +1207,6 @@ mod proptests {
             let request_body = body_summary(&request_body_bytes);
             let request_bytes = body_len(&request_body_bytes);
             let request_digest = BodyDigest::from_bytes(&request_body_bytes).to_hex_string();
-            let response_body = body_summary(&response_body_bytes);
             let observed_response_body = observed_body_summary(&response_body_bytes);
             let response_bytes = body_len(&response_body_bytes);
             let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
@@ -1065,7 +1230,7 @@ mod proptests {
                 2 => (
                     AuditOutcome::response_error(
                         error_class.clone(),
-                        response_body,
+                        observed_response_body,
                         status,
                         upstream,
                     ),
