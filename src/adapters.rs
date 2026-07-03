@@ -120,7 +120,7 @@ impl SequentialRequestIds {
         // The process id disambiguates runs whose wall clocks collide, such
         // as restored snapshots or stepped clocks.
         let run_token = format!("{:x}-{run_nanos:x}", process::id());
-        Self::new(RunToken::new(run_token).expect("production run token should be non-empty"))
+        Self::new(RunToken::new(run_token).expect("production run token should be valid"))
     }
 }
 
@@ -346,7 +346,7 @@ mod tests {
 
     #[test]
     fn sequential_request_ids_report_exhaustion_without_wrapping() {
-        let run_token = RunToken::for_test("run");
+        let run_token = RunToken::for_test("a-b");
         let request_ids = SequentialRequestIds {
             last_allocated: AtomicU64::new(u64::MAX - 1),
             run_token: run_token.clone(),

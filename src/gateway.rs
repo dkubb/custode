@@ -459,7 +459,7 @@ mod tests {
         gateway
             .audit_denial(
                 RequestId::from_parts(
-                    &RunToken::for_test("run"),
+                    &RunToken::for_test("a-b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
                 &Method::CONNECT,
@@ -488,7 +488,7 @@ mod tests {
         gateway
             .audit_denial(
                 RequestId::from_parts(
-                    &RunToken::for_test("run"),
+                    &RunToken::for_test("a-b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
                 &Method::DELETE,
@@ -512,7 +512,7 @@ mod tests {
         gateway
             .audit_denial(
                 RequestId::from_parts(
-                    &RunToken::for_test("run"),
+                    &RunToken::for_test("a-b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
                 &Method::POST,
@@ -538,7 +538,7 @@ mod tests {
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
             RequestId::from_parts(
-                &RunToken::for_test("run"),
+                &RunToken::for_test("a-b"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
             ),
         );
@@ -568,7 +568,7 @@ mod tests {
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
             RequestId::from_parts(
-                &RunToken::for_test("run"),
+                &RunToken::for_test("a-b"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
             ),
         );

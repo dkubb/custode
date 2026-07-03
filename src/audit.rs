@@ -17,6 +17,9 @@ use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
+/// Maximum per-run token bytes.
+const MAX_RUN_TOKEN_BYTES: usize = 64;
+
 /// Audit decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -366,16 +369,28 @@ pub(crate) struct AuditWriter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct RequestId(String);
 
-/// Non-empty per-run token used in request identities.
+/// Bounded per-run token used in request identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunToken {
-    /// Non-empty run token text.
+    /// Bounded lower-hex `pid-nanos` run token text.
     value: NonEmptyString,
 }
 
-/// Empty run token rejection.
+/// Run token rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct EmptyRunToken;
+pub(crate) enum RunTokenError {
+    /// Token was empty.
+    Empty,
+
+    /// Token contained a byte outside lowercase hex and `-`.
+    InvalidCharacter,
+
+    /// Token was not exactly `hex-hex`.
+    InvalidShape,
+
+    /// Token exceeded the supported byte limit.
+    TooLong,
+}
 
 /// RFC 3339 UTC audit timestamp.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1043,19 +1058,20 @@ impl RunToken {
         self.value.as_str()
     }
 
-    /// Creates a non-empty run token for tests.
+    /// Creates a valid run token for tests.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn for_test(value: &str) -> Self {
-        Self::new(value).expect("test run token should be non-empty")
+        Self::new(value).expect("test run token should be valid")
     }
 
-    /// Creates a non-empty run token.
-    pub(crate) fn new(value: impl Into<String>) -> Result<Self, EmptyRunToken> {
+    /// Creates a bounded lower-hex `pid-nanos` run token.
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, RunTokenError> {
         let text = value.into();
+        validate_run_token(&text)?;
         NonEmptyString::new(text)
             .map(|non_empty| Self { value: non_empty })
-            .map_err(|_empty| EmptyRunToken)
+            .map_err(|_empty| RunTokenError::Empty)
     }
 }
 
@@ -1087,6 +1103,30 @@ impl AuditTimestamp {
     pub(crate) fn now() -> Self {
         Self(humantime::format_rfc3339_nanos(SystemTime::now()).to_string())
     }
+}
+
+/// Validates the run token grammar.
+fn validate_run_token(text: &str) -> Result<(), RunTokenError> {
+    if text.is_empty() {
+        return Err(RunTokenError::Empty);
+    }
+    if text.len() > MAX_RUN_TOKEN_BYTES {
+        return Err(RunTokenError::TooLong);
+    }
+    if text
+        .bytes()
+        .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+    {
+        return Err(RunTokenError::InvalidCharacter);
+    }
+
+    let mut parts = text.split('-');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if first.is_empty() || second.is_none_or(str::is_empty) || parts.next().is_some() {
+        return Err(RunTokenError::InvalidShape);
+    }
+    Ok(())
 }
 
 /// Serializes one bounded audit event as NDJSON bytes.
@@ -1133,8 +1173,8 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        EmptyRunToken, ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken,
-        write_serialized_event,
+        MAX_RUN_TOKEN_BYTES, ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken,
+        RunTokenError, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1225,7 +1265,7 @@ mod tests {
         AuditRequestInput::new(
             Method::from_bytes(method.as_bytes()).expect("test method should parse"),
             target,
-            RequestId::from_parts(&RunToken::for_test("run"), request_sequence(1)),
+            RequestId::from_parts(&RunToken::for_test("a-b"), request_sequence(1)),
             body,
             UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
         )
@@ -1321,7 +1361,36 @@ mod tests {
 
     #[test]
     fn run_token_rejects_empty_text() {
-        assert_eq!(RunToken::new(""), Err(EmptyRunToken));
+        assert_eq!(RunToken::new(""), Err(RunTokenError::Empty));
+    }
+
+    #[test]
+    fn run_token_rejects_invalid_text() {
+        let cases = Vec::from([
+            ("abcdef".to_owned(), RunTokenError::InvalidShape),
+            ("-abcdef".to_owned(), RunTokenError::InvalidShape),
+            ("abcdef-".to_owned(), RunTokenError::InvalidShape),
+            ("ab-cd-ef".to_owned(), RunTokenError::InvalidShape),
+            ("AB-cd".to_owned(), RunTokenError::InvalidCharacter),
+            ("ab_cd-ef".to_owned(), RunTokenError::InvalidCharacter),
+            ("ab\ncd-ef".to_owned(), RunTokenError::InvalidCharacter),
+            ("a".repeat(MAX_RUN_TOKEN_BYTES + 1), RunTokenError::TooLong),
+        ]);
+
+        for (token, expected) in cases {
+            assert_eq!(
+                RunToken::new(token.as_str()),
+                Err(expected),
+                "token {token:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_token_accepts_production_shape() {
+        let token = RunToken::new("1a-2b").expect("production-shaped token should parse");
+
+        assert_eq!(token.as_str(), "1a-2b");
     }
 
     #[test]
@@ -1372,7 +1441,7 @@ mod tests {
         assert_eq!(object.len(), expected_fields.len());
         assert_eq!(object["version"], 3_u64);
         assert_eq!(object["decision"], "denied");
-        assert_eq!(object["request_id"], "req-run-0000000000000001");
+        assert_eq!(object["request_id"], "req-a-b-0000000000000001");
         assert!(object["upstream_path"].is_null());
         assert!(object["upstream_query"].is_null());
         assert!(object["query"].is_null());
@@ -1634,6 +1703,12 @@ mod proptests {
         collection::vec(any::<u8>(), 1..33)
     }
 
+    /// Generates valid run tokens matching the production `pid-nanos` shape.
+    fn run_token_valid() -> impl Strategy<Value = String> {
+        ("[0-9a-f]{1,8}", "[0-9a-f]{1,16}")
+            .prop_map(|(process_id, run_nanos)| format!("{process_id}-{run_nanos}"))
+    }
+
     /// Returns a parsed method from generated method text.
     fn method_value(method: &str) -> Method {
         Method::from_bytes(method.as_bytes()).expect("generated method should parse")
@@ -1720,7 +1795,7 @@ mod proptests {
             status_code_value in 100_u16..600,
             request_body_bytes in non_empty_body(),
             response_body_bytes in non_empty_body(),
-            run_token in "[0-9a-f]{1,16}",
+            run_token in run_token_valid(),
             sequence_value in 1_u64..=u64::MAX,
         ) {
             let sequence =
@@ -1816,7 +1891,7 @@ mod proptests {
                 }
             };
             let request_run_token =
-                RunToken::new(run_token).expect("generated run token should be non-empty");
+                RunToken::new(run_token).expect("generated run token should be valid");
             let request = AuditRequestInput::new(
                 method_value(&method),
                 AuditTarget::from_uri_parts(&path, query.as_deref()),
@@ -1867,13 +1942,13 @@ mod proptests {
 
         #[test]
         fn request_id_embeds_run_token_and_padded_sequence(
-            run_token in "[0-9a-f]{1,16}",
+            run_token in run_token_valid(),
             sequence_value in 1_u64..=u64::MAX,
         ) {
             let sequence =
                 NonZeroU64::new(sequence_value).expect("generated sequence should be non-zero");
             let request_run_token =
-                RunToken::new(run_token.clone()).expect("generated run token should be non-empty");
+                RunToken::new(run_token.clone()).expect("generated run token should be valid");
             let value = serde_json::to_value(RequestId::from_parts(&request_run_token, sequence))
                 .expect("request id should serialize");
 
