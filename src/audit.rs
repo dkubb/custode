@@ -308,7 +308,12 @@ pub(crate) enum ObservedBodySummary {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResponseBodyPrefix {
     /// A non-empty response prefix was accepted before the limit failure.
-    Accepted(ObservedBodySummary),
+    Accepted {
+        /// Prefix digest.
+        blake3: BodyDigest,
+        /// Prefix byte count.
+        bytes: NonZeroU64,
+    },
 
     /// No response bytes were accepted before the limit failure.
     NoneAccepted,
@@ -542,12 +547,10 @@ impl ResponseBodyPrefix {
     #[must_use]
     pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
         let (byte_count, response_digest) = response_account.into_digest_parts();
-        response_digest.map_or(Self::NoneAccepted, |digest| {
-            Self::Accepted(ObservedBodySummary::NonEmpty {
-                blake3: digest,
-                bytes: NonZeroU64::new(byte_count)
-                    .expect("response body digest requires non-zero bytes"),
-            })
+        response_digest.map_or(Self::NoneAccepted, |digest| Self::Accepted {
+            blake3: digest,
+            bytes: NonZeroU64::new(byte_count)
+                .expect("response body digest requires non-zero bytes"),
         })
     }
 
@@ -556,7 +559,7 @@ impl ResponseBodyPrefix {
     const fn into_summary(self) -> AuditBodySummary {
         match self {
             Self::NoneAccepted => AuditBodySummary::not_observed(),
-            Self::Accepted(summary) => summary.into_summary(),
+            Self::Accepted { blake3, bytes } => AuditBodySummary::non_empty(blake3, bytes),
         }
     }
 }
@@ -1787,10 +1790,10 @@ mod tests {
 
         assert_eq!(
             prefix,
-            ResponseBodyPrefix::Accepted(ObservedBodySummary::NonEmpty {
+            ResponseBodyPrefix::Accepted {
                 blake3: BodyDigest::from_bytes(b"accepted"),
                 bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
-            }),
+            },
         );
     }
 
@@ -2689,7 +2692,11 @@ mod proptests {
                         ),
                         1 => (
                             AuditResponseError::response_body_too_large(
-                                ResponseBodyPrefix::Accepted(observed_response_body),
+                                ResponseBodyPrefix::Accepted {
+                                    blake3: BodyDigest::from_bytes(&response_body_bytes),
+                                    bytes: NonZeroU64::new(response_bytes)
+                                        .expect("generated body should be non-empty"),
+                                },
                                 status,
                             ),
                             body_value(response_bytes, &response_digest),
