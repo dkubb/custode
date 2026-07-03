@@ -74,16 +74,30 @@ pub(super) struct Scenario {
 /// Product of deterministic scenario fault-class axes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct ScenarioClass {
-    /// Gateway admission state.
-    admission: ScenarioAdmission,
-    /// Audit sink behavior.
-    audit: ScenarioAudit,
-    /// Scenario byte bounds.
-    bounds: ScenarioBounds,
-    /// Downstream response consumption behavior.
-    downstream: ScenarioDownstream,
-    /// Scripted upstream behavior.
-    upstream: ScenarioUpstream,
+    /// Reachable scenario fault class.
+    kind: ScenarioClassKind,
+}
+
+/// Reachable deterministic scenario fault classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScenarioClassKind {
+    /// Base product over admission, audit, bounds, and upstream behavior.
+    Base {
+        /// Gateway admission state.
+        admission: ScenarioAdmission,
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+        /// Scenario byte bounds.
+        bounds: ScenarioBounds,
+        /// Scripted upstream behavior.
+        upstream: ScenarioUpstream,
+    },
+
+    /// Reachable downstream disconnect during successful streaming response.
+    DownstreamDisconnect {
+        /// Downstream response consumption behavior.
+        downstream: ScenarioDownstream,
+    },
 }
 
 /// Gateway admission state for a deterministic scenario.
@@ -169,6 +183,31 @@ enum ScriptedUpstreamBehavior {
 
     /// Return an error after streaming one response chunk.
     StreamError,
+}
+
+impl ScenarioAdmission {
+    /// Every scenario admission variant.
+    const ALL: [Self; 2] = [Self::Open, Self::Saturated];
+}
+
+impl ScenarioAudit {
+    /// Every scenario audit variant.
+    const ALL: [Self; 2] = [Self::FailFirst, Self::Record];
+}
+
+impl ScenarioBounds {
+    /// Every scenario bounds variant.
+    const ALL: [Self; 2] = [Self::Roomy, Self::TinyResponse];
+}
+
+impl ScenarioDownstream {
+    /// Reachable downstream disconnect variants.
+    const DISCONNECTS: [Self; 2] = [Self::DropBeforeFirstChunk, Self::DropBeforeFinalChunk];
+}
+
+impl ScenarioUpstream {
+    /// Every scenario upstream variant.
+    const ALL: [Self; 3] = [Self::Respond, Self::StreamError, Self::Timeout];
 }
 
 /// Scripted upstream client for deterministic handler tests.
@@ -366,13 +405,28 @@ impl Scenario {
     /// Builds a deterministic gateway scenario from a generated class.
     #[must_use]
     pub(super) const fn with_class(class: ScenarioClass, request: ScenarioRequest) -> Self {
-        Self {
-            admission: class.admission,
-            audit: class.audit,
-            bounds: class.bounds,
-            downstream: class.downstream,
-            request,
-            upstream: class.upstream,
+        match class.kind {
+            ScenarioClassKind::Base {
+                admission,
+                audit,
+                bounds,
+                upstream,
+            } => Self {
+                admission,
+                audit,
+                bounds,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream,
+            },
+            ScenarioClassKind::DownstreamDisconnect { downstream } => Self {
+                admission: ScenarioAdmission::Open,
+                audit: ScenarioAudit::Record,
+                bounds: ScenarioBounds::Roomy,
+                downstream,
+                request,
+                upstream: ScenarioUpstream::Respond,
+            },
         }
     }
 }
@@ -381,39 +435,41 @@ impl ScenarioClass {
     /// Returns every scenario fault-class combination.
     #[must_use]
     pub(super) fn all() -> Vec<Self> {
-        let mut classes = Vec::with_capacity(26);
-        for admission in [ScenarioAdmission::Open, ScenarioAdmission::Saturated] {
-            for audit in [ScenarioAudit::FailFirst, ScenarioAudit::Record] {
-                for bounds in [ScenarioBounds::Roomy, ScenarioBounds::TinyResponse] {
-                    for upstream in [
-                        ScenarioUpstream::Respond,
-                        ScenarioUpstream::StreamError,
-                        ScenarioUpstream::Timeout,
-                    ] {
+        let mut classes = Vec::with_capacity(Self::count());
+        for admission in ScenarioAdmission::ALL {
+            for audit in ScenarioAudit::ALL {
+                for bounds in ScenarioBounds::ALL {
+                    for upstream in ScenarioUpstream::ALL {
                         classes.push(Self {
-                            admission,
-                            audit,
-                            bounds,
-                            downstream: ScenarioDownstream::ConsumeAll,
-                            upstream,
+                            kind: ScenarioClassKind::Base {
+                                admission,
+                                audit,
+                                bounds,
+                                upstream,
+                            },
                         });
                     }
                 }
             }
         }
-        for downstream in [
-            ScenarioDownstream::DropBeforeFirstChunk,
-            ScenarioDownstream::DropBeforeFinalChunk,
-        ] {
+        for downstream in ScenarioDownstream::DISCONNECTS {
             classes.push(Self {
-                admission: ScenarioAdmission::Open,
-                audit: ScenarioAudit::Record,
-                bounds: ScenarioBounds::Roomy,
-                downstream,
-                upstream: ScenarioUpstream::Respond,
+                kind: ScenarioClassKind::DownstreamDisconnect { downstream },
             });
         }
         classes
+    }
+
+    /// Returns the derived number of reachable scenario classes.
+    #[must_use]
+    pub(super) fn count() -> usize {
+        ScenarioAdmission::ALL
+            .len()
+            .checked_mul(ScenarioAudit::ALL.len())
+            .and_then(|count| count.checked_mul(ScenarioBounds::ALL.len()))
+            .and_then(|count| count.checked_mul(ScenarioUpstream::ALL.len()))
+            .and_then(|count| count.checked_add(ScenarioDownstream::DISCONNECTS.len()))
+            .expect("scenario class count should not overflow")
     }
 }
 
