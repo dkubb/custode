@@ -1,4 +1,5 @@
 /target/
+/proptest-regressions/
 /.env
 /.env.*
 !/env.example
