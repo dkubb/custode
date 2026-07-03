@@ -1,8 +1,5 @@
-/target/
-/proptest-regressions/
-/.env
-/.env.*
-!/env.example
 /logs/
+/proptest-regressions/
 /secrets/*
 !/secrets/*.example
+/target/
