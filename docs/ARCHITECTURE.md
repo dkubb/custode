@@ -361,7 +361,8 @@ Configuration parsing is fail-closed:
   operation string MUST be at most 4,160 bytes.
 - Each operation MUST have the form `METHOD:exact:/path` or
   `METHOD:prefix:/path`.
-- Every configured path or prefix MUST begin with `/`.
+- Every configured path or prefix MUST begin with `/` and MUST NOT contain a
+  query delimiter, fragment delimiter, or literal backslash.
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
   `/v1/responses` and `/v1/responses/{id}`, but not `/v1/responses-other`.
 - Size, concurrency, and duration bounds MUST be positive and MUST NOT exceed

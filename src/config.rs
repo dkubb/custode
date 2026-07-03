@@ -96,7 +96,7 @@ pub(crate) enum ConfigError {
 
     /// Path was not a supported origin-form path.
     #[error(
-        "allowed path {path:?} must be origin-form without dot segments, encoded separators, or invalid percent-encoding"
+        "allowed path {path:?} must be origin-form without query delimiters, fragments, literal backslashes, dot segments, encoded separators, or invalid percent-encoding"
     )]
     InvalidAllowedPath {
         /// Invalid path.
@@ -690,9 +690,23 @@ fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperat
 
 /// Parses an allowed path string.
 fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
+    if has_forbidden_allowed_path_character(path) {
+        return Err(ConfigError::InvalidAllowedPath {
+            path: path.to_owned(),
+        });
+    }
+
     OriginFormPath::parse(path).map_err(|_error| ConfigError::InvalidAllowedPath {
         path: path.to_owned(),
     })
+}
+
+/// Returns true when configured path text includes non-path syntax.
+fn has_forbidden_allowed_path_character(path: &str) -> bool {
+    path.as_bytes()
+        .iter()
+        .copied()
+        .any(|byte| matches!(byte, b'#' | b'?' | b'\\'))
 }
 
 #[cfg(test)]
@@ -756,6 +770,19 @@ mod tests {
     #[test]
     fn allowed_path_rejects_dot_segments_encoded_separators_and_invalid_percent_encoding() {
         for path in ["/v1/../models", "/v1/%2fmodels", "/v1/%zz"] {
+            assert!(
+                matches!(
+                    AllowedPath::exact(path),
+                    Err(ConfigError::InvalidAllowedPath { .. }),
+                ),
+                "path {path:?} should fail closed",
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_path_rejects_query_fragments_and_backslashes() {
+        for path in ["/v1/models?limit=1", "/v1/models#fragment", "/v1\\models"] {
             assert!(
                 matches!(
                     AllowedPath::exact(path),
@@ -1304,6 +1331,9 @@ mod proptests {
             allowed_path_valid().prop_map(|path| format!("{path}/..")),
             allowed_path_valid().prop_map(|path| format!("{path}%2fchild")),
             allowed_path_valid().prop_map(|path| format!("{path}%zz")),
+            allowed_path_valid().prop_map(|path| format!("{path}?limit=1")),
+            allowed_path_valid().prop_map(|path| format!("{path}#fragment")),
+            allowed_path_valid().prop_map(|path| format!("{path}\\child")),
             (MAX_ORIGIN_FORM_PATH_BYTES..=MAX_ORIGIN_FORM_PATH_BYTES + 64)
                 .prop_map(|tail_len| format!("/{}", "a".repeat(tail_len))),
         ]
