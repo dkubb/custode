@@ -7,7 +7,23 @@ use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
 use std::path::PathBuf;
 use thiserror::Error;
+use tokio::sync::Semaphore;
 use url::Url;
+
+/// Maximum serialized audit event bytes.
+const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
+/// Maximum concurrent gateway requests accepted by Tokio's semaphore.
+const MAX_CONCURRENT_REQUESTS: usize = Semaphore::MAX_PERMITS;
+/// Maximum incoming request body bytes.
+const MAX_REQUEST_BYTES: usize = 0x4000_0000;
+/// Maximum incoming request header name/value bytes.
+const MAX_REQUEST_HEADER_BYTES: usize = 0x0010_0000;
+/// Maximum upstream response body bytes.
+const MAX_RESPONSE_BYTES: u64 = 0x4000_0000;
+/// Maximum upstream response header name/value bytes.
+const MAX_RESPONSE_HEADER_BYTES: usize = 0x0010_0000;
+/// Maximum request timeout in seconds.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 3_600;
 
 /// A configured method-path operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -40,6 +56,17 @@ enum AllowedPathKind {
 /// Configuration parsing error.
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
+    /// A numeric bound was above the supported maximum.
+    #[error("{name} must be at most {max}, got {value}")]
+    BoundTooLarge {
+        /// Bound name.
+        name: &'static str,
+        /// Maximum accepted value.
+        max: u128,
+        /// Supplied value.
+        value: u128,
+    },
+
     /// No operations were configured.
     #[error("at least one allowed operation is required")]
     EmptyOperations,
@@ -331,9 +358,10 @@ impl RequestTimeout {
     }
 
     /// Parses timeout seconds from a raw numeric configuration value.
-    fn parse_seconds(name: &'static str, seconds: u64) -> Result<Self, ConfigError> {
+    fn parse_seconds(name: &'static str, raw_seconds: u64) -> Result<Self, ConfigError> {
+        let seconds = bounded_non_zero_u64(name, raw_seconds, MAX_REQUEST_TIMEOUT_SECS)?;
         Ok(Self {
-            duration: Duration::from_secs(non_zero_u64(name, seconds)?.get()),
+            duration: Duration::from_secs(seconds.get()),
         })
     }
 }
@@ -473,26 +501,35 @@ impl TryFrom<ServeArgs> for GatewayConfig {
             allowed_operations,
             audit_log: args.audit_log,
             bind: args.bind,
-            max_audit_event_bytes: non_zero_usize(
+            max_audit_event_bytes: bounded_non_zero_usize(
                 "CUSTODE_MAX_AUDIT_EVENT_BYTES",
                 args.max_audit_event_bytes,
+                MAX_AUDIT_EVENT_BYTES,
             )?,
-            max_concurrent_requests: non_zero_usize(
+            max_concurrent_requests: bounded_non_zero_usize(
                 "CUSTODE_MAX_CONCURRENT_REQUESTS",
                 args.max_concurrent_requests,
+                MAX_CONCURRENT_REQUESTS,
             )?,
-            max_request_bytes: non_zero_usize("CUSTODE_MAX_REQUEST_BYTES", args.max_request_bytes)?,
-            max_request_header_bytes: non_zero_usize(
+            max_request_bytes: bounded_non_zero_usize(
+                "CUSTODE_MAX_REQUEST_BYTES",
+                args.max_request_bytes,
+                MAX_REQUEST_BYTES,
+            )?,
+            max_request_header_bytes: bounded_non_zero_usize(
                 "CUSTODE_MAX_REQUEST_HEADER_BYTES",
                 args.max_request_header_bytes,
+                MAX_REQUEST_HEADER_BYTES,
             )?,
-            max_response_bytes: non_zero_u64(
+            max_response_bytes: bounded_non_zero_u64(
                 "CUSTODE_MAX_RESPONSE_BYTES",
                 args.max_response_bytes,
+                MAX_RESPONSE_BYTES,
             )?,
-            max_response_header_bytes: non_zero_usize(
+            max_response_header_bytes: bounded_non_zero_usize(
                 "CUSTODE_MAX_RESPONSE_HEADER_BYTES",
                 args.max_response_header_bytes,
+                MAX_RESPONSE_HEADER_BYTES,
             )?,
             request_timeout,
             upstream_origin: UpstreamOrigin::parse(&args.upstream_origin)?,
@@ -561,9 +598,48 @@ fn non_zero_u64(name: &'static str, value: u64) -> Result<NonZeroU64, ConfigErro
     NonZeroU64::new(value).ok_or(ConfigError::ZeroBound { name })
 }
 
+/// Returns a bounded non-zero `u64` or the matching configuration error.
+fn bounded_non_zero_u64(
+    name: &'static str,
+    raw_value: u64,
+    max: u64,
+) -> Result<NonZeroU64, ConfigError> {
+    let value = non_zero_u64(name, raw_value)?;
+    if raw_value > max {
+        return Err(ConfigError::BoundTooLarge {
+            name,
+            max: u128::from(max),
+            value: u128::from(raw_value),
+        });
+    }
+    Ok(value)
+}
+
 /// Returns a non-zero `usize` or the matching configuration error.
 fn non_zero_usize(name: &'static str, value: usize) -> Result<NonZeroUsize, ConfigError> {
     NonZeroUsize::new(value).ok_or(ConfigError::ZeroBound { name })
+}
+
+/// Returns a bounded non-zero `usize` or the matching configuration error.
+fn bounded_non_zero_usize(
+    name: &'static str,
+    raw_value: usize,
+    max: usize,
+) -> Result<NonZeroUsize, ConfigError> {
+    let value = non_zero_usize(name, raw_value)?;
+    if raw_value > max {
+        return Err(ConfigError::BoundTooLarge {
+            name,
+            max: usize_to_u128(max),
+            value: usize_to_u128(raw_value),
+        });
+    }
+    Ok(value)
+}
+
+/// Converts `usize` to `u128` without loss.
+fn usize_to_u128(value: usize) -> u128 {
+    u128::try_from(value).expect("usize should fit into u128")
 }
 
 /// Parses allowed operation strings and rejects an empty operation set.
@@ -601,16 +677,18 @@ fn parse_allowed_path(path: &str) -> Result<String, ConfigError> {
 )]
 mod tests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,
-        non_zero_usize, parse_allowed_operations,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_AUDIT_EVENT_BYTES,
+        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
+        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
+        UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
     use core::net::SocketAddr;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
 
-    /// A mutation that zeroes one serve argument bound.
-    type ZeroOneBound = fn(&mut ServeArgs);
+    /// A mutation that changes one serve argument bound.
+    type MutateBound = fn(&mut ServeArgs);
 
     /// Builds valid serve args mirroring the documented defaults.
     pub(super) fn serve_args() -> ServeArgs {
@@ -747,6 +825,94 @@ mod tests {
     }
 
     #[test]
+    fn too_large_serve_args_fail_closed_with_the_env_name() {
+        let cases: [(&str, u128, MutateBound); 7] = [
+            (
+                "CUSTODE_MAX_AUDIT_EVENT_BYTES",
+                usize_to_u128(MAX_AUDIT_EVENT_BYTES),
+                |args| {
+                    args.max_audit_event_bytes = MAX_AUDIT_EVENT_BYTES
+                        .checked_add(1)
+                        .expect("test max should fit usize");
+                },
+            ),
+            (
+                "CUSTODE_MAX_CONCURRENT_REQUESTS",
+                usize_to_u128(MAX_CONCURRENT_REQUESTS),
+                |args| {
+                    args.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
+                        .checked_add(1)
+                        .expect("test max should fit usize");
+                },
+            ),
+            (
+                "CUSTODE_MAX_REQUEST_BYTES",
+                usize_to_u128(MAX_REQUEST_BYTES),
+                |args| {
+                    args.max_request_bytes = MAX_REQUEST_BYTES
+                        .checked_add(1)
+                        .expect("test max should fit usize");
+                },
+            ),
+            (
+                "CUSTODE_MAX_REQUEST_HEADER_BYTES",
+                usize_to_u128(MAX_REQUEST_HEADER_BYTES),
+                |args| {
+                    args.max_request_header_bytes = MAX_REQUEST_HEADER_BYTES
+                        .checked_add(1)
+                        .expect("test max should fit usize");
+                },
+            ),
+            (
+                "CUSTODE_MAX_RESPONSE_BYTES",
+                u128::from(MAX_RESPONSE_BYTES),
+                |args| {
+                    args.max_response_bytes = MAX_RESPONSE_BYTES
+                        .checked_add(1)
+                        .expect("test max should fit u64");
+                },
+            ),
+            (
+                "CUSTODE_MAX_RESPONSE_HEADER_BYTES",
+                usize_to_u128(MAX_RESPONSE_HEADER_BYTES),
+                |args| {
+                    args.max_response_header_bytes = MAX_RESPONSE_HEADER_BYTES
+                        .checked_add(1)
+                        .expect("test max should fit usize");
+                },
+            ),
+            (
+                "CUSTODE_REQUEST_TIMEOUT_SECS",
+                u128::from(MAX_REQUEST_TIMEOUT_SECS),
+                |args| {
+                    args.request_timeout_secs = MAX_REQUEST_TIMEOUT_SECS
+                        .checked_add(1)
+                        .expect("test max should fit u64");
+                },
+            ),
+        ];
+
+        for (name, expected_max, too_large_bound) in cases {
+            let mut args = serve_args();
+            too_large_bound(&mut args);
+
+            let error = GatewayConfig::try_from(args).expect_err("large bound should fail");
+
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::BoundTooLarge {
+                        name: actual,
+                        max,
+                        ..
+                    } if actual == name && max == expected_max
+                ),
+                "bound {name} should fail closed"
+            );
+        }
+    }
+
+    #[test]
     fn serve_args_convert_into_a_full_config() {
         let config = GatewayConfig::try_from(serve_args()).expect("valid args should convert");
 
@@ -781,7 +947,7 @@ mod tests {
 
     #[test]
     fn zero_serve_args_fail_closed_with_the_env_name() {
-        let cases: [(&str, ZeroOneBound); 7] = [
+        let cases: [(&str, MutateBound); 7] = [
             ("CUSTODE_MAX_AUDIT_EVENT_BYTES", |args| {
                 args.max_audit_event_bytes = 0;
             }),
@@ -881,8 +1047,10 @@ mod tests {
 )]
 mod proptests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, ServeArgs, UpstreamOrigin,
-        parse_allowed_operations, tests::serve_args,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_AUDIT_EVENT_BYTES,
+        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
+        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
+        UpstreamOrigin, parse_allowed_operations, tests::serve_args,
     };
     use ::http::Method;
     use core::iter;
@@ -939,14 +1107,14 @@ mod proptests {
         ]
     }
 
-    /// Non-zero `u64` bounds biased toward the low boundary.
-    fn bound_u64() -> impl Strategy<Value = u64> {
-        prop_oneof![1 => Just(1_u64), 4 => 1_u64..]
+    /// Supported non-zero `u64` bounds biased toward the low boundary.
+    fn bound_u64(max: u64) -> impl Strategy<Value = u64> {
+        prop_oneof![1 => Just(1_u64), 4 => 1_u64..=max]
     }
 
-    /// Non-zero `usize` bounds biased toward the low boundary.
-    fn bound_usize() -> impl Strategy<Value = usize> {
-        prop_oneof![1 => Just(1_usize), 4 => 1_usize..]
+    /// Supported non-zero `usize` bounds biased toward the low boundary.
+    fn bound_usize(max: usize) -> impl Strategy<Value = usize> {
+        prop_oneof![1 => Just(1_usize), 4 => 1_usize..=max]
     }
 
     /// Paths missing the required leading slash (first invalid form).
@@ -1157,13 +1325,13 @@ mod proptests {
         #[test]
         fn serve_args_with_non_zero_bounds_convert(
             port in port_any(),
-            max_audit_event_bytes in bound_usize(),
-            max_concurrent_requests in bound_usize(),
-            max_request_bytes in bound_usize(),
-            max_request_header_bytes in bound_usize(),
-            max_response_bytes in bound_u64(),
-            max_response_header_bytes in bound_usize(),
-            request_timeout_secs in bound_u64(),
+            max_audit_event_bytes in bound_usize(MAX_AUDIT_EVENT_BYTES),
+            max_concurrent_requests in bound_usize(MAX_CONCURRENT_REQUESTS),
+            max_request_bytes in bound_usize(MAX_REQUEST_BYTES),
+            max_request_header_bytes in bound_usize(MAX_REQUEST_HEADER_BYTES),
+            max_response_bytes in bound_u64(MAX_RESPONSE_BYTES),
+            max_response_header_bytes in bound_usize(MAX_RESPONSE_HEADER_BYTES),
+            request_timeout_secs in bound_u64(MAX_REQUEST_TIMEOUT_SECS),
             origin in origin_valid(),
         ) {
             let args = ServeArgs {

@@ -358,7 +358,11 @@ Configuration parsing is fail-closed:
 - Every configured path or prefix MUST begin with `/`.
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
   `/v1/responses` and `/v1/responses/{id}`, but not `/v1/responses-other`.
-- Size, concurrency, and duration bounds MUST be positive.
+- Size, concurrency, and duration bounds MUST be positive and MUST NOT exceed
+  the implementation maxima: audit event bytes 1,048,576; concurrent requests
+  Tokio `Semaphore::MAX_PERMITS`; request bytes 1,073,741,824; request header
+  name/value bytes 1,048,576; response bytes 1,073,741,824; response header
+  name/value bytes 1,048,576; request timeout 3,600 seconds.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.
