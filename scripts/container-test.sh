@@ -6,6 +6,7 @@
 # - /custode-proxy in the proxy image is statically linked;
 # - the composition comes up with a healthy proxy;
 # - the proxy publishes no ports to the host;
+# - the harness is attached only to Docker-internal networks;
 # - the harness cannot reach an external URL directly, tested from inside
 #   the harness container;
 # - the harness can reach the gateway on the internal network.
@@ -14,7 +15,7 @@ export CUSTODE_UPSTREAM_ORIGIN="${CUSTODE_UPSTREAM_ORIGIN:-https://api.anthropic
 export CUSTODE_ALLOWED_OPERATIONS="${CUSTODE_ALLOWED_OPERATIONS:-POST:prefix:/v1/messages,GET:prefix:/v1/models}"
 export COMPOSE_PROJECT_NAME="custode_container_test_$$"
 
-readonly TAP_TEST_COUNT=6
+readonly TAP_TEST_COUNT=7
 
 test_number=0
 failed=0
@@ -99,6 +100,42 @@ proxy_publishes_no_ports() {
   fi
 }
 
+harness_networks_are_internal_only() {
+  local container_id
+  local internal
+  local network_id
+  local network_ids=()
+
+  if ! container_id=$(docker compose ps --quiet harness); then
+    return 1
+  fi
+
+  if [[ -z "${container_id}" ]]; then
+    printf "harness container was not found\n" >&2
+    return 1
+  fi
+
+  while IFS= read -r network_id; do
+    if [[ -n "${network_id}" ]]; then
+      network_ids+=("${network_id}")
+    fi
+  done < <(docker inspect --format '{{range .NetworkSettings.Networks}}{{.NetworkID}}{{"\n"}}{{end}}' "${container_id}")
+
+  if [[ "${#network_ids[@]}" -ne 1 ]]; then
+    printf "expected harness to have exactly 1 network, found %d\n" "${#network_ids[@]}" >&2
+    return 1
+  fi
+
+  if ! internal=$(docker network inspect --format '{{.Internal}}' "${network_ids[0]}"); then
+    return 1
+  fi
+
+  if [[ "${internal}" != "true" ]]; then
+    printf "harness network %s is not internal\n" "${network_ids[0]}" >&2
+    return 1
+  fi
+}
+
 harness_cannot_reach_external() {
   if docker compose exec -T harness curl --silent --max-time 5 https://example.com >/dev/null 2>&1; then
     printf "harness reached an external URL directly\n" >&2
@@ -165,6 +202,8 @@ run_test "static linkage of /custode-proxy" static_linkage
 run_test "docker compose up with healthy proxy" docker compose up --detach --wait
 
 run_test "proxy publishes no ports to the host" proxy_publishes_no_ports
+
+run_test "harness networks are internal-only" harness_networks_are_internal_only
 
 run_test "harness cannot reach an external URL directly" harness_cannot_reach_external
 

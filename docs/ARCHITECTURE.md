@@ -813,11 +813,16 @@ Container tests are implemented by `scripts/container-test.sh`, run with
 - `docker compose up --detach --wait` with a healthy proxy;
 - the proxy publishes no ports to the host, so the gateway and its
   healthcheck are reachable only from the Compose networks;
-- harness cannot reach an external URL directly;
+- the harness is attached to exactly one Docker network and Docker reports
+  that network as internal;
+- harness cannot reach an external URL directly from inside the harness
+  container;
 - harness reaches the gateway service on the internal network.
 
 The direct-egress denial test MUST run from inside the harness container. A
-passing proxy request is not proof that direct egress is denied.
+passing proxy request is not proof that direct egress is denied. The topology
+check is the primary containment proof; the external request is a live
+end-to-end regression check.
 
 Mutation runs that gate a change are scoped to the touched files with unit
 tests only (`cargo mutants -f <file> -- --lib`); the `just mutants` recipe
