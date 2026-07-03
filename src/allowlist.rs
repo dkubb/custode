@@ -26,13 +26,17 @@ impl AcceptedTarget {
     ///
     /// # Errors
     ///
-    /// Returns a rejection when the path is not origin-form, contains invalid
-    /// percent-encoding, or contains a literal or percent-encoded dot segment.
+    /// Returns a rejection when the path is not origin-form, when the path or
+    /// query contains invalid percent-encoding, or when the path contains a
+    /// literal or percent-encoded dot segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
         if !path.starts_with('/') {
             return Err(RejectionReason::NonOriginForm);
         }
         if !has_valid_percent_encoding(path) {
+            return Err(RejectionReason::InvalidPercentEncoding);
+        }
+        if query.is_some_and(|value| !has_valid_percent_encoding(value)) {
             return Err(RejectionReason::InvalidPercentEncoding);
         }
         if has_dot_segment(path) {
@@ -287,6 +291,10 @@ mod tests {
     fn target_rejects_invalid_percent_encoding() {
         assert_eq!(
             AcceptedTarget::new("/v1/%zz", None),
+            Err(RejectionReason::InvalidPercentEncoding),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/models", Some("bad=%zz")),
             Err(RejectionReason::InvalidPercentEncoding),
         );
     }
