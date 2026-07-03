@@ -1427,7 +1427,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
             .await
@@ -1439,7 +1439,7 @@ mod tests {
             gateway,
             request_body,
             request_id: RequestId::from_parts(
-                &RunToken::for_test("7e57-c0de"),
+                &RunToken::for_test("0000000000007e57-000000000000c0de"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
             ),
             response_account,
@@ -1488,7 +1488,7 @@ mod tests {
             ("request_body".to_owned(), non_empty_body_value(b"hello")),
             (
                 "request_id".to_owned(),
-                Value::String("req-7e57-c0de-0000000000000001".to_owned()),
+                Value::String("req-0000000000007e57-000000000000c0de-0000000000000001".to_owned()),
             ),
             (
                 "response_body".to_owned(),
@@ -1532,7 +1532,7 @@ mod tests {
             ("request_body".to_owned(), empty_body_value()),
             (
                 "request_id".to_owned(),
-                Value::String("req-7e57-c0de-0000000000000001".to_owned()),
+                Value::String("req-0000000000007e57-000000000000c0de-0000000000000001".to_owned()),
             ),
             ("response_body".to_owned(), not_observed_body_value()),
             ("status".to_owned(), Value::from(504_u64)),
@@ -1567,7 +1567,7 @@ mod tests {
             ("request_body".to_owned(), not_observed_body_value()),
             (
                 "request_id".to_owned(),
-                Value::String("req-7e57-c0de-0000000000000001".to_owned()),
+                Value::String("req-0000000000007e57-000000000000c0de-0000000000000001".to_owned()),
             ),
             ("response_body".to_owned(), not_observed_body_value()),
             ("status".to_owned(), Value::from(408_u64)),
@@ -1624,7 +1624,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let permits = match scenario.admission() {
@@ -1885,7 +1885,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
@@ -1958,7 +1958,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
@@ -2025,7 +2025,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
@@ -2100,7 +2100,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
@@ -3083,7 +3083,7 @@ mod tests {
             config,
             audit,
             FixedClock,
-            SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
+            SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de")),
         );
         let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
             .await
@@ -3095,7 +3095,7 @@ mod tests {
             gateway,
             request_body,
             request_id: RequestId::from_parts(
-                &RunToken::for_test("7e57-c0de"),
+                &RunToken::for_test("0000000000007e57-000000000000c0de"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
             ),
             response_account,
@@ -3399,7 +3399,7 @@ mod tests {
             gateway,
             request_body,
             request_id: RequestId::from_parts(
-                &RunToken::for_test("7e57-c0de"),
+                &RunToken::for_test("0000000000007e57-000000000000c0de"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
             ),
             response_account,

@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn sequential_request_ids_report_exhaustion_without_wrapping() {
-        let run_token = RunToken::for_test("a-b");
+        let run_token = RunToken::for_test("000000000000000a-000000000000000b");
         let request_ids = SequentialRequestIds {
             last_allocated: AtomicU64::new(u64::MAX - 1),
             run_token: run_token.clone(),

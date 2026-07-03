@@ -17,8 +17,11 @@ use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
-/// Maximum per-run token bytes.
-const MAX_RUN_TOKEN_BYTES: usize = 64;
+/// Hex bytes in one half of a per-run token.
+const RUN_TOKEN_HEX_HALF_BYTES: usize = 16;
+
+/// Exact per-run token bytes.
+const RUN_TOKEN_BYTES: usize = RUN_TOKEN_HEX_HALF_BYTES * 2 + 1;
 
 /// Audit decision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -1088,7 +1091,7 @@ impl RunToken {
         Self::new(value).expect("test run token should be valid")
     }
 
-    /// Creates a bounded lower-hex two-part run token.
+    /// Creates a fixed-width lower-hex two-part run token.
     pub(crate) fn new(value: impl Into<String>) -> Result<Self, RunTokenError> {
         let text = value.into();
         validate_run_token(&text)?;
@@ -1133,7 +1136,7 @@ fn validate_run_token(text: &str) -> Result<(), RunTokenError> {
     if text.is_empty() {
         return Err(RunTokenError::Empty);
     }
-    if text.len() > MAX_RUN_TOKEN_BYTES {
+    if text.len() > RUN_TOKEN_BYTES {
         return Err(RunTokenError::TooLong);
     }
     if text
@@ -1142,11 +1145,22 @@ fn validate_run_token(text: &str) -> Result<(), RunTokenError> {
     {
         return Err(RunTokenError::InvalidCharacter);
     }
+    if text.len() != RUN_TOKEN_BYTES {
+        return Err(RunTokenError::InvalidShape);
+    }
 
-    let mut parts = text.split('-');
-    let first = parts.next().unwrap_or_default();
-    let second = parts.next();
-    if first.is_empty() || second.is_none_or(str::is_empty) || parts.next().is_some() {
+    let mut bytes = text.bytes();
+    if bytes
+        .by_ref()
+        .take(RUN_TOKEN_HEX_HALF_BYTES)
+        .any(|byte| byte == b'-')
+    {
+        return Err(RunTokenError::InvalidShape);
+    }
+    if bytes.next() != Some(b'-') {
+        return Err(RunTokenError::InvalidShape);
+    }
+    if bytes.any(|byte| byte == b'-') {
         return Err(RunTokenError::InvalidShape);
     }
     Ok(())
@@ -1196,7 +1210,7 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        MAX_RUN_TOKEN_BYTES, ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken,
+        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
         RunTokenError, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
@@ -1288,7 +1302,10 @@ mod tests {
         AuditRequestInput::new(
             Method::from_bytes(method.as_bytes()).expect("test method should parse"),
             target,
-            RequestId::from_parts(&RunToken::for_test("a-b"), request_sequence(1)),
+            RequestId::from_parts(
+                &RunToken::for_test("000000000000000a-000000000000000b"),
+                request_sequence(1),
+            ),
             body,
             UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
         )
@@ -1398,7 +1415,19 @@ mod tests {
             ("AB-cd".to_owned(), RunTokenError::InvalidCharacter),
             ("ab_cd-ef".to_owned(), RunTokenError::InvalidCharacter),
             ("ab\ncd-ef".to_owned(), RunTokenError::InvalidCharacter),
-            ("a".repeat(MAX_RUN_TOKEN_BYTES + 1), RunTokenError::TooLong),
+            (
+                "aaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb".to_owned(),
+                RunTokenError::InvalidShape,
+            ),
+            (
+                "aaaaaaaaaaaaaaa--bbbbbbbbbbbbbbbb".to_owned(),
+                RunTokenError::InvalidShape,
+            ),
+            (
+                "aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbb-".to_owned(),
+                RunTokenError::InvalidShape,
+            ),
+            ("a".repeat(RUN_TOKEN_BYTES + 1), RunTokenError::TooLong),
         ]);
 
         for (token, expected) in cases {
@@ -1412,17 +1441,18 @@ mod tests {
 
     #[test]
     fn run_token_accepts_production_shape() {
-        let token = RunToken::new("1a-2b").expect("production-shaped token should parse");
+        let token = RunToken::new("000000000000001a-000000000000002b")
+            .expect("production-shaped token should parse");
 
-        assert_eq!(token.as_str(), "1a-2b");
+        assert_eq!(token.as_str(), "000000000000001a-000000000000002b");
     }
 
     #[test]
-    fn run_token_accepts_the_maximum_supported_length() {
-        let text = format!("{}-{}", "a".repeat(31), "b".repeat(32));
-        assert_eq!(text.len(), MAX_RUN_TOKEN_BYTES);
+    fn run_token_accepts_the_exact_supported_length() {
+        let text = format!("{}-{}", "a".repeat(16), "b".repeat(16));
+        assert_eq!(text.len(), RUN_TOKEN_BYTES);
 
-        let token = RunToken::new(text.clone()).expect("maximum-length token should parse");
+        let token = RunToken::new(text.clone()).expect("exact-length token should parse");
 
         assert_eq!(token.as_str(), text);
     }
@@ -1475,7 +1505,10 @@ mod tests {
         assert_eq!(object.len(), expected_fields.len());
         assert_eq!(object["version"], 3_u64);
         assert_eq!(object["decision"], "denied");
-        assert_eq!(object["request_id"], "req-a-b-0000000000000001");
+        assert_eq!(
+            object["request_id"],
+            "req-000000000000000a-000000000000000b-0000000000000001"
+        );
         assert!(object["upstream_path"].is_null());
         assert!(object["upstream_query"].is_null());
         assert!(object["query"].is_null());
@@ -1699,7 +1732,7 @@ mod proptests {
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, ObservedBodySummary, RequestId,
-        ResponseBodyPrefix, RunToken,
+        ResponseBodyPrefix, RunToken, RunTokenError,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1763,8 +1796,11 @@ mod proptests {
     #[test]
     fn request_id_serializes_as_wire_text_across_json_encoders() {
         let sequence = NonZeroU64::new(15).expect("sequence should be non-zero");
-        let request_id = RequestId::from_parts(&RunToken::for_test("7e57-c0de"), sequence);
-        let expected = "\"req-7e57-c0de-000000000000000f\"";
+        let request_id = RequestId::from_parts(
+            &RunToken::for_test("0000000000007e57-000000000000c0de"),
+            sequence,
+        );
+        let expected = "\"req-0000000000007e57-000000000000c0de-000000000000000f\"";
 
         let string = serde_json::to_string(&request_id).expect("request id should serialize");
         let bytes = serde_json::to_vec(&request_id).expect("request id should serialize");
@@ -1774,7 +1810,10 @@ mod proptests {
         assert_eq!(string, expected);
         assert_eq!(bytes, expected.as_bytes());
         assert_eq!(raw_value.get(), expected);
-        assert_eq!(value.as_str(), Some("req-7e57-c0de-000000000000000f"));
+        assert_eq!(
+            value.as_str(),
+            Some("req-0000000000007e57-000000000000c0de-000000000000000f")
+        );
     }
 
     /// Generates observed non-empty body bytes.
@@ -1784,7 +1823,16 @@ mod proptests {
 
     /// Generates valid run tokens matching the production two-part shape.
     fn run_token_valid() -> impl Strategy<Value = String> {
-        ("[0-9a-f]{1,8}", "[0-9a-f]{1,16}").prop_map(|(first, second)| format!("{first}-{second}"))
+        ("[0-9a-f]{16}", "[0-9a-f]{16}").prop_map(|(first, second)| format!("{first}-{second}"))
+    }
+
+    /// Generates exact-length run tokens with misplaced separators.
+    fn run_token_invalid_shape() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("aaaaaaaaaaaaaaaaabbbbbbbbbbbbbbbb".to_owned()),
+            Just("aaaaaaaaaaaaaaa--bbbbbbbbbbbbbbbb".to_owned()),
+            Just("aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbb-".to_owned()),
+        ]
     }
 
     /// Returns a parsed method from generated method text.
@@ -2032,6 +2080,13 @@ mod proptests {
 
             let expected = format!("req-{run_token}-{sequence_value:016x}");
             prop_assert_eq!(value.as_str(), Some(expected.as_str()));
+        }
+
+        #[test]
+        fn run_token_rejects_generated_invalid_shapes(
+            run_token in run_token_invalid_shape(),
+        ) {
+            prop_assert_eq!(RunToken::new(run_token), Err(RunTokenError::InvalidShape));
         }
 
         #[test]
