@@ -30,6 +30,22 @@ enum Command {
 impl Cli {
     /// Runs the selected command.
     ///
+    /// ```
+    /// use clap::Parser as _;
+    /// use custode::Cli;
+    ///
+    /// let cli = Cli::try_parse_from([
+    ///     "custode-proxy",
+    ///     "serve",
+    ///     "--upstream-origin",
+    ///     "https://api.openai.com",
+    /// ])?;
+    /// let result = tokio::runtime::Runtime::new()?.block_on(cli.run());
+    ///
+    /// assert!(result.is_err());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    ///
     /// # Errors
     ///
     /// Returns an error when configuration parsing, serving, or healthchecking
@@ -55,6 +71,24 @@ pub struct RunError {
 
 impl RunError {
     /// Returns the process exit code for this error.
+    ///
+    /// ```
+    /// use clap::Parser as _;
+    /// use custode::Cli;
+    ///
+    /// let cli = Cli::try_parse_from([
+    ///     "custode-proxy",
+    ///     "serve",
+    ///     "--upstream-origin",
+    ///     "https://api.openai.com",
+    /// ])?;
+    /// let error = tokio::runtime::Runtime::new()?
+    ///     .block_on(cli.run())
+    ///     .expect_err("empty allowlist should fail closed");
+    ///
+    /// let _exit_code = error.exit_code();
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
     #[inline]
     #[must_use]
     pub const fn exit_code(&self) -> ExitCode {
