@@ -63,6 +63,8 @@ pub(super) struct Scenario {
     audit: ScenarioAudit,
     /// Scenario byte bounds.
     bounds: ScenarioBounds,
+    /// Downstream response consumption behavior.
+    downstream: ScenarioDownstream,
     /// Harness request shape.
     request: ScenarioRequest,
     /// Scripted upstream behavior.
@@ -78,6 +80,8 @@ pub(super) struct ScenarioClass {
     audit: ScenarioAudit,
     /// Scenario byte bounds.
     bounds: ScenarioBounds,
+    /// Downstream response consumption behavior.
+    downstream: ScenarioDownstream,
     /// Scripted upstream behavior.
     upstream: ScenarioUpstream,
 }
@@ -110,6 +114,19 @@ pub(super) enum ScenarioBounds {
 
     /// Configure a response limit smaller than the scripted success chunk.
     TinyResponse,
+}
+
+/// Downstream response consumption behavior for a deterministic scenario.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioDownstream {
+    /// Consume the full response body.
+    ConsumeAll,
+
+    /// Drop the downstream body after the first chunk and before the final chunk.
+    DropBeforeFinalChunk,
+
+    /// Drop the downstream body before the first chunk can be received.
+    DropBeforeFirstChunk,
 }
 
 /// Harness request shape for a deterministic gateway scenario.
@@ -315,6 +332,12 @@ impl Scenario {
         self.bounds
     }
 
+    /// Returns the downstream response consumption behavior.
+    #[must_use]
+    pub(super) const fn downstream(&self) -> ScenarioDownstream {
+        self.downstream
+    }
+
     /// Builds a deterministic gateway scenario.
     #[must_use]
     pub(super) const fn new(request: ScenarioRequest, upstream: ScenarioUpstream) -> Self {
@@ -322,6 +345,7 @@ impl Scenario {
             admission: ScenarioAdmission::Open,
             audit: ScenarioAudit::Record,
             bounds: ScenarioBounds::Roomy,
+            downstream: ScenarioDownstream::ConsumeAll,
             request,
             upstream,
         }
@@ -346,6 +370,7 @@ impl Scenario {
             admission: class.admission,
             audit: class.audit,
             bounds: class.bounds,
+            downstream: class.downstream,
             request,
             upstream: class.upstream,
         }
@@ -356,7 +381,7 @@ impl ScenarioClass {
     /// Returns every scenario fault-class combination.
     #[must_use]
     pub(super) fn all() -> Vec<Self> {
-        let mut classes = Vec::with_capacity(24);
+        let mut classes = Vec::with_capacity(26);
         for admission in [ScenarioAdmission::Open, ScenarioAdmission::Saturated] {
             for audit in [ScenarioAudit::FailFirst, ScenarioAudit::Record] {
                 for bounds in [ScenarioBounds::Roomy, ScenarioBounds::TinyResponse] {
@@ -369,11 +394,24 @@ impl ScenarioClass {
                             admission,
                             audit,
                             bounds,
+                            downstream: ScenarioDownstream::ConsumeAll,
                             upstream,
                         });
                     }
                 }
             }
+        }
+        for downstream in [
+            ScenarioDownstream::DropBeforeFirstChunk,
+            ScenarioDownstream::DropBeforeFinalChunk,
+        ] {
+            classes.push(Self {
+                admission: ScenarioAdmission::Open,
+                audit: ScenarioAudit::Record,
+                bounds: ScenarioBounds::Roomy,
+                downstream,
+                upstream: ScenarioUpstream::Respond,
+            });
         }
         classes
     }
@@ -522,7 +560,18 @@ fn scripted_response() -> UpstreamResponse {
     UpstreamResponse::new(
         StatusCode::CREATED,
         ::http::HeaderMap::new(),
-        stream::iter([Ok(Bytes::from_static(b"scripted"))]).boxed(),
+        stream::unfold(0_u8, |step| async move {
+            match step {
+                0 => Some((Ok(Bytes::from_static(b"script")), 1)),
+                1 => Some((Ok(Bytes::from_static(b"ed")), 2)),
+                2 => {
+                    sleep(Duration::from_secs(1)).await;
+                    None
+                }
+                _ => None,
+            }
+        })
+        .boxed(),
     )
 }
 

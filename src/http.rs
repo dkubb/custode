@@ -683,7 +683,7 @@ mod tests {
         use super::{ScenarioBody, ScenarioRun, run_scenario};
         use crate::sim::{
             Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
-            ScenarioRequest, ScenarioUpstream, scenario_any,
+            ScenarioDownstream, ScenarioRequest, ScenarioUpstream, scenario_any,
         };
         use axum::body::Bytes;
         use http::{Method, StatusCode};
@@ -762,8 +762,13 @@ mod tests {
         fn expected_audit_outcome(
             scenario: &Scenario,
         ) -> Result<(&'static str, Value, StatusCode, u64, Value, bool), TestCaseError> {
-            match (scenario.admission(), scenario.bounds(), scenario.upstream()) {
-                (ScenarioAdmission::Saturated, _, _) => Ok((
+            match (
+                scenario.admission(),
+                scenario.bounds(),
+                scenario.downstream(),
+                scenario.upstream(),
+            ) {
+                (ScenarioAdmission::Saturated, _, _, _) => Ok((
                     "denied",
                     Value::String("too_many_requests".to_owned()),
                     StatusCode::TOO_MANY_REQUESTS,
@@ -771,7 +776,7 @@ mod tests {
                     not_observed_body_value(),
                     false,
                 )),
-                (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => Ok((
+                (ScenarioAdmission::Open, _, _, ScenarioUpstream::Timeout) => Ok((
                     "upstream_error",
                     Value::String("upstream_timeout".to_owned()),
                     StatusCode::GATEWAY_TIMEOUT,
@@ -779,7 +784,7 @@ mod tests {
                     not_observed_body_value(),
                     true,
                 )),
-                (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _) => Ok((
+                (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _, _) => Ok((
                     "response_error",
                     Value::String("response_body_too_large".to_owned()),
                     StatusCode::CREATED,
@@ -787,26 +792,58 @@ mod tests {
                     empty_body_value(),
                     true,
                 )),
-                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::StreamError) => {
-                    Ok((
-                        "response_error",
-                        Value::String("upstream_response_stream_failed".to_owned()),
-                        StatusCode::CREATED,
-                        5,
-                        audit_body_value(b"first")?,
-                        true,
-                    ))
-                }
-                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
-                    Ok((
-                        "allowed",
-                        Value::Null,
-                        StatusCode::CREATED,
-                        8,
-                        audit_body_value(b"scripted")?,
-                        true,
-                    ))
-                }
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioBounds::Roomy,
+                    _,
+                    ScenarioUpstream::StreamError,
+                ) => Ok((
+                    "response_error",
+                    Value::String("upstream_response_stream_failed".to_owned()),
+                    StatusCode::CREATED,
+                    5,
+                    audit_body_value(b"first")?,
+                    true,
+                )),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Respond,
+                ) => Ok((
+                    "allowed",
+                    Value::Null,
+                    StatusCode::CREATED,
+                    8,
+                    audit_body_value(b"scripted")?,
+                    true,
+                )),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFirstChunk,
+                    ScenarioUpstream::Respond,
+                ) => Ok((
+                    "response_error",
+                    Value::String("downstream_closed".to_owned()),
+                    StatusCode::CREATED,
+                    6,
+                    audit_body_value(b"script")?,
+                    true,
+                )),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFinalChunk,
+                    ScenarioUpstream::Respond,
+                ) => Ok((
+                    "response_error",
+                    Value::String("downstream_closed".to_owned()),
+                    StatusCode::CREATED,
+                    8,
+                    audit_body_value(b"scripted")?,
+                    true,
+                )),
             }
         }
 
@@ -816,33 +853,55 @@ mod tests {
                 scenario.admission(),
                 scenario.audit(),
                 scenario.bounds(),
+                scenario.downstream(),
                 scenario.upstream(),
             ) {
-                (ScenarioAdmission::Saturated, _, _, _)
-                | (ScenarioAdmission::Open, _, _, ScenarioUpstream::Timeout) => {
+                (ScenarioAdmission::Saturated, _, _, _, _)
+                | (ScenarioAdmission::Open, _, _, _, ScenarioUpstream::Timeout) => {
                     ScenarioBody::Complete(Bytes::new())
                 }
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::FailFirst,
                     _,
+                    _,
                     ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
                 ) => ScenarioBody::Error(
                     "failed to write audit event: scripted audit failure".to_owned(),
                 ),
-                (ScenarioAdmission::Open, _, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
-                    ScenarioBody::Complete(Bytes::from_static(b"scripted"))
-                }
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
                     ScenarioBounds::TinyResponse,
+                    _,
                     ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
                 ) => ScenarioBody::Error("response_body_too_large".to_owned()),
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
                     ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Respond,
+                ) => ScenarioBody::Complete(Bytes::from_static(b"scripted")),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFirstChunk,
+                    ScenarioUpstream::Respond,
+                ) => ScenarioBody::Dropped(Bytes::new()),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFinalChunk,
+                    ScenarioUpstream::Respond,
+                ) => ScenarioBody::Dropped(Bytes::from_static(b"script")),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    _,
                     ScenarioUpstream::StreamError,
                 ) => ScenarioBody::Error("scripted upstream stream failed".to_owned()),
             }
@@ -1091,7 +1150,7 @@ mod tests {
         fn generated_fault_classes_cover_every_combination() {
             let classes = ScenarioClass::all();
 
-            assert_eq!(classes.len(), 24);
+            assert_eq!(classes.len(), 26);
             for class in classes {
                 let scenario = Scenario::with_class(
                     class,
@@ -1140,7 +1199,8 @@ mod tests {
     };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
-        ScenarioBounds, ScenarioRequest, ScenarioUpstream, ScriptedUpstreamClient,
+        ScenarioBounds, ScenarioDownstream, ScenarioRequest, ScenarioUpstream,
+        ScriptedUpstreamClient,
     };
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
@@ -1156,6 +1216,7 @@ mod tests {
     use core::time::Duration;
     use futures_util::StreamExt as _;
     use futures_util::stream;
+    use http_body_util::BodyExt as _;
     use pretty_assertions::assert_eq;
     use reqwest::Client;
     use serde_json::{Map, Value};
@@ -1200,6 +1261,9 @@ mod tests {
     enum ScenarioBody {
         /// Response body completed successfully.
         Complete(Bytes),
+
+        /// Response body was dropped before completion.
+        Dropped(Bytes),
 
         /// Response body ended with an error.
         Error(String),
@@ -1431,10 +1495,8 @@ mod tests {
             .expect("scenario proxy should respond");
 
         let status = response.status();
-        let response_body = match to_bytes(response.into_body(), 1_024).await {
-            Ok(bytes) => ScenarioBody::Complete(bytes),
-            Err(error) => ScenarioBody::Error(error.to_string()),
-        };
+        let response_body =
+            consume_scenario_response(response.into_body(), scenario.downstream()).await;
         let captured_upstream_requests = upstream_recorder
             .lock()
             .expect("scripted upstream should not be poisoned")
@@ -1457,6 +1519,49 @@ mod tests {
             status,
             upstream_requests: captured_upstream_requests,
         }
+    }
+
+    /// Consumes a scenario response according to downstream behavior.
+    async fn consume_scenario_response(body: Body, downstream: ScenarioDownstream) -> ScenarioBody {
+        match downstream {
+            ScenarioDownstream::ConsumeAll => complete_scenario_response(body).await,
+            ScenarioDownstream::DropBeforeFirstChunk => drop_before_first_chunk(body).await,
+            ScenarioDownstream::DropBeforeFinalChunk => drop_before_final_chunk(body).await,
+        }
+    }
+
+    /// Consumes the full scenario response body.
+    async fn complete_scenario_response(body: Body) -> ScenarioBody {
+        match to_bytes(body, 1_024).await {
+            Ok(bytes) => ScenarioBody::Complete(bytes),
+            Err(error) => ScenarioBody::Error(error.to_string()),
+        }
+    }
+
+    /// Drops the scenario response before receiving any body bytes.
+    async fn drop_before_first_chunk(body: Body) -> ScenarioBody {
+        drop(body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        ScenarioBody::Dropped(Bytes::new())
+    }
+
+    /// Receives the first data frame, then drops the scenario response body.
+    async fn drop_before_final_chunk(mut body: Body) -> ScenarioBody {
+        let first_chunk = loop {
+            let frame = match body.frame().await {
+                Some(Ok(frame)) => frame,
+                Some(Err(error)) => return ScenarioBody::Error(error.to_string()),
+                None => return ScenarioBody::Complete(Bytes::new()),
+            };
+            if let Ok(bytes) = frame.into_data() {
+                break bytes;
+            }
+        };
+        drop(body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+        ScenarioBody::Dropped(first_chunk)
     }
 
     /// Builds an upstream router that streams two chunks with a delay between.
