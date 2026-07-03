@@ -155,7 +155,8 @@ The local gate vocabulary is:
   and fails when missed regions, functions, lines, or branches exceed the
   documented ratchet outside inline test modules.
 - `just mutants` runs `cargo-mutants` mutation testing.
-- `just check` runs formatting, linting, tests, and the Dockerfile check.
+- `just check` runs Rust formatting, Rust linting, shell checks, tests, and
+  the Dockerfile check.
 - `just ci` runs `check` plus `deny`.
 
 Gates never skip silently: a recipe fails when its tool is missing rather
