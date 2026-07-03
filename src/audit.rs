@@ -6,7 +6,6 @@ use crate::config::{AuditEventBytes, GatewayConfig, UpstreamOrigin};
 use ::http::{Method, StatusCode};
 use core::fmt;
 use core::num::NonZeroU64;
-use non_empty_string::NonEmptyString;
 use serde::{Serialize, Serializer};
 use std::io;
 use std::io::SeekFrom;
@@ -21,9 +20,14 @@ use tokio::io::{
 use tokio::sync::Mutex;
 
 /// Hex bytes in one half of a per-run token.
+#[cfg(test)]
 const RUN_TOKEN_HEX_HALF_BYTES: usize = 16;
 
+/// Random bytes in a per-run token.
+pub(crate) const RUN_TOKEN_RANDOM_BYTES: usize = 16;
+
 /// Exact per-run token bytes.
+#[cfg(test)]
 const RUN_TOKEN_BYTES: usize = RUN_TOKEN_HEX_HALF_BYTES * 2 + 1;
 
 /// Audit decision.
@@ -421,13 +425,14 @@ pub(crate) struct RequestId {
 }
 
 /// Bounded per-run token used in request identities.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RunToken {
-    /// Bounded lower-hex two-part run token text.
-    value: NonEmptyString,
+    /// Per-run entropy bytes.
+    entropy: [u8; RUN_TOKEN_RANDOM_BYTES],
 }
 
 /// Run token rejection.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunTokenError {
     /// Token was empty.
@@ -1104,9 +1109,9 @@ impl RequestId {
     /// The sequence is unique within a run; the random run token makes
     /// cross-run collisions negligible under the OS RNG assumption.
     #[must_use]
-    pub(crate) fn from_parts(run_token: &RunToken, sequence: NonZeroU64) -> Self {
+    pub(crate) const fn from_parts(run_token: &RunToken, sequence: NonZeroU64) -> Self {
         Self {
-            run_token: run_token.clone(),
+            run_token: *run_token,
             sequence,
         }
     }
@@ -1129,12 +1134,6 @@ impl Serialize for RequestId {
 }
 
 impl RunToken {
-    /// Returns the run token as a string slice.
-    #[must_use]
-    fn as_str(&self) -> &str {
-        self.value.as_str()
-    }
-
     /// Creates a valid run token for tests.
     #[cfg(test)]
     #[must_use]
@@ -1142,19 +1141,44 @@ impl RunToken {
         Self::new(value).expect("test run token should be valid")
     }
 
+    /// Creates a run token from per-run entropy.
+    #[must_use]
+    pub(crate) const fn from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> Self {
+        Self { entropy }
+    }
+
     /// Creates a fixed-width lower-hex two-part run token.
-    pub(crate) fn new(value: impl Into<String>) -> Result<Self, RunTokenError> {
-        let text = value.into();
-        validate_run_token(&text)?;
-        NonEmptyString::new(text)
-            .map(|non_empty| Self { value: non_empty })
-            .map_err(|_empty| RunTokenError::Empty)
+    #[cfg(test)]
+    pub(crate) fn new(value: impl AsRef<str>) -> Result<Self, RunTokenError> {
+        parse_run_token(value.as_ref()).map(Self::from_entropy)
     }
 }
 
 impl fmt::Display for RunToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        let [
+            a0,
+            a1,
+            a2,
+            a3,
+            a4,
+            a5,
+            a6,
+            a7,
+            b0,
+            b1,
+            b2,
+            b3,
+            b4,
+            b5,
+            b6,
+            b7,
+        ] = self.entropy;
+        write!(
+            f,
+            "{a0:02x}{a1:02x}{a2:02x}{a3:02x}{a4:02x}{a5:02x}{a6:02x}{a7:02x}-\
+             {b0:02x}{b1:02x}{b2:02x}{b3:02x}{b4:02x}{b5:02x}{b6:02x}{b7:02x}"
+        )
     }
 }
 
@@ -1212,39 +1236,135 @@ async fn classify_audit_log_tail(reader: &mut dyn AuditLogTailReader) -> io::Res
     }
 }
 
-/// Validates the run token grammar.
-fn validate_run_token(text: &str) -> Result<(), RunTokenError> {
+/// Parses a run token into its entropy bytes.
+#[cfg(test)]
+fn parse_run_token(text: &str) -> Result<[u8; RUN_TOKEN_RANDOM_BYTES], RunTokenError> {
     if text.is_empty() {
         return Err(RunTokenError::Empty);
     }
     if text.len() > RUN_TOKEN_BYTES {
         return Err(RunTokenError::TooLong);
     }
-    if text
-        .bytes()
-        .any(|byte| !matches!(byte, b'0'..=b'9' | b'a'..=b'f' | b'-'))
+
+    let &[
+        d0,
+        d1,
+        d2,
+        d3,
+        d4,
+        d5,
+        d6,
+        d7,
+        d8,
+        d9,
+        d10,
+        d11,
+        d12,
+        d13,
+        d14,
+        d15,
+        separator,
+        d16,
+        d17,
+        d18,
+        d19,
+        d20,
+        d21,
+        d22,
+        d23,
+        d24,
+        d25,
+        d26,
+        d27,
+        d28,
+        d29,
+        d30,
+        d31,
+    ] = text.as_bytes()
+    else {
+        if has_invalid_run_token_character(text) {
+            return Err(RunTokenError::InvalidCharacter);
+        }
+        return Err(RunTokenError::InvalidShape);
+    };
+
+    let pairs = [
+        (d0, d1),
+        (d2, d3),
+        (d4, d5),
+        (d6, d7),
+        (d8, d9),
+        (d10, d11),
+        (d12, d13),
+        (d14, d15),
+        (d16, d17),
+        (d18, d19),
+        (d20, d21),
+        (d22, d23),
+        (d24, d25),
+        (d26, d27),
+        (d28, d29),
+        (d30, d31),
+    ];
+
+    if pairs
+        .iter()
+        .copied()
+        .any(|(high, low)| high == b'-' || low == b'-')
     {
-        return Err(RunTokenError::InvalidCharacter);
+        return Err(RunTokenError::InvalidShape);
     }
-    if text.len() != RUN_TOKEN_BYTES {
+    if separator != b'-' {
+        if token_nibble(separator).is_none() {
+            return Err(RunTokenError::InvalidCharacter);
+        }
         return Err(RunTokenError::InvalidShape);
     }
 
-    let mut bytes = text.bytes();
-    if bytes
-        .by_ref()
-        .take(RUN_TOKEN_HEX_HALF_BYTES)
-        .any(|byte| byte == b'-')
-    {
-        return Err(RunTokenError::InvalidShape);
+    let mut entropy = [0_u8; RUN_TOKEN_RANDOM_BYTES];
+    for (byte, (high, low)) in entropy.iter_mut().zip(pairs) {
+        *byte = parse_run_token_byte(high, low)?;
     }
-    if bytes.next() != Some(b'-') {
-        return Err(RunTokenError::InvalidShape);
+    Ok(entropy)
+}
+
+/// Returns whether text contains a byte that cannot appear in a run token.
+#[cfg(test)]
+fn has_invalid_run_token_character(text: &str) -> bool {
+    text.bytes()
+        .any(|byte| byte != b'-' && token_nibble(byte).is_none())
+}
+
+/// Parses one run-token byte from a high and low lower-hex digit.
+#[cfg(test)]
+fn parse_run_token_byte(high: u8, low: u8) -> Result<u8, RunTokenError> {
+    let high_nibble = token_nibble(high).ok_or(RunTokenError::InvalidCharacter)?;
+    let low_nibble = token_nibble(low).ok_or(RunTokenError::InvalidCharacter)?;
+    Ok((high_nibble << 4_u8) | low_nibble)
+}
+
+/// Converts a lower-hex digit to a nibble.
+#[cfg(test)]
+const fn token_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0' => Some(0),
+        b'1' => Some(1),
+        b'2' => Some(2),
+        b'3' => Some(3),
+        b'4' => Some(4),
+        b'5' => Some(5),
+        b'6' => Some(6),
+        b'7' => Some(7),
+        b'8' => Some(8),
+        b'9' => Some(9),
+        b'a' => Some(10),
+        b'b' => Some(11),
+        b'c' => Some(12),
+        b'd' => Some(13),
+        b'e' => Some(14),
+        b'f' => Some(15),
+        _other => None,
     }
-    if bytes.any(|byte| byte == b'-') {
-        return Err(RunTokenError::InvalidShape);
-    }
-    Ok(())
 }
 
 /// Serializes one bounded audit event as NDJSON bytes.
@@ -1722,6 +1842,10 @@ mod tests {
                 RunTokenError::InvalidShape,
             ),
             (
+                "aaaaaaaaaaaaaa-a-bbbbbbbbbbbbbbbb".to_owned(),
+                RunTokenError::InvalidShape,
+            ),
+            (
                 "aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbb-".to_owned(),
                 RunTokenError::InvalidShape,
             ),
@@ -1742,7 +1866,7 @@ mod tests {
         let token = RunToken::new("000000000000001a-000000000000002b")
             .expect("production-shaped token should parse");
 
-        assert_eq!(token.as_str(), "000000000000001a-000000000000002b");
+        assert_eq!(token.to_string(), "000000000000001a-000000000000002b");
     }
 
     #[test]
@@ -1752,7 +1876,7 @@ mod tests {
 
         let token = RunToken::new(text.clone()).expect("exact-length token should parse");
 
-        assert_eq!(token.as_str(), text);
+        assert_eq!(token.to_string(), text);
     }
 
     #[test]
@@ -2360,6 +2484,37 @@ mod proptests {
     /// Opens an audit writer on a local test runtime.
     fn open_writer(config: &GatewayConfig) -> Result<AuditWriter, super::AuditError> {
         audit_runtime().block_on(AuditWriter::open(config))
+    }
+
+    #[test]
+    fn run_token_parser_covers_each_boundary_class() {
+        let all_digits = "0123456789abcdef-fedcba9876543210";
+
+        let token = RunToken::new(all_digits).expect("all lower-hex digits should parse");
+
+        assert_eq!(token.to_string(), all_digits);
+        assert_eq!(RunToken::new(""), Err(RunTokenError::Empty));
+        assert_eq!(
+            RunToken::new("g123456789abcdef-fedcba9876543210"),
+            Err(RunTokenError::InvalidCharacter),
+        );
+        assert_eq!(
+            RunToken::new("0g23456789abcdef-fedcba9876543210"),
+            Err(RunTokenError::InvalidCharacter),
+        );
+        assert_eq!(
+            RunToken::new("0123456789abcdef_fedcba9876543210"),
+            Err(RunTokenError::InvalidCharacter),
+        );
+        assert_eq!(RunToken::new("AB-cd"), Err(RunTokenError::InvalidCharacter),);
+        assert_eq!(
+            RunToken::new("0123456789abcdef-fedcba9876543210f"),
+            Err(RunTokenError::TooLong),
+        );
+        assert_eq!(
+            RunToken::new("0123456789abcdef0fedcba987654321"),
+            Err(RunTokenError::InvalidShape),
+        );
     }
 
     #[test]

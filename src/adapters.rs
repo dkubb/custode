@@ -1,6 +1,9 @@
 //! Production runtime adapters.
 
-use crate::audit::{AuditError, AuditEvent, AuditTimestamp, AuditWriter, RequestId, RunToken};
+use crate::audit::{
+    AuditError, AuditEvent, AuditTimestamp, AuditWriter, RUN_TOKEN_RANDOM_BYTES, RequestId,
+    RunToken,
+};
 use crate::ports::{
     AuditSink, BoxFuture, Clock, RequestIdError, RequestIdSource, UpstreamBodyError,
     UpstreamClient, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
@@ -11,9 +14,6 @@ use futures_util::StreamExt as _;
 use std::fs::File;
 use std::io::Read as _;
 use thiserror::Error;
-
-/// Number of OS-random bytes embedded in a production run token.
-const RUN_TOKEN_RANDOM_BYTES: usize = 16;
 
 /// Production audit timestamp source.
 #[derive(Clone, Copy, Debug)]
@@ -169,30 +169,8 @@ impl ReqwestErrorView for reqwest::Error {
 }
 
 /// Builds a run token from 128 bits of entropy.
-fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunToken {
-    let [
-        a0,
-        a1,
-        a2,
-        a3,
-        a4,
-        a5,
-        a6,
-        a7,
-        b0,
-        b1,
-        b2,
-        b3,
-        b4,
-        b5,
-        b6,
-        b7,
-    ] = entropy;
-    let run_token = format!(
-        "{a0:02x}{a1:02x}{a2:02x}{a3:02x}{a4:02x}{a5:02x}{a6:02x}{a7:02x}-\
-         {b0:02x}{b1:02x}{b2:02x}{b3:02x}{b4:02x}{b5:02x}{b6:02x}{b7:02x}"
-    );
-    RunToken::new(run_token).expect("entropy-formatted run token should be valid")
+const fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunToken {
+    RunToken::from_entropy(entropy)
 }
 
 /// Creates an upstream body error from reqwest.
@@ -447,7 +425,7 @@ mod tests {
         let run_token = RunToken::for_test("000000000000000a-000000000000000b");
         let request_ids = SequentialRequestIds {
             last_allocated: AtomicU64::new(u64::MAX - 1),
-            run_token: run_token.clone(),
+            run_token,
         };
 
         let final_id = request_ids
