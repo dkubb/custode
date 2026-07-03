@@ -37,7 +37,9 @@ coverage:
     scripts/check-coverage-summary.sh target/coverage/unit.json
 
 coverage-proptests:
-    PROPTEST_RNG_SEED=00000000000000000000000000000014 cargo coverage-proptests
+    PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
+        PROPTEST_RNG_SEED=00000000000000000000000000000014 \
+        cargo coverage-proptests
     scripts/check-coverage-summary.sh \
         --exclude-test-mods \
         --max-missed-regions 595 \
