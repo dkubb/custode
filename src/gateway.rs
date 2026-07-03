@@ -299,6 +299,7 @@ mod tests {
     use axum::body::Body;
     use core::num::NonZeroUsize;
     use pretty_assertions::{assert_eq, assert_ne};
+    use serde_json::{Map, Value};
     use std::path::Path;
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
@@ -350,6 +351,37 @@ mod tests {
         .expect("request body should be accounted")
     }
 
+    /// Expected serialized empty body summary.
+    fn empty_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("empty".to_owned()),
+        )]))
+    }
+
+    /// Expected serialized non-empty body summary.
+    fn non_empty_body_value(body: &[u8]) -> Value {
+        Value::Object(Map::from_iter([
+            (
+                "blake3".to_owned(),
+                Value::String(blake3::hash(body).to_hex().to_string()),
+            ),
+            (
+                "bytes".to_owned(),
+                Value::from(u64::try_from(body.len()).expect("test body length should fit u64")),
+            ),
+            ("state".to_owned(), Value::String("non_empty".to_owned())),
+        ]))
+    }
+
+    /// Expected serialized unobserved body summary.
+    fn not_observed_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("not_observed".to_owned()),
+        )]))
+    }
+
     #[tokio::test]
     async fn next_request_id_is_unique_per_request() {
         let directory = tempdir().expect("temporary directory should be created");
@@ -384,12 +416,7 @@ mod tests {
         assert_eq!(event["method"], "CONNECT");
         assert_eq!(event["path"], "/");
         assert_eq!(event["status"], 405_u16);
-        assert_eq!(event["request_bytes"], 0_u64);
-        assert_eq!(event["request_body_observed"], false);
-        assert!(
-            event["request_body_blake3"].is_null(),
-            "denials before body observation should have no request digest"
-        );
+        assert_eq!(event["request_body"], not_observed_body_value());
     }
 
     #[tokio::test]
@@ -411,12 +438,7 @@ mod tests {
             .expect("denial audit should be written");
 
         let event = &single_audit_event(directory.path()).await;
-        assert_eq!(event["request_body_observed"], true);
-        assert_eq!(event["request_bytes"], 0_u64);
-        assert!(
-            event["request_body_blake3"].is_null(),
-            "observed empty bodies should have no request digest"
-        );
+        assert_eq!(event["request_body"], empty_body_value());
     }
 
     #[tokio::test]
@@ -438,12 +460,32 @@ mod tests {
             .expect("denial audit should be written");
 
         let event = &single_audit_event(directory.path()).await;
-        assert_eq!(event["request_body_observed"], true);
-        assert_eq!(event["request_bytes"], 5_u64);
-        assert!(
-            event["request_body_blake3"].is_string(),
-            "denials with a body should record its digest"
-        );
+        assert_eq!(event["request_body"], non_empty_body_value(b"hello"));
+    }
+
+    #[tokio::test]
+    async fn audit_response_records_observed_empty_response_bodies() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+        let request_body = accounted_body(Body::empty()).await;
+        let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
+        let input = ResponseAuditInput {
+            method: "GET".to_owned(),
+            outcome: ResponseAuditOutcome::allowed(&response_account, 200),
+            request_body,
+            request_id: RequestId::from_parts("run", 1),
+            target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
+        };
+
+        gateway
+            .audit_response(input)
+            .await
+            .expect("response audit should be written");
+
+        let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["request_body"], empty_body_value());
+        assert_eq!(event["response_body"], empty_body_value());
     }
 
     #[tokio::test]
@@ -472,15 +514,10 @@ mod tests {
         let event = &single_audit_event(directory.path()).await;
         assert_eq!(event["decision"], "allowed");
         assert_eq!(event["status"], 200_u16);
-        assert_eq!(event["response_bytes"], 5_u64);
         assert_eq!(event["upstream_path"], "/v1/models");
         assert_eq!(event["upstream_query"], "limit=1");
-        assert_eq!(event["request_body_observed"], true);
-        assert_eq!(event["response_body_observed"], true);
-        assert!(
-            event["response_body_blake3"].is_string(),
-            "completed responses should record a body digest"
-        );
+        assert_eq!(event["request_body"], empty_body_value());
+        assert_eq!(event["response_body"], non_empty_body_value(b"world"));
     }
 
     #[tokio::test]

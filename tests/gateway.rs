@@ -26,7 +26,7 @@ use axum::http::{HeaderMap, Request};
 use axum::routing::any;
 use core::net::SocketAddr;
 use core::time::Duration;
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::env::temp_dir;
 use std::fs::{DirBuilder, remove_dir};
 use std::io::Error;
@@ -254,6 +254,29 @@ impl Drop for GatewayTestLock {
     }
 }
 
+/// Expected serialized empty body summary.
+fn empty_body_value() -> Value {
+    Value::Object(Map::from_iter([(
+        "state".to_owned(),
+        Value::String("empty".to_owned()),
+    )]))
+}
+
+/// Expected serialized non-empty body summary.
+fn non_empty_body_value(body: &[u8]) -> Value {
+    Value::Object(Map::from_iter([
+        (
+            "blake3".to_owned(),
+            Value::String(blake3::hash(body).to_hex().to_string()),
+        ),
+        (
+            "bytes".to_owned(),
+            Value::from(u64::try_from(body.len()).expect("test body length should fit u64")),
+        ),
+        ("state".to_owned(), Value::String("non_empty".to_owned())),
+    ]))
+}
+
 /// Records one upstream request and returns a fixed body.
 async fn record(State(recorder): State<Recorder>, request: Request<Body>) -> &'static str {
     let (parts, body_stream) = request.into_parts();
@@ -472,8 +495,8 @@ fn wait_for_failure(mut child: Child) -> bool {
 mod tests {
     use super::{
         Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio,
-        free_local_addr, raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy,
-        start_upstream, tempdir, wait_for_failure,
+        empty_body_value, free_local_addr, non_empty_body_value, raw_response_status_line, sleep,
+        spawn_gateway_command, start_fake_proxy, start_upstream, tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
 
@@ -549,9 +572,9 @@ mod tests {
         assert_eq!(event["decision"], "allowed");
         assert_eq!(event["upstream_path"], "/v1/models");
         assert_eq!(event["status"], 200_u64);
-        assert_eq!(event["request_body_observed"], true);
-        assert_eq!(event["response_body_observed"], true);
-        assert_eq!(event["version"], 2_u64);
+        assert_eq!(event["request_body"], empty_body_value());
+        assert_eq!(event["response_body"], non_empty_body_value(b"ok"));
+        assert_eq!(event["version"], 3_u64);
     }
 
     #[tokio::test]
@@ -655,11 +678,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = events.first().expect("one audit event should exist");
         assert_eq!(event["decision"], "denied");
-        assert_eq!(event["request_bytes"], serde_json::Value::from(body.len()));
-        assert_eq!(
-            event["request_body_blake3"],
-            serde_json::Value::String(blake3::hash(body).to_hex().to_string())
-        );
+        assert_eq!(event["request_body"], non_empty_body_value(body));
         assert!(event["upstream_path"].is_null());
     }
 

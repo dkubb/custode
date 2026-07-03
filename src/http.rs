@@ -692,21 +692,15 @@ mod tests {
         use tokio::runtime::Builder;
 
         /// Serialized audit event field names.
-        const AUDIT_FIELDS: [&str; 20] = [
+        const AUDIT_FIELDS: [&str; 14] = [
             "decision",
             "error_class",
             "method",
             "path",
             "query",
-            "request_body_blake3",
-            "request_body_observed",
             "request_body",
-            "request_bytes",
             "request_id",
-            "response_body_blake3",
-            "response_body_observed",
             "response_body",
-            "response_bytes",
             "status",
             "timestamp",
             "upstream_origin",
@@ -736,16 +730,6 @@ mod tests {
                     ("state".to_owned(), Value::String("non_empty".to_owned())),
                 ])))
             }
-        }
-
-        fn audit_body_flat_fields(summary: &Value) -> (Value, bool, u64) {
-            let digest = summary.get("blake3").cloned().unwrap_or(Value::Null);
-            let observed = summary.get("state").and_then(Value::as_str) != Some("not_observed");
-            let bytes = summary
-                .get("bytes")
-                .and_then(Value::as_u64)
-                .unwrap_or_default();
-            (digest, observed, bytes)
         }
 
         /// Returns lower-case headers named by generated connection headers.
@@ -980,11 +964,6 @@ mod tests {
 
             let (decision, error_class, status, response_bytes, response_body, has_upstream) =
                 expected_audit_outcome(scenario)?;
-            let request_body = request_body_value_for_audit(scenario)?;
-            let (request_digest, request_observed, request_bytes) =
-                audit_body_flat_fields(&request_body);
-            let (response_digest, response_observed, flat_response_bytes) =
-                audit_body_flat_fields(&response_body);
             let path = request_path(scenario.request().target());
             let query = query_value(scenario.request().target());
             prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
@@ -995,20 +974,11 @@ mod tests {
             );
             prop_assert_eq!(&object["path"], &Value::String(path.to_owned()));
             prop_assert_eq!(&object["query"], &query);
-            prop_assert_eq!(&object["request_body_blake3"], &request_digest);
             prop_assert_eq!(
-                &object["request_body_observed"],
-                &Value::Bool(request_observed)
-            );
-            prop_assert_eq!(&object["request_body"], &request_body);
-            prop_assert_eq!(&object["request_bytes"], &Value::from(request_bytes));
-            prop_assert_eq!(&object["response_body_blake3"], &response_digest);
-            prop_assert_eq!(
-                &object["response_body_observed"],
-                &Value::Bool(response_observed)
+                &object["request_body"],
+                &request_body_value_for_audit(scenario)?
             );
             prop_assert_eq!(&object["response_body"], &response_body);
-            prop_assert_eq!(&object["response_bytes"], &Value::from(flat_response_bytes));
             prop_assert!(
                 response_bytes <= max_response_bytes(scenario),
                 "audited response bytes exceeded scenario bound"
@@ -1029,7 +999,7 @@ mod tests {
                 prop_assert_eq!(&object["upstream_path"], &Value::Null);
                 prop_assert_eq!(&object["upstream_query"], &Value::Null);
             }
-            prop_assert_eq!(&object["version"], &Value::from(2_u64));
+            prop_assert_eq!(&object["version"], &Value::from(3_u64));
             Ok(())
         }
 
@@ -1263,14 +1233,6 @@ mod tests {
         )]))
     }
 
-    fn body_digest_value(body: &[u8]) -> Value {
-        if body.is_empty() {
-            Value::Null
-        } else {
-            Value::String(blake3::hash(body).to_hex().to_string())
-        }
-    }
-
     /// Expected serialized non-empty body summary.
     fn non_empty_body_value(body: &[u8]) -> Value {
         Value::Object(Map::from_iter([
@@ -1336,27 +1298,15 @@ mod tests {
             ("method".to_owned(), Value::String("GET".to_owned())),
             ("path".to_owned(), Value::String("/v1/models".to_owned())),
             ("query".to_owned(), Value::String("limit=1".to_owned())),
-            (
-                "request_body_blake3".to_owned(),
-                body_digest_value(b"hello"),
-            ),
-            ("request_body_observed".to_owned(), Value::Bool(true)),
             ("request_body".to_owned(), non_empty_body_value(b"hello")),
-            ("request_bytes".to_owned(), Value::from(5_u64)),
             (
                 "request_id".to_owned(),
                 Value::String("req-test-0000000000000001".to_owned()),
             ),
             (
-                "response_body_blake3".to_owned(),
-                body_digest_value(b"scripted"),
-            ),
-            ("response_body_observed".to_owned(), Value::Bool(true)),
-            (
                 "response_body".to_owned(),
                 non_empty_body_value(b"scripted"),
             ),
-            ("response_bytes".to_owned(), Value::from(8_u64)),
             ("status".to_owned(), Value::from(201_u64)),
             (
                 "timestamp".to_owned(),
@@ -1374,7 +1324,7 @@ mod tests {
                 "upstream_query".to_owned(),
                 Value::String("limit=1".to_owned()),
             ),
-            ("version".to_owned(), Value::from(2_u64)),
+            ("version".to_owned(), Value::from(3_u64)),
         ]))
     }
 
@@ -1392,18 +1342,12 @@ mod tests {
             ("method".to_owned(), Value::String("GET".to_owned())),
             ("path".to_owned(), Value::String("/v1/models".to_owned())),
             ("query".to_owned(), Value::Null),
-            ("request_body_blake3".to_owned(), Value::Null),
-            ("request_body_observed".to_owned(), Value::Bool(true)),
             ("request_body".to_owned(), empty_body_value()),
-            ("request_bytes".to_owned(), Value::from(0_u64)),
             (
                 "request_id".to_owned(),
                 Value::String("req-test-0000000000000001".to_owned()),
             ),
-            ("response_body_blake3".to_owned(), Value::Null),
-            ("response_body_observed".to_owned(), Value::Bool(false)),
             ("response_body".to_owned(), not_observed_body_value()),
-            ("response_bytes".to_owned(), Value::from(0_u64)),
             ("status".to_owned(), Value::from(504_u64)),
             (
                 "timestamp".to_owned(),
@@ -1418,7 +1362,7 @@ mod tests {
                 Value::String("/v1/models".to_owned()),
             ),
             ("upstream_query".to_owned(), Value::Null),
-            ("version".to_owned(), Value::from(2_u64)),
+            ("version".to_owned(), Value::from(3_u64)),
         ]))
     }
 
@@ -1817,11 +1761,7 @@ mod tests {
         let events = audit_events(&audit_log).await;
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["error_class"], "method_denied");
-        assert_eq!(event["request_bytes"], Value::from(body.len()));
-        assert_eq!(
-            event["request_body_blake3"],
-            Value::String(blake3::hash(&body).to_hex().to_string())
-        );
+        assert_eq!(event["request_body"], non_empty_body_value(&body));
     }
 
     #[tokio::test]
@@ -1971,7 +1911,7 @@ mod tests {
         let event = events.first().expect("completion should be audited");
         assert_eq!(event["decision"], "allowed");
         assert_eq!(event["status"], 200_u16);
-        assert_eq!(event["response_bytes"], 5_u64);
+        assert_eq!(event["response_body"], non_empty_body_value(b"hello"));
         assert_eq!(event["upstream_path"], "/v1/models");
     }
 
@@ -2532,8 +2472,7 @@ mod tests {
         let event = events.first().expect("disconnect should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "downstream_closed");
-        assert_eq!(event["response_body_observed"], true);
-        assert_eq!(event["response_bytes"], 11_u64);
+        assert_eq!(event["response_body"], non_empty_body_value(b"firstsecond"));
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(
