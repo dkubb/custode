@@ -186,8 +186,8 @@ pub(crate) struct AuditEvent {
     request_id: RequestId,
     /// Response body summary.
     response_body: AuditBodySummary,
-    /// Response status returned to the harness, when one exists.
-    status: Option<u16>,
+    /// Response status returned to the harness.
+    status: u16,
     /// RFC 3339 UTC timestamp.
     timestamp: AuditTimestamp,
     /// Configured upstream origin.
@@ -832,14 +832,14 @@ impl AuditEvent {
                 AuditDecision::Allowed,
                 None,
                 response_body.into_summary(),
-                Some(status.as_u16()),
+                status.as_u16(),
                 Some(upstream),
             ),
             AuditOutcomeKind::Denied { reason } => (
                 AuditDecision::Denied,
                 Some(reason.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                Some(reason.status().as_u16()),
+                reason.status().as_u16(),
                 None,
             ),
             AuditOutcomeKind::ResponseError { error, upstream } => {
@@ -848,7 +848,7 @@ impl AuditEvent {
                     AuditDecision::ResponseError,
                     Some(error_class.to_owned()),
                     response_body,
-                    Some(status.as_u16()),
+                    status.as_u16(),
                     Some(upstream),
                 )
             }
@@ -856,7 +856,7 @@ impl AuditEvent {
                 AuditDecision::UpstreamError,
                 Some(error.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                Some(error.status().as_u16()),
+                error.status().as_u16(),
                 Some(upstream),
             ),
         };
@@ -1067,7 +1067,7 @@ mod tests {
         );
 
         let event = AuditEvent::new(input);
-        let expected = Some(405);
+        let expected = 405;
 
         assert_eq!(event.status, expected);
     }
