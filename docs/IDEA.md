@@ -361,8 +361,8 @@ Gateway configuration MUST include:
 
 Invalid configuration MUST stop the gateway before it accepts traffic.
 
-The upstream provider origin MUST be a scheme, host, and optional port only.
-Path, query, fragment, and wildcard hosts are invalid.
+The upstream provider origin MUST be a scheme, host, and optional non-zero port
+only. Path, query, fragment, and wildcard hosts are invalid.
 
 The harness command is intentionally operator-supplied. Custode MUST NOT try to
 hide which harness command is being run.

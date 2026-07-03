@@ -190,6 +190,10 @@ pub(crate) enum ConfigError {
     #[error("upstream origin must not include credentials")]
     UpstreamOriginHasCredentials,
 
+    /// Upstream origin used port zero.
+    #[error("upstream origin port must be greater than zero")]
+    UpstreamOriginHasZeroPort,
+
     /// Upstream origin text exceeded the supported byte limit.
     #[error("upstream origin must be at most {max} bytes, got {value}")]
     UpstreamOriginTooLong {
@@ -799,6 +803,9 @@ impl UpstreamOrigin {
         if url.host_str().is_some_and(|host| host.contains('*')) {
             return Err(ConfigError::WildcardUpstreamHost);
         }
+        if url.port() == Some(0) {
+            return Err(ConfigError::UpstreamOriginHasZeroPort);
+        }
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
             return Err(ConfigError::UpstreamOriginHasComponents);
         }
@@ -1139,6 +1146,19 @@ mod tests {
                 matches!(
                     UpstreamOrigin::parse(origin),
                     Err(ConfigError::WildcardUpstreamHost),
+                ),
+                "origin {origin} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_origin_rejects_zero_ports() {
+        for origin in ["http://api.openai.com:0", "https://api.openai.com:0"] {
+            assert!(
+                matches!(
+                    UpstreamOrigin::parse(origin),
+                    Err(ConfigError::UpstreamOriginHasZeroPort),
                 ),
                 "origin {origin} should be rejected"
             );
@@ -1744,12 +1764,13 @@ mod proptests {
     }
 
     /// Invalid origins sampling representative rejection classes: wildcard
-    /// hosts, extra components, credentials, unsupported schemes, and
+    /// hosts, zero ports, extra components, credentials, unsupported schemes, and
     /// unparsable spellings (hostless and scheme-relative).
     fn origin_invalid() -> impl Strategy<Value = String> {
         prop_oneof![
             host_valid().prop_map(|host| format!("https://*.{host}")),
             Just("https://*".to_owned()),
+            host_valid().prop_map(|host| format!("https://{host}:0")),
             (host_valid(), "[a-z]{1,8}").prop_map(|(host, path)| format!("https://{host}/{path}")),
             (host_valid(), "[a-z]{1,8}")
                 .prop_map(|(host, query)| { format!("https://{host}?{query}") }),

@@ -358,7 +358,7 @@ Configuration parsing is fail-closed:
 
 - `CUSTODE_BIND` MUST parse as a socket address.
 - `CUSTODE_UPSTREAM_ORIGIN` MUST parse as an HTTP or HTTPS URL with scheme,
-  host, and optional port, MUST NOT include path, query, fragment, or
+  host, and optional non-zero port, MUST NOT include path, query, fragment, or
   userinfo credentials, MUST NOT use a wildcard host, and MUST be at most 255
   bytes.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at least one operation.
