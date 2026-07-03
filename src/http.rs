@@ -504,9 +504,7 @@ fn response_stream(
             pending = Some(chunk);
         }
 
-        if let Some(final_chunk) = pending
-            && sender.send(Ok(final_chunk)).await.is_err()
-        {
+        if pending.is_some() && sender.is_closed() {
             if let Err(audit_error) = context
                 .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                 .await
@@ -516,11 +514,16 @@ fn response_stream(
             return;
         }
 
-        if let Err(error) = context
+        let audit_result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
-            .await
-        {
+            .await;
+        if let Err(error) = audit_result {
             send_stream_error(&sender, Err(error), "audit failed".to_owned()).await;
+            return;
+        }
+
+        if let Some(final_chunk) = pending {
+            drop(sender.send(Ok(final_chunk)).await);
         }
     });
 
@@ -3223,6 +3226,42 @@ mod tests {
             ),
             "unexpected fatal error: {fatal_result:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_withholds_final_chunk_when_allowed_audit_fails() {
+        let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
+        let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
+        let audit_observer = audit.clone();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body =
+            stream::once(async { Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")) });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let mut response_body = response_stream(context, upstream_response);
+
+        let outcome = response_body
+            .next()
+            .await
+            .expect("terminal error should be sent");
+        let error = outcome.expect_err("final chunk should be withheld");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to write audit event: scripted audit failure"
+        );
+        assert_eq!(audit_observer.event_count(), 1);
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert!(events.is_empty());
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("audit failure should be reported");
+        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
