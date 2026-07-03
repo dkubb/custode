@@ -97,8 +97,16 @@ pub(crate) struct AuditEvent {
 
 /// Body accounting summary recorded in audit events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct AuditBodySummary {
+    /// Closed body-summary state.
+    kind: AuditBodySummaryKind,
+}
+
+/// Closed body accounting summary recorded in audit events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
-pub(crate) enum AuditBodySummary {
+enum AuditBodySummaryKind {
     /// Body was observed and empty.
     Empty,
 
@@ -229,7 +237,9 @@ impl AuditBodySummary {
     /// Creates an empty body summary.
     #[must_use]
     pub(crate) const fn empty() -> Self {
-        Self::Empty
+        Self {
+            kind: AuditBodySummaryKind::Empty,
+        }
     }
 
     /// Creates an observed body summary from a request body.
@@ -246,14 +256,18 @@ impl AuditBodySummary {
 
     /// Creates a non-empty body summary.
     #[must_use]
-    pub(crate) const fn non_empty(blake3: BodyDigest, bytes: NonZeroU64) -> Self {
-        Self::NonEmpty { blake3, bytes }
+    const fn non_empty(blake3: BodyDigest, bytes: NonZeroU64) -> Self {
+        Self {
+            kind: AuditBodySummaryKind::NonEmpty { blake3, bytes },
+        }
     }
 
     /// Creates an unobserved body summary.
     #[must_use]
     pub(crate) const fn not_observed() -> Self {
-        Self::NotObserved
+        Self {
+            kind: AuditBodySummaryKind::NotObserved,
+        }
     }
 }
 
