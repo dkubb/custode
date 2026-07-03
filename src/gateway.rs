@@ -10,7 +10,6 @@ use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdSource};
 use ::http::{Error as HttpError, Method};
-use core::num::NonZeroU64;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -105,7 +104,7 @@ impl ResponseAuditOutcome {
     pub(crate) fn allowed(response_account: &ResponseAccount, status: u16) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::Allowed {
-                response_body: response_body_summary(response_account),
+                response_body: AuditBodySummary::from_response_account(response_account),
                 status,
             },
         }
@@ -127,7 +126,7 @@ impl ResponseAuditOutcome {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseError {
                 error_class: error_class.into(),
-                response_body: response_body_summary(response_account),
+                response_body: AuditBodySummary::from_response_account(response_account),
                 status,
             },
         }
@@ -172,8 +171,10 @@ impl Gateway {
         error_class: &'static str,
         status: u16,
     ) -> Result<(), GatewayError> {
-        let request_summary =
-            request_body.map_or_else(AuditBodySummary::not_observed, request_body_summary);
+        let request_summary = request_body.map_or_else(
+            AuditBodySummary::not_observed,
+            AuditBodySummary::from_request_body,
+        );
         let request = AuditRequestInput::new(
             method.to_string(),
             target,
@@ -216,7 +217,7 @@ impl Gateway {
             input.method,
             input.target.into(),
             input.request_id,
-            request_body_summary(&input.request_body),
+            AuditBodySummary::from_request_body(&input.request_body),
             self.config.upstream_origin().as_str().to_owned(),
         );
         let event = AuditEvent::new_at(AuditEventInput::new(request, outcome), self.clock.now());
@@ -254,32 +255,6 @@ impl Gateway {
     pub(crate) fn next_request_id(&self) -> RequestId {
         self.request_ids.next_request_id()
     }
-}
-
-/// Summarizes an accounted request body for audit logging.
-fn request_body_summary(request_body: &AccountedBody) -> AuditBodySummary {
-    request_body
-        .digest()
-        .map_or_else(AuditBodySummary::empty, |digest| {
-            AuditBodySummary::non_empty(
-                digest,
-                NonZeroU64::new(request_body.byte_count())
-                    .expect("request body digest requires non-zero bytes"),
-            )
-        })
-}
-
-/// Summarizes an accounted response body for audit logging.
-fn response_body_summary(response_account: &ResponseAccount) -> AuditBodySummary {
-    response_account
-        .finalize_digest()
-        .map_or_else(AuditBodySummary::empty, |digest| {
-            AuditBodySummary::non_empty(
-                digest,
-                NonZeroU64::new(response_account.byte_count())
-                    .expect("response body digest requires non-zero bytes"),
-            )
-        })
 }
 
 #[cfg(test)]

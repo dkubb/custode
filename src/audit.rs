@@ -1,7 +1,7 @@
 //! Audit event schema and writer.
 
 use crate::allowlist::AcceptedTarget;
-use crate::body::BodyDigest;
+use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::GatewayConfig;
 use core::num::NonZeroU64;
 use serde::Serialize;
@@ -223,6 +223,32 @@ impl AuditBodySummary {
     #[must_use]
     pub(crate) const fn empty() -> Self {
         Self::Empty
+    }
+
+    /// Creates an observed body summary from a request body.
+    #[must_use]
+    pub(crate) fn from_request_body(request_body: &AccountedBody) -> Self {
+        request_body.digest().map_or_else(Self::empty, |digest| {
+            Self::non_empty(
+                digest,
+                NonZeroU64::new(request_body.byte_count())
+                    .expect("request body digest requires non-zero bytes"),
+            )
+        })
+    }
+
+    /// Creates an observed body summary from a response body account.
+    #[must_use]
+    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
+        response_account
+            .finalize_digest()
+            .map_or_else(Self::empty, |digest| {
+                Self::non_empty(
+                    digest,
+                    NonZeroU64::new(response_account.byte_count())
+                        .expect("response body digest requires non-zero bytes"),
+                )
+            })
     }
 
     /// Creates a non-empty body summary.
