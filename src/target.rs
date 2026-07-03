@@ -1,4 +1,4 @@
-//! Request target path parsing.
+//! Request target parsing.
 
 /// Origin-form request path accepted by the gateway.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -18,6 +18,20 @@ pub(crate) enum OriginFormPathError {
 
     /// Path was not origin-form.
     NonOriginForm,
+}
+
+/// Origin-form request query accepted by the gateway.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct OriginFormQuery {
+    /// Parsed query string without `?`.
+    value: String,
+}
+
+/// Origin-form query parsing error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OriginFormQueryError {
+    /// Query contained invalid percent-encoding.
+    InvalidPercentEncoding,
 }
 
 /// Decoded dot-segment recognition state.
@@ -79,9 +93,32 @@ impl OriginFormPath {
     }
 }
 
+impl OriginFormQuery {
+    /// Returns the origin-form query string without `?`.
+    #[must_use]
+    pub(crate) fn as_str(&self) -> &str {
+        &self.value
+    }
+
+    /// Parses an origin-form query string without `?`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the query contains invalid percent-encoding.
+    pub(crate) fn parse(query: &str) -> Result<Self, OriginFormQueryError> {
+        if !has_valid_percent_encoding(query) {
+            return Err(OriginFormQueryError::InvalidPercentEncoding);
+        }
+
+        Ok(Self {
+            value: query.to_owned(),
+        })
+    }
+}
+
 /// Returns true when all percent escape sequences have two hex digits.
-pub(crate) fn has_valid_percent_encoding(path: &str) -> bool {
-    let mut bytes = path.as_bytes().iter().copied();
+pub(crate) fn has_valid_percent_encoding(value: &str) -> bool {
+    let mut bytes = value.as_bytes().iter().copied();
     while let Some(byte) = bytes.next() {
         if byte == b'%' {
             let Some(first) = bytes.next() else {
@@ -174,7 +211,9 @@ const fn hex_value(byte: u8) -> Option<u8> {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{DotSegmentState, OriginFormPath, OriginFormPathError};
+    use super::{
+        DotSegmentState, OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError,
+    };
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -285,6 +324,40 @@ mod tests {
     }
 
     #[test]
+    fn query_accepts_empty_string() {
+        let query = OriginFormQuery::parse("").expect("empty query should parse");
+
+        assert_eq!(query.as_str(), "");
+    }
+
+    #[test]
+    fn query_accepts_valid_percent_encoding() {
+        let query = OriginFormQuery::parse("q=%2e&limit=1").expect("valid query should parse");
+
+        assert_eq!(query.as_str(), "q=%2e&limit=1");
+    }
+
+    #[test]
+    fn query_rejects_invalid_percent_encoding() {
+        assert_eq!(
+            OriginFormQuery::parse("bad=%zz"),
+            Err(OriginFormQueryError::InvalidPercentEncoding),
+        );
+    }
+
+    #[test]
+    fn query_rejects_truncated_percent_escapes() {
+        assert_eq!(
+            OriginFormQuery::parse("bad=%"),
+            Err(OriginFormQueryError::InvalidPercentEncoding),
+        );
+        assert_eq!(
+            OriginFormQuery::parse("bad=%2"),
+            Err(OriginFormQueryError::InvalidPercentEncoding),
+        );
+    }
+
+    #[test]
     fn path_accepts_segments_of_three_or_more_dots() {
         for path in ["/.../x", "/...."] {
             let parsed = OriginFormPath::parse(path)
@@ -312,7 +385,7 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::{OriginFormPath, OriginFormPathError};
+    use super::{OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError};
     use proptest::collection;
     use proptest::prelude::*;
 
@@ -411,6 +484,29 @@ mod proptests {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
     }
 
+    /// Valid query strings accepted as origin-form query witnesses.
+    fn query_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            "[A-Za-z0-9_=&.-]{1,24}",
+            escape_non_dot(),
+        ]
+    }
+
+    /// Queries whose final percent escape is truncated or non-hex.
+    fn query_with_invalid_percent() -> impl Strategy<Value = String> {
+        (
+            "[A-Za-z0-9_=&.-]{0,12}",
+            prop_oneof![
+                Just(String::new()),
+                "[0-9a-fA-F]",
+                "[g-zG-Z]{2}",
+                "[0-9a-fA-F][g-zG-Z]",
+            ],
+        )
+            .prop_map(|(prefix, escape)| format!("{prefix}%{escape}"))
+    }
+
     proptest! {
         #[test]
         fn parse_accepts_every_valid_path(path in path_valid()) {
@@ -441,6 +537,24 @@ mod proptests {
             prop_assert_eq!(
                 OriginFormPath::parse(&path),
                 Err(OriginFormPathError::NonOriginForm)
+            );
+        }
+
+        #[test]
+        fn query_parse_accepts_every_valid_query(query in query_valid()) {
+            let parsed = OriginFormQuery::parse(&query)
+                .expect("valid query should be accepted");
+
+            prop_assert_eq!(parsed.as_str(), query.as_str());
+        }
+
+        #[test]
+        fn query_parse_rejects_every_invalid_percent_escape(
+            query in query_with_invalid_percent(),
+        ) {
+            prop_assert_eq!(
+                OriginFormQuery::parse(&query),
+                Err(OriginFormQueryError::InvalidPercentEncoding)
             );
         }
 

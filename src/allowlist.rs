@@ -1,7 +1,7 @@
 //! Method and path allowlist decisions.
 
 use crate::config::GatewayConfig;
-use crate::target::{OriginFormPath, OriginFormPathError, has_valid_percent_encoding};
+use crate::target::{OriginFormPath, OriginFormPathError, OriginFormQuery};
 use ::http::Method;
 
 /// Request target accepted by the gateway.
@@ -10,7 +10,7 @@ pub(crate) struct AcceptedTarget {
     /// Origin-form path.
     path: OriginFormPath,
     /// Optional query string without `?`.
-    query: Option<String>,
+    query: Option<OriginFormQuery>,
 }
 
 /// Request target proven to match the configured allowlist.
@@ -32,13 +32,14 @@ impl AcceptedTarget {
     /// literal or percent-encoded dot segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
         let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
-        if query.is_some_and(|value| !has_valid_percent_encoding(value)) {
-            return Err(RejectionReason::InvalidPercentEncoding);
-        }
+        let accepted_query = query
+            .map(OriginFormQuery::parse)
+            .transpose()
+            .map_err(|_error| RejectionReason::InvalidPercentEncoding)?;
 
         Ok(Self {
             path: accepted_path,
-            query: query.map(str::to_owned),
+            query: accepted_query,
         })
     }
 
@@ -46,6 +47,12 @@ impl AcceptedTarget {
     #[must_use]
     pub(crate) const fn origin_form_path(&self) -> &OriginFormPath {
         &self.path
+    }
+
+    /// Returns the accepted origin-form query witness.
+    #[must_use]
+    pub(crate) const fn origin_form_query(&self) -> Option<&OriginFormQuery> {
+        self.query.as_ref()
     }
 
     /// Returns the accepted path.
@@ -57,7 +64,7 @@ impl AcceptedTarget {
     /// Returns the accepted query.
     #[must_use]
     pub(crate) fn query(&self) -> Option<&str> {
-        self.query.as_deref()
+        self.query.as_ref().map(OriginFormQuery::as_str)
     }
 }
 
@@ -156,7 +163,7 @@ pub(crate) fn allow_target(
 mod tests {
     use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::{AllowedPath, GatewayConfig};
-    use crate::target::OriginFormPath;
+    use crate::target::{OriginFormPath, OriginFormQuery};
     use ::http::Method;
     use core::num::NonZeroUsize;
     use pretty_assertions::assert_eq;
@@ -227,6 +234,10 @@ mod tests {
 
         assert_eq!(target.path(), "/v1/models");
         assert_eq!(target.query(), Some("limit=1"));
+        assert_eq!(
+            target.origin_form_query().map(OriginFormQuery::as_str),
+            Some("limit=1"),
+        );
     }
 
     #[test]

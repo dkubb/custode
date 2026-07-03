@@ -1,6 +1,6 @@
 //! Gateway configuration parsing.
 
-use crate::target::OriginFormPath;
+use crate::target::{OriginFormPath, OriginFormQuery};
 use ::http::Method;
 use clap::Args;
 use core::net::SocketAddr;
@@ -546,10 +546,14 @@ impl UpstreamOrigin {
 
     /// Joins an accepted origin-form path and query onto this origin.
     #[must_use]
-    pub(crate) fn join_path_query(&self, path: &OriginFormPath, query: Option<&str>) -> Url {
+    pub(crate) fn join_path_query(
+        &self,
+        path: &OriginFormPath,
+        query: Option<&OriginFormQuery>,
+    ) -> Url {
         let mut url = self.url.clone();
         url.set_path(path.as_str());
-        url.set_query(query);
+        url.set_query(query.map(OriginFormQuery::as_str));
         url
     }
 
@@ -669,7 +673,7 @@ mod tests {
         MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
         UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
-    use crate::target::OriginFormPath;
+    use crate::target::{OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
@@ -698,6 +702,11 @@ mod tests {
     /// Parses a test origin-form path.
     fn origin_form_path(path: &str) -> OriginFormPath {
         OriginFormPath::parse(path).expect("test path should parse")
+    }
+
+    /// Parses a test origin-form query.
+    fn origin_form_query(query: &str) -> OriginFormQuery {
+        OriginFormQuery::parse(query).expect("test query should parse")
     }
 
     #[test]
@@ -776,7 +785,8 @@ mod tests {
             UpstreamOrigin::parse("https://api.example.com:8443").expect("origin should parse");
 
         let path = origin_form_path("/v1/models");
-        let with_query = origin.join_path_query(&path, Some("limit=1"));
+        let query = origin_form_query("limit=1");
+        let with_query = origin.join_path_query(&path, Some(&query));
         let without_query = origin.join_path_query(&path, None);
 
         assert_eq!(
@@ -1085,7 +1095,7 @@ mod proptests {
         MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
         UpstreamOrigin, parse_allowed_operations, tests::serve_args,
     };
-    use crate::target::OriginFormPath;
+    use crate::target::{OriginFormPath, OriginFormQuery};
     use ::http::Method;
     use core::iter;
     use core::net::SocketAddr;
@@ -1524,8 +1534,13 @@ mod proptests {
             let parsed = UpstreamOrigin::parse(&origin).expect("generated origin should parse");
             let parsed_path = OriginFormPath::parse(&path)
                 .expect("generated path should parse");
+            let parsed_query = query
+                .as_deref()
+                .map(OriginFormQuery::parse)
+                .transpose()
+                .expect("generated query should parse");
 
-            let joined = parsed.join_path_query(&parsed_path, query.as_deref());
+            let joined = parsed.join_path_query(&parsed_path, parsed_query.as_ref());
 
             let expected = query.as_deref().map_or_else(
                 || format!("{}{path}", parsed.as_str()),

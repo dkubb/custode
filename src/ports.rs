@@ -187,8 +187,10 @@ impl UpstreamRequest {
             deadline,
             headers: headers.into_header_map(),
             method: target.method().clone(),
-            url: origin
-                .join_path_query(target.target().origin_form_path(), target.target().query()),
+            url: origin.join_path_query(
+                target.target().origin_form_path(),
+                target.target().origin_form_query(),
+            ),
         }
     }
 
