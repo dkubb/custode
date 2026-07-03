@@ -777,6 +777,11 @@ mod tests {
         OriginFormQuery::parse(query).expect("test query should parse")
     }
 
+    /// Converts a test `usize` into the expected `u128` value.
+    fn expected_usize_u128(value: usize) -> u128 {
+        u128::try_from(value).expect("usize should fit into u128")
+    }
+
     /// Builds the longest valid origin accepted by the input byte cap.
     fn maximum_supported_origin() -> String {
         let labels = [
@@ -788,6 +793,19 @@ mod tests {
         let origin = format!("https://{}", labels.join("."));
         assert_eq!(origin.len(), MAX_UPSTREAM_ORIGIN_BYTES);
         origin
+    }
+
+    #[test]
+    fn configuration_limits_match_documented_values() {
+        assert_eq!(MAX_ALLOWED_OPERATION_BYTES, 4_160);
+        assert_eq!(MAX_ALLOWED_OPERATIONS, 256);
+        assert_eq!(MAX_AUDIT_EVENT_BYTES, 0x0010_0000);
+        assert_eq!(MAX_REQUEST_BYTES, 0x4000_0000);
+        assert_eq!(MAX_REQUEST_HEADER_BYTES, 0x0010_0000);
+        assert_eq!(MAX_RESPONSE_BYTES, 0x4000_0000);
+        assert_eq!(MAX_RESPONSE_HEADER_BYTES, 0x0010_0000);
+        assert_eq!(MAX_REQUEST_TIMEOUT_SECS, 3_600);
+        assert_eq!(MAX_UPSTREAM_ORIGIN_BYTES, 255);
     }
 
     #[test]
@@ -860,8 +878,8 @@ mod tests {
         assert!(matches!(
             AllowedOperation::parse(&raw),
             Err(ConfigError::AllowedOperationTooLong { max, value })
-                if max == usize_to_u128(MAX_ALLOWED_OPERATION_BYTES)
-                    && value == usize_to_u128(raw.len()),
+                if max == expected_usize_u128(MAX_ALLOWED_OPERATION_BYTES)
+                    && value == expected_usize_u128(raw.len()),
         ));
     }
 
@@ -900,8 +918,8 @@ mod tests {
         assert!(matches!(
             UpstreamOrigin::parse(&origin),
             Err(ConfigError::UpstreamOriginTooLong { max, value })
-                if max == usize_to_u128(MAX_UPSTREAM_ORIGIN_BYTES)
-                    && value == usize_to_u128(origin.len()),
+                if max == expected_usize_u128(MAX_UPSTREAM_ORIGIN_BYTES)
+                    && value == expected_usize_u128(origin.len()),
         ));
     }
 
@@ -1004,8 +1022,8 @@ mod tests {
         assert!(matches!(
             parse_allowed_operations(operations),
             Err(ConfigError::TooManyAllowedOperations { max, value })
-                if max == usize_to_u128(MAX_ALLOWED_OPERATIONS)
-                    && value == usize_to_u128(MAX_ALLOWED_OPERATIONS + 1),
+                if max == expected_usize_u128(MAX_ALLOWED_OPERATIONS)
+                    && value == expected_usize_u128(MAX_ALLOWED_OPERATIONS + 1),
         ));
     }
 
@@ -1051,11 +1069,19 @@ mod tests {
     }
 
     #[test]
+    fn usize_to_u128_preserves_representative_values() {
+        assert_eq!(usize_to_u128(0), 0);
+        assert_eq!(usize_to_u128(1), 1);
+        assert_eq!(usize_to_u128(usize::MAX), expected_usize_u128(usize::MAX));
+    }
+
+    #[test]
     fn too_large_serve_args_fail_closed_with_the_env_name() {
-        let cases: [(&str, u128, MutateBound); 7] = [
+        let cases: [(&str, u128, u128, MutateBound); 7] = [
             (
                 "CUSTODE_MAX_AUDIT_EVENT_BYTES",
-                usize_to_u128(MAX_AUDIT_EVENT_BYTES),
+                expected_usize_u128(MAX_AUDIT_EVENT_BYTES),
+                expected_usize_u128(MAX_AUDIT_EVENT_BYTES + 1),
                 |args| {
                     args.max_audit_event_bytes = MAX_AUDIT_EVENT_BYTES
                         .checked_add(1)
@@ -1064,7 +1090,12 @@ mod tests {
             ),
             (
                 "CUSTODE_MAX_CONCURRENT_REQUESTS",
-                usize_to_u128(MAX_CONCURRENT_REQUESTS),
+                expected_usize_u128(MAX_CONCURRENT_REQUESTS),
+                expected_usize_u128(
+                    MAX_CONCURRENT_REQUESTS
+                        .checked_add(1)
+                        .expect("test max should fit usize"),
+                ),
                 |args| {
                     args.max_concurrent_requests = MAX_CONCURRENT_REQUESTS
                         .checked_add(1)
@@ -1073,7 +1104,8 @@ mod tests {
             ),
             (
                 "CUSTODE_MAX_REQUEST_BYTES",
-                usize_to_u128(MAX_REQUEST_BYTES),
+                expected_usize_u128(MAX_REQUEST_BYTES),
+                expected_usize_u128(MAX_REQUEST_BYTES + 1),
                 |args| {
                     args.max_request_bytes = MAX_REQUEST_BYTES
                         .checked_add(1)
@@ -1082,7 +1114,8 @@ mod tests {
             ),
             (
                 "CUSTODE_MAX_REQUEST_HEADER_BYTES",
-                usize_to_u128(MAX_REQUEST_HEADER_BYTES),
+                expected_usize_u128(MAX_REQUEST_HEADER_BYTES),
+                expected_usize_u128(MAX_REQUEST_HEADER_BYTES + 1),
                 |args| {
                     args.max_request_header_bytes = MAX_REQUEST_HEADER_BYTES
                         .checked_add(1)
@@ -1092,6 +1125,7 @@ mod tests {
             (
                 "CUSTODE_MAX_RESPONSE_BYTES",
                 u128::from(MAX_RESPONSE_BYTES),
+                u128::from(MAX_RESPONSE_BYTES + 1),
                 |args| {
                     args.max_response_bytes = MAX_RESPONSE_BYTES
                         .checked_add(1)
@@ -1100,7 +1134,8 @@ mod tests {
             ),
             (
                 "CUSTODE_MAX_RESPONSE_HEADER_BYTES",
-                usize_to_u128(MAX_RESPONSE_HEADER_BYTES),
+                expected_usize_u128(MAX_RESPONSE_HEADER_BYTES),
+                expected_usize_u128(MAX_RESPONSE_HEADER_BYTES + 1),
                 |args| {
                     args.max_response_header_bytes = MAX_RESPONSE_HEADER_BYTES
                         .checked_add(1)
@@ -1110,6 +1145,7 @@ mod tests {
             (
                 "CUSTODE_REQUEST_TIMEOUT_SECS",
                 u128::from(MAX_REQUEST_TIMEOUT_SECS),
+                u128::from(MAX_REQUEST_TIMEOUT_SECS + 1),
                 |args| {
                     args.request_timeout_secs = MAX_REQUEST_TIMEOUT_SECS
                         .checked_add(1)
@@ -1118,7 +1154,7 @@ mod tests {
             ),
         ];
 
-        for (name, expected_max, too_large_bound) in cases {
+        for (name, expected_max, expected_value, too_large_bound) in cases {
             let mut args = serve_args();
             too_large_bound(&mut args);
 
@@ -1130,12 +1166,46 @@ mod tests {
                     ConfigError::BoundTooLarge {
                         name: actual,
                         max,
-                        ..
-                    } if actual == name && max == expected_max
+                        value,
+                    } if actual == name && max == expected_max && value == expected_value
                 ),
                 "bound {name} should fail closed"
             );
         }
+    }
+
+    #[test]
+    fn serve_args_accept_the_supported_maximum_bounds() {
+        let mut args = serve_args();
+        args.max_audit_event_bytes = MAX_AUDIT_EVENT_BYTES;
+        args.max_concurrent_requests = MAX_CONCURRENT_REQUESTS;
+        args.max_request_bytes = MAX_REQUEST_BYTES;
+        args.max_request_header_bytes = MAX_REQUEST_HEADER_BYTES;
+        args.max_response_bytes = MAX_RESPONSE_BYTES;
+        args.max_response_header_bytes = MAX_RESPONSE_HEADER_BYTES;
+        args.request_timeout_secs = MAX_REQUEST_TIMEOUT_SECS;
+
+        let config = GatewayConfig::try_from(args).expect("maximum bounds should parse");
+
+        assert_eq!(config.max_audit_event_bytes().get(), MAX_AUDIT_EVENT_BYTES);
+        assert_eq!(
+            config.max_concurrent_requests().get(),
+            MAX_CONCURRENT_REQUESTS
+        );
+        assert_eq!(config.max_request_bytes().get(), MAX_REQUEST_BYTES);
+        assert_eq!(
+            config.max_request_header_bytes().get(),
+            MAX_REQUEST_HEADER_BYTES
+        );
+        assert_eq!(config.max_response_bytes().get(), MAX_RESPONSE_BYTES);
+        assert_eq!(
+            config.max_response_header_bytes().get(),
+            MAX_RESPONSE_HEADER_BYTES
+        );
+        assert_eq!(
+            config.request_timeout().as_duration(),
+            Duration::from_secs(MAX_REQUEST_TIMEOUT_SECS)
+        );
     }
 
     #[test]
