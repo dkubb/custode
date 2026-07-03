@@ -10,12 +10,14 @@ use non_empty_string::NonEmptyString;
 use serde::{Serialize, Serializer};
 use std::io;
 use std::io::SeekFrom;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions, create_dir_all};
-use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{
+    AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _,
+};
 use tokio::sync::Mutex;
 
 /// Hex bytes in one half of a per-run token.
@@ -169,6 +171,15 @@ pub(crate) enum AuditError {
         max: usize,
     },
 
+    /// Audit log tail could not be inspected.
+    #[error("failed to inspect audit path {path}: {source}")]
+    Inspect {
+        /// Path that failed.
+        path: PathBuf,
+        /// I/O source error.
+        source: io::Error,
+    },
+
     /// Audit log could not be opened.
     #[error("failed to open audit path {path}: {source}")]
     Open {
@@ -189,6 +200,22 @@ pub(crate) enum AuditError {
     #[error("failed to write audit event: {0}")]
     Write(io::Error),
 }
+
+/// Existing audit log tail state at startup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuditLogTail {
+    /// Existing log ends with an NDJSON record terminator.
+    Complete,
+    /// Empty audit log.
+    Empty,
+    /// Existing log ends with a partial NDJSON record.
+    Torn,
+}
+
+/// Sendable reader surface required to classify an existing audit log tail.
+trait AuditLogTailReader: AsyncRead + AsyncSeek + Send + Unpin {}
+
+impl<T> AuditLogTailReader for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
 
 /// Structured audit event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1035,10 +1062,13 @@ impl AuditWriter {
                 path: path.to_owned(),
                 source,
             })?;
-        if has_torn_log_tail(&mut audit_file).await {
-            return Err(AuditError::TornLog {
-                path: path.to_owned(),
-            });
+        match inspect_audit_log_tail(path, &mut audit_file).await? {
+            AuditLogTail::Empty | AuditLogTail::Complete => {}
+            AuditLogTail::Torn => {
+                return Err(AuditError::TornLog {
+                    path: path.to_owned(),
+                });
+            }
         }
         Ok(Self {
             file: Arc::new(Mutex::new(audit_file)),
@@ -1145,24 +1175,34 @@ impl AuditTimestamp {
     }
 }
 
-/// Returns whether a non-empty audit log lacks an NDJSON newline tail.
-async fn has_torn_log_tail(file: &mut File) -> bool {
-    let length = file
-        .metadata()
+/// Inspects an existing audit log tail and maps I/O failures.
+async fn inspect_audit_log_tail(
+    path: &Path,
+    reader: &mut dyn AuditLogTailReader,
+) -> Result<AuditLogTail, AuditError> {
+    classify_audit_log_tail(reader)
         .await
-        .expect("opened audit log metadata should be readable");
-    if length.len() == 0 {
-        return false;
+        .map_err(|source| AuditError::Inspect {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Classifies the tail state for an existing audit log.
+async fn classify_audit_log_tail(reader: &mut dyn AuditLogTailReader) -> io::Result<AuditLogTail> {
+    let length = reader.seek(SeekFrom::End(0)).await?;
+    if length == 0 {
+        return Ok(AuditLogTail::Empty);
     }
 
-    file.seek(SeekFrom::End(-1))
-        .await
-        .expect("opened non-empty audit log should seek to final byte");
+    reader.seek(SeekFrom::End(-1)).await?;
     let mut final_byte = [0_u8; 1];
-    file.read_exact(&mut final_byte)
-        .await
-        .expect("opened non-empty audit log final byte should be readable");
-    final_byte != *b"\n"
+    reader.read_exact(&mut final_byte).await?;
+    if final_byte == *b"\n" {
+        Ok(AuditLogTail::Complete)
+    } else {
+        Ok(AuditLogTail::Torn)
+    }
 }
 
 /// Validates the run token grammar.
@@ -1243,9 +1283,10 @@ where
 mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
-        AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
-        RunTokenError, write_serialized_event,
+        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditTarget,
+        AuditTimestamp, AuditWriter, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
+        ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
+        inspect_audit_log_tail, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1257,11 +1298,14 @@ mod tests {
     use core::time::Duration;
     use pretty_assertions::assert_eq;
     use serde_json::{Map, Value};
+    use std::io::SeekFrom;
     use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::Command;
     use std::time::UNIX_EPOCH;
     use std::{fs, io};
     use tempfile::tempdir;
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
 
     /// Test writer that fails one write operation class.
     #[derive(Debug)]
@@ -1278,6 +1322,130 @@ mod tests {
 
         /// Fail writes.
         Write,
+    }
+
+    /// Test reader that can fail one audit-tail inspection operation.
+    #[derive(Debug)]
+    pub(super) struct TailReader {
+        /// Reader bytes.
+        bytes: Vec<u8>,
+        /// Failure mode.
+        failure: Option<TailReaderFailure>,
+        /// Current position.
+        position: usize,
+        /// Seek call count.
+        seek_calls: u8,
+    }
+
+    /// Test audit-tail reader failure mode.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum TailReaderFailure {
+        /// Fail the second seek.
+        FinalSeek,
+        /// Fail the first seek.
+        InitialSeek,
+        /// Fail the final-byte read.
+        Read,
+    }
+
+    impl TailReader {
+        /// Creates a failing test reader.
+        pub(super) fn failing(bytes: impl Into<Vec<u8>>, failure: TailReaderFailure) -> Self {
+            Self {
+                bytes: bytes.into(),
+                failure: Some(failure),
+                position: 0,
+                seek_calls: 0,
+            }
+        }
+
+        /// Creates a successful test reader.
+        pub(super) fn new(bytes: impl Into<Vec<u8>>) -> Self {
+            Self {
+                bytes: bytes.into(),
+                failure: None,
+                position: 0,
+                seek_calls: 0,
+            }
+        }
+
+        /// Converts a seek request into a test-reader position.
+        fn seek_position(&self, position: SeekFrom) -> io::Result<usize> {
+            match position {
+                SeekFrom::Start(offset) => usize::try_from(offset).map_err(|_error| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "seek offset too large")
+                }),
+                SeekFrom::End(0) => Ok(self.bytes.len()),
+                SeekFrom::End(-1) => self.bytes.len().checked_sub(1).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "negative seek offset")
+                }),
+                SeekFrom::End(_offset) | SeekFrom::Current(_offset) => Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "unsupported test seek",
+                )),
+            }
+        }
+    }
+
+    impl AsyncRead for TailReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if self.failure == Some(TailReaderFailure::Read) {
+                return Poll::Ready(Err(io::Error::other("read failed")));
+            }
+            let Some(available) = self.bytes.len().checked_sub(self.position) else {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "test read position out of bounds",
+                )));
+            };
+            let length = available.min(buf.remaining());
+            let end = self
+                .position
+                .checked_add(length)
+                .expect("test read position should not overflow");
+            let chunk = self.bytes.get(self.position..end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "test read out of bounds")
+            });
+            match chunk {
+                Ok(bytes) => {
+                    buf.put_slice(bytes);
+                    self.position = end;
+                    Poll::Ready(Ok(()))
+                }
+                Err(error) => Poll::Ready(Err(error)),
+            }
+        }
+    }
+
+    impl AsyncSeek for TailReader {
+        fn poll_complete(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<u64>> {
+            let position =
+                u64::try_from(self.position).expect("test reader position should fit in u64");
+            Poll::Ready(Ok(position))
+        }
+
+        fn start_seek(mut self: Pin<&mut Self>, position: SeekFrom) -> io::Result<()> {
+            self.seek_calls = self
+                .seek_calls
+                .checked_add(1)
+                .expect("test seek count should not overflow");
+            match (self.failure, self.seek_calls) {
+                (Some(TailReaderFailure::InitialSeek), 1) => {
+                    Err(io::Error::other("initial seek failed"))
+                }
+                (Some(TailReaderFailure::FinalSeek), 2) => {
+                    Err(io::Error::other("final seek failed"))
+                }
+                _ => {
+                    self.position = self.seek_position(position)?;
+                    Ok(())
+                }
+            }
+        }
     }
 
     impl AsyncWrite for FailingWriter {
@@ -1385,6 +1553,97 @@ mod tests {
     /// A roomy audit event limit for tests that should not hit the bound.
     fn roomy_event_limit() -> NonZeroUsize {
         NonZeroUsize::new(0x4000).expect("limit should be non-zero")
+    }
+
+    #[test]
+    fn denial_reasons_report_stable_error_classes_and_statuses() {
+        let cases = [
+            (
+                AuditDenialReason::AbsoluteFormUnsupported,
+                "absolute_form_unsupported",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::ConnectUnsupported,
+                "connect_unsupported",
+                StatusCode::METHOD_NOT_ALLOWED,
+            ),
+            (
+                AuditDenialReason::DotSegment,
+                "dot_segment",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::EncodedSeparator,
+                "encoded_path_separator",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::InvalidPercentEncoding,
+                "invalid_percent_encoding",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::InvalidRequestConnectionHeader,
+                "invalid_request_connection_header",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::MethodDenied,
+                "method_denied",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                AuditDenialReason::NonOriginForm,
+                "non_origin_form",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::PathDenied,
+                "path_denied",
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                AuditDenialReason::PathTooLong,
+                "path_too_long",
+                StatusCode::URI_TOO_LONG,
+            ),
+            (
+                AuditDenialReason::QueryTooLong,
+                "query_too_long",
+                StatusCode::URI_TOO_LONG,
+            ),
+            (
+                AuditDenialReason::RequestBodyReadFailed,
+                "request_body_read_failed",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                AuditDenialReason::RequestBodyTimeout,
+                "request_body_timeout",
+                StatusCode::REQUEST_TIMEOUT,
+            ),
+            (
+                AuditDenialReason::RequestBodyTooLarge,
+                "request_body_too_large",
+                StatusCode::PAYLOAD_TOO_LARGE,
+            ),
+            (
+                AuditDenialReason::RequestHeadersTooLarge,
+                "request_headers_too_large",
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            ),
+            (
+                AuditDenialReason::TooManyRequests,
+                "too_many_requests",
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+        ];
+
+        for (reason, error_class, status) in cases {
+            assert_eq!(reason.error_class(), error_class);
+            assert_eq!(reason.status(), status);
+        }
     }
 
     #[test]
@@ -1695,6 +1954,92 @@ mod tests {
         assert_eq!(contents, "{\"version\":3}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn open_fails_when_the_audit_path_is_unseekable() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let status = Command::new("mkfifo")
+            .arg(&audit_log)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success());
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(matches!(result, Err(AuditError::Inspect { path, .. }) if path == audit_log));
+    }
+
+    #[tokio::test]
+    async fn classify_audit_log_tail_reports_empty_logs() {
+        let mut reader = TailReader::new([]);
+
+        let tail = classify_audit_log_tail(&mut reader)
+            .await
+            .expect("tail classification should succeed");
+
+        assert_eq!(tail, AuditLogTail::Empty);
+    }
+
+    #[tokio::test]
+    async fn classify_audit_log_tail_reports_complete_logs() {
+        let mut reader = TailReader::new(*b"{\"version\":3}\n");
+
+        let tail = classify_audit_log_tail(&mut reader)
+            .await
+            .expect("tail classification should succeed");
+
+        assert_eq!(tail, AuditLogTail::Complete);
+    }
+
+    #[tokio::test]
+    async fn classify_audit_log_tail_reports_torn_logs() {
+        let mut reader = TailReader::new(*b"{\"version\":3}");
+
+        let tail = classify_audit_log_tail(&mut reader)
+            .await
+            .expect("tail classification should succeed");
+
+        assert_eq!(tail, AuditLogTail::Torn);
+    }
+
+    #[tokio::test]
+    async fn inspect_audit_log_tail_reports_initial_seek_errors() {
+        let path = Path::new("audit.ndjson");
+        let mut reader = TailReader::failing([], TailReaderFailure::InitialSeek);
+
+        let result = inspect_audit_log_tail(path, &mut reader).await;
+
+        assert!(
+            matches!(result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_audit_log_tail_reports_final_seek_errors() {
+        let path = Path::new("audit.ndjson");
+        let mut reader = TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::FinalSeek);
+
+        let result = inspect_audit_log_tail(path, &mut reader).await;
+
+        assert!(
+            matches!(result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_audit_log_tail_reports_read_errors() {
+        let path = Path::new("audit.ndjson");
+        let mut reader = TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::Read);
+
+        let result = inspect_audit_log_tail(path, &mut reader).await;
+
+        assert!(
+            matches!(result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+    }
+
     #[tokio::test]
     async fn write_event_appends_one_ndjson_line() {
         let directory = tempdir().expect("temporary directory should be created");
@@ -1807,11 +2152,12 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
+    use super::tests::{TailReader, TailReaderFailure};
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
-        ResponseBodyPrefix, RunToken, RunTokenError,
+        ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1825,6 +2171,9 @@ mod proptests {
     use proptest::{collection, option};
     use serde_json::{Map, Value, value::to_raw_value};
     use std::fs;
+    use std::path::Path;
+    #[cfg(unix)]
+    use std::process::Command;
     use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
     use tokio::runtime::{Builder, Runtime};
@@ -2029,6 +2378,50 @@ mod proptests {
         assert!(matches!(
             torn_result,
             Err(super::AuditError::TornLog { path }) if path == torn_log
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_reports_unseekable_audit_logs() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let status = Command::new("mkfifo")
+            .arg(&audit_log)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success());
+
+        let result = open_writer(&GatewayConfig::for_test(
+            audit_log.clone(),
+            roomy_event_limit(),
+        ));
+
+        assert!(matches!(
+            result,
+            Err(super::AuditError::Inspect { path, .. }) if path == audit_log
+        ));
+    }
+
+    #[test]
+    fn tail_inspection_reports_final_seek_and_read_errors() {
+        let path = Path::new("audit.ndjson");
+        let runtime = audit_runtime();
+        let mut final_seek_reader =
+            TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::FinalSeek);
+        let mut read_reader = TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::Read);
+
+        let final_seek_result =
+            runtime.block_on(inspect_audit_log_tail(path, &mut final_seek_reader));
+        let read_result = runtime.block_on(inspect_audit_log_tail(path, &mut read_reader));
+
+        assert!(matches!(
+            final_seek_result,
+            Err(super::AuditError::Inspect { path: error_path, .. }) if error_path == path
+        ));
+        assert!(matches!(
+            read_result,
+            Err(super::AuditError::Inspect { path: error_path, .. }) if error_path == path
         ));
     }
 

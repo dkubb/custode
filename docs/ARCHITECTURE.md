@@ -445,6 +445,7 @@ The audit log is newline-delimited JSON.
 At startup, a non-empty existing audit log MUST end with a newline. If the
 final byte is not a newline, the gateway MUST reject the log before appending
 so a partial final event cannot be joined with a later event.
+If the gateway cannot inspect the existing log tail, it MUST fail startup.
 
 The event schema is:
 
