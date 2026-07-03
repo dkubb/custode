@@ -12,6 +12,7 @@ use core::pin::Pin;
 use core::time::Duration;
 use futures_util::stream::BoxStream;
 use http::{HeaderMap, Method, StatusCode};
+use non_empty_string::NonEmptyString;
 use thiserror::Error;
 use url::Url;
 
@@ -103,7 +104,7 @@ pub(crate) struct UpstreamError {
     /// Stable failure kind.
     kind: UpstreamErrorKind,
     /// Source error message.
-    message: String,
+    message: NonEmptyString,
 }
 
 /// Upstream response body streaming failure.
@@ -111,7 +112,7 @@ pub(crate) struct UpstreamError {
 #[error("{message}")]
 pub(crate) struct UpstreamBodyError {
     /// Source error message.
-    message: String,
+    message: NonEmptyString,
 }
 
 impl UpstreamDeadline {
@@ -135,7 +136,7 @@ impl UpstreamBodyError {
     #[must_use]
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            message: message.into(),
+            message: non_empty_message(message.into(), "upstream response body failed"),
         }
     }
 }
@@ -152,7 +153,7 @@ impl UpstreamError {
     pub(crate) fn new(kind: UpstreamErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            message: message.into(),
+            message: non_empty_message(message.into(), default_upstream_error_message(kind)),
         }
     }
 }
@@ -263,6 +264,22 @@ impl fmt::Debug for UpstreamResponse {
     }
 }
 
+/// Returns the fallback message for an upstream request failure kind.
+const fn default_upstream_error_message(kind: UpstreamErrorKind) -> &'static str {
+    match kind {
+        UpstreamErrorKind::Connect => "upstream connection failed",
+        UpstreamErrorKind::Request => "upstream request failed",
+        UpstreamErrorKind::Timeout => "upstream request timed out",
+    }
+}
+
+/// Returns a non-empty upstream error message.
+fn non_empty_message(message: String, fallback: &'static str) -> NonEmptyString {
+    NonEmptyString::new(message)
+        .or_else(|_empty| NonEmptyString::try_from(fallback).map_err(str::to_owned))
+        .expect("fallback error message should be non-empty")
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -270,7 +287,7 @@ impl fmt::Debug for UpstreamResponse {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::UpstreamResponse;
+    use super::{UpstreamBodyError, UpstreamError, UpstreamErrorKind, UpstreamResponse};
     use futures_util::{StreamExt as _, stream};
     use http::{HeaderMap, StatusCode};
     use pretty_assertions::assert_eq;
@@ -287,6 +304,44 @@ mod tests {
             output,
             "UpstreamResponse { headers: {\"x-test\": \"present\"}, status: 200, .. }"
         );
+    }
+
+    #[test]
+    fn upstream_body_error_preserves_non_empty_messages() {
+        let error = UpstreamBodyError::new("stream failed");
+
+        assert_eq!(error.to_string(), "stream failed");
+    }
+
+    #[test]
+    fn upstream_body_error_replaces_empty_messages() {
+        let error = UpstreamBodyError::new("");
+
+        assert_eq!(error.to_string(), "upstream response body failed");
+    }
+
+    #[test]
+    fn upstream_error_preserves_non_empty_messages() {
+        let error = UpstreamError::new(UpstreamErrorKind::Request, "protocol failed");
+
+        assert_eq!(error.kind(), UpstreamErrorKind::Request);
+        assert_eq!(error.to_string(), "protocol failed");
+    }
+
+    #[test]
+    fn upstream_error_replaces_empty_messages_by_kind() {
+        let cases = [
+            (UpstreamErrorKind::Connect, "upstream connection failed"),
+            (UpstreamErrorKind::Request, "upstream request failed"),
+            (UpstreamErrorKind::Timeout, "upstream request timed out"),
+        ];
+
+        for (kind, expected) in cases {
+            let error = UpstreamError::new(kind, "");
+
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), expected);
+        }
     }
 }
 

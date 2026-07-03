@@ -9,6 +9,7 @@ use futures_util as _;
 use http as _;
 use http_body_util as _;
 use humantime as _;
+use non_empty_string as _;
 use pretty_assertions as _;
 use proptest as _;
 use serde as _;
