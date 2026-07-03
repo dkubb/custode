@@ -157,7 +157,6 @@ async fn accept_allowed_target(
     request_id: &RequestId,
     method: &Method,
     uri: &Uri,
-    request_body: &AccountedBody,
 ) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
         let target = synthetic_target(uri);
@@ -166,7 +165,7 @@ async fn accept_allowed_target(
                 request_id.clone(),
                 method,
                 target,
-                Some(request_body),
+                None,
                 AuditDenialReason::ConnectUnsupported,
             )
             .await?;
@@ -182,7 +181,7 @@ async fn accept_allowed_target(
                 request_id.clone(),
                 method,
                 target,
-                Some(request_body),
+                None,
                 AuditDenialReason::AbsoluteFormUnsupported,
             )
             .await?;
@@ -197,13 +196,7 @@ async fn accept_allowed_target(
             let denial = denial_reason_from_rejection(reason);
             let target = synthetic_target(uri);
             gateway
-                .audit_denial(
-                    request_id.clone(),
-                    method,
-                    target,
-                    Some(request_body),
-                    denial,
-                )
+                .audit_denial(request_id.clone(), method, target, None, denial)
                 .await?;
             return Ok(Err(status_response(denial.status())));
         }
@@ -214,13 +207,7 @@ async fn accept_allowed_target(
         Err(reason) => {
             let denial = denial_reason_from_rejection(reason);
             gateway
-                .audit_denial(
-                    request_id.clone(),
-                    method,
-                    target.into(),
-                    Some(request_body),
-                    denial,
-                )
+                .audit_denial(request_id.clone(), method, target.into(), None, denial)
                 .await?;
             Ok(Err(status_response(denial.status())))
         }
@@ -280,23 +267,10 @@ async fn handle_request(
     let uri = parts.uri;
     let headers = parts.headers;
 
-    let request_body =
-        match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
-            Ok(request_body) => request_body,
-            Err(error) => {
-                let reason = denial_reason_from_request_body(&error);
-                gateway
-                    .audit_denial(request_id, &method, synthetic_target(&uri), None, reason)
-                    .await?;
-                return Ok(status_response(reason.status()));
-            }
-        };
-
-    let target =
-        match accept_allowed_target(&gateway, &request_id, &method, &uri, &request_body).await? {
-            Ok(target) => target,
-            Err(response) => return Ok(response),
-        };
+    let target = match accept_allowed_target(&gateway, &request_id, &method, &uri).await? {
+        Ok(target) => target,
+        Err(response) => return Ok(response),
+    };
 
     let request_headers =
         match forward_request_headers(&headers, gateway.config().max_request_header_bytes()) {
@@ -308,7 +282,25 @@ async fn handle_request(
                         request_id,
                         &method,
                         target.target().clone().into(),
-                        Some(&request_body),
+                        None,
+                        reason,
+                    )
+                    .await?;
+                return Ok(status_response(reason.status()));
+            }
+        };
+
+    let request_body =
+        match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
+            Ok(request_body) => request_body,
+            Err(error) => {
+                let reason = denial_reason_from_request_body(&error);
+                gateway
+                    .audit_denial(
+                        request_id,
+                        &method,
+                        target.target().clone().into(),
+                        None,
                         reason,
                     )
                     .await?;
@@ -1837,7 +1829,7 @@ mod tests {
         let events = audit_events(&audit_log).await;
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["error_class"], "method_denied");
-        assert_eq!(event["request_body"], non_empty_body_value(&body));
+        assert_eq!(event["request_body"], not_observed_body_value());
     }
 
     #[tokio::test]
@@ -1864,6 +1856,7 @@ mod tests {
         let events = audit_events(&audit_log).await;
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["error_class"], "request_headers_too_large");
+        assert_eq!(event["request_body"], not_observed_body_value());
     }
 
     #[tokio::test]

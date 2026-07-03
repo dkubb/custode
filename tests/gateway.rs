@@ -277,6 +277,14 @@ fn non_empty_body_value(body: &[u8]) -> Value {
     ]))
 }
 
+/// Expected serialized unobserved body summary.
+fn not_observed_body_value() -> Value {
+    Value::Object(Map::from_iter([(
+        "state".to_owned(),
+        Value::String("not_observed".to_owned()),
+    )]))
+}
+
 /// Records one upstream request and returns a fixed body.
 async fn record(State(recorder): State<Recorder>, request: Request<Body>) -> &'static str {
     let (parts, body_stream) = request.into_parts();
@@ -495,8 +503,9 @@ fn wait_for_failure(mut child: Child) -> bool {
 mod tests {
     use super::{
         Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio,
-        empty_body_value, free_local_addr, non_empty_body_value, raw_response_status_line, sleep,
-        spawn_gateway_command, start_fake_proxy, start_upstream, tempdir, wait_for_failure,
+        empty_body_value, free_local_addr, non_empty_body_value, not_observed_body_value,
+        raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy, start_upstream,
+        tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
 
@@ -678,7 +687,7 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = events.first().expect("one audit event should exist");
         assert_eq!(event["decision"], "denied");
-        assert_eq!(event["request_body"], non_empty_body_value(body));
+        assert_eq!(event["request_body"], not_observed_body_value());
         assert!(event["upstream_path"].is_null());
     }
 
