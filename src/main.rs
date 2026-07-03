@@ -49,4 +49,5 @@ fn initialize_tracing() {
         .with_env_filter(filter)
         .with_writer(io::stderr)
         .try_init();
+    tracing::debug!("tracing initialized");
 }

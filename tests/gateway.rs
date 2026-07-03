@@ -601,6 +601,27 @@ mod tests {
             .clone()
     }
 
+    #[test]
+    fn rust_log_enables_startup_tracing() {
+        let output = Command::new(env!("CARGO_BIN_EXE_custode-proxy"))
+            .arg("healthcheck")
+            .arg("--addr")
+            .arg("127.0.0.1:1")
+            .env("RUST_LOG", "debug")
+            .output()
+            .expect("gateway binary should run");
+
+        assert!(
+            !output.status.success(),
+            "healthcheck against a closed port should fail"
+        );
+        let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+        assert!(
+            stderr.contains("tracing initialized"),
+            "stderr should contain the startup tracing event, got {stderr:?}"
+        );
+    }
+
     #[tokio::test]
     async fn allowed_request_reaches_upstream_and_audits() {
         let _guard = lock_gateway_test().await;
