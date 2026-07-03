@@ -64,17 +64,34 @@ fn enforce_header_limit(
     headers: &HeaderMap,
     max_header_bytes: NonZeroUsize,
 ) -> Result<(), HeaderError> {
+    let max = max_header_bytes.get();
     let mut bytes = 0_usize;
     for (name, value) in headers {
-        bytes = bytes
-            .checked_add(name.as_str().len())
-            .and_then(|value_so_far| value_so_far.checked_add(value.as_bytes().len()))
-            .ok_or(HeaderError::TooLarge)?;
-        if bytes > max_header_bytes.get() {
-            return Err(HeaderError::TooLarge);
-        }
+        bytes = add_header_bytes(bytes, name.as_str().len(), max)?;
+        bytes = add_header_bytes(bytes, value.as_bytes().len(), max)?;
     }
     Ok(())
+}
+
+/// Adds bytes after proving the configured aggregate bound still has room.
+const fn add_header_bytes(bytes: usize, amount: usize, max: usize) -> Result<usize, HeaderError> {
+    if amount > remaining_header_bytes(bytes, max) {
+        return Err(HeaderError::TooLarge);
+    }
+    Ok(checked_header_bytes(bytes, amount))
+}
+
+/// Adds two header byte counts after the caller proves the sum fits.
+const fn checked_header_bytes(bytes: usize, amount: usize) -> usize {
+    bytes
+        .checked_add(amount)
+        .expect("bounded header byte count should not overflow")
+}
+
+/// Returns the remaining byte budget for a valid running header total.
+const fn remaining_header_bytes(bytes: usize, max: usize) -> usize {
+    max.checked_sub(bytes)
+        .expect("running header byte count should stay within the limit")
 }
 
 /// Applies request header filtering before upstream forwarding.
@@ -245,6 +262,21 @@ mod tests {
     }
 
     #[test]
+    fn request_headers_reject_non_utf8_connection_values() {
+        let mut headers = HeaderMap::new();
+        let value = HeaderValue::from_bytes(b"\xff").expect("opaque header value should build");
+        headers.insert(CONNECTION, value);
+
+        let result = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(1024).expect("literal should be non-zero"),
+        );
+        let expected = Err(HeaderError::InvalidConnectionHeader);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn request_headers_accept_sets_exactly_at_the_byte_limit() {
         let mut headers = HeaderMap::new();
         headers.insert("x-wide", HeaderValue::from_static("0123456789"));
@@ -270,6 +302,20 @@ mod tests {
         let result = forward_request_headers(
             &headers,
             NonZeroUsize::new(1).expect("literal should be non-zero"),
+        );
+        let expected = Err(HeaderError::TooLarge);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn request_headers_reject_sets_whose_value_exceeds_the_remaining_limit() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-wide", HeaderValue::from_static("0123456789"));
+
+        let result = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(6).expect("literal should be non-zero"),
         );
         let expected = Err(HeaderError::TooLarge);
 

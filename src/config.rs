@@ -110,10 +110,6 @@ pub(crate) enum ConfigError {
         source: url::ParseError,
     },
 
-    /// Upstream origin had no host.
-    #[error("upstream origin must include a host")]
-    MissingUpstreamHost,
-
     /// Upstream origin used an unsupported scheme.
     #[error("unsupported upstream scheme {scheme:?}")]
     UnsupportedUpstreamScheme {
@@ -557,9 +553,8 @@ impl UpstreamOrigin {
     ///
     /// # Errors
     ///
-    /// Returns a configuration error when the origin is not HTTP(S), lacks a
-    /// host, uses a wildcard host, or contains path, query, fragment,
-    /// username, or password.
+    /// Returns a configuration error when the origin is not HTTP(S), uses a
+    /// wildcard host, or contains path, query, fragment, username, or password.
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
         let url = Url::parse(raw).map_err(|source| ConfigError::InvalidUpstreamOrigin {
             raw: raw.to_owned(),
@@ -571,15 +566,7 @@ impl UpstreamOrigin {
                 scheme: url.scheme().to_owned(),
             });
         }
-        let Some(host) = url.host_str() else {
-            // Unreachable today: `Url::parse` guarantees a host for the
-            // special `http` and `https` schemes (hostless spellings such as
-            // `http://` fail to parse first), so this guard only fires if
-            // scheme support ever widens. It stays to keep parsing
-            // fail-closed.
-            return Err(ConfigError::MissingUpstreamHost);
-        };
-        if host.contains('*') {
+        if url.host_str().is_some_and(|host| host.contains('*')) {
             return Err(ConfigError::WildcardUpstreamHost);
         }
         if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
@@ -747,10 +734,19 @@ mod tests {
 
     #[test]
     fn upstream_origin_rejects_credentials() {
-        assert!(matches!(
-            UpstreamOrigin::parse("https://user:secret@api.openai.com"),
-            Err(ConfigError::UpstreamOriginHasCredentials),
-        ));
+        for origin in [
+            "https://user:secret@api.openai.com",
+            "https://user@api.openai.com",
+            "https://:secret@api.openai.com",
+        ] {
+            assert!(
+                matches!(
+                    UpstreamOrigin::parse(origin),
+                    Err(ConfigError::UpstreamOriginHasCredentials),
+                ),
+                "origin {origin} should be rejected"
+            );
+        }
     }
 
     #[test]
@@ -943,6 +939,19 @@ mod tests {
             Duration::from_secs(120)
         );
         assert_eq!(config.upstream_origin().as_str(), "https://api.openai.com");
+    }
+
+    #[test]
+    fn serve_args_reject_invalid_upstream_origins() {
+        let mut args = serve_args();
+        args.upstream_origin = "ftp://api.openai.com".to_owned();
+
+        let error = GatewayConfig::try_from(args).expect_err("invalid origin should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::UnsupportedUpstreamScheme { scheme } if scheme == "ftp",
+        ));
     }
 
     #[test]

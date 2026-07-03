@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions, create_dir_all};
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 /// Audit decision.
@@ -159,10 +159,6 @@ pub(crate) enum AuditError {
         /// I/O source error.
         source: io::Error,
     },
-
-    /// Audit event could not be serialized.
-    #[error("failed to serialize audit event: {0}")]
-    Serialize(serde_json::Error),
 
     /// Audit log write failed.
     #[error("failed to write audit event: {0}")]
@@ -959,27 +955,14 @@ impl AuditWriter {
     ///
     /// # Errors
     ///
-    /// Returns an error when serialization or writing fails.
+    /// Returns an error when the event exceeds the byte limit or writing fails.
     pub(crate) async fn write_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
-        // `AuditEvent` is a plain struct of strings and integers, so
-        // serialization cannot fail in practice; the `Serialize` arm exists
-        // to keep the audit path fail-closed if the schema ever changes.
-        let mut serialized = serde_json::to_vec(event).map_err(AuditError::Serialize)?;
-        if serialized.len() > self.max_event_bytes {
-            return Err(AuditError::EventTooLarge {
-                bytes: serialized.len(),
-                max: self.max_event_bytes,
-            });
-        }
-        serialized.push(b'\n');
+        let serialized = serialize_event(event, self.max_event_bytes)?;
 
         let mut file = self.file.lock().await;
-        file.write_all(&serialized)
-            .await
-            .map_err(AuditError::Write)?;
-        file.flush().await.map_err(AuditError::Write)?;
+        let result = write_serialized_event(&mut *file, &serialized).await;
         drop(file);
-        Ok(())
+        result
     }
 }
 
@@ -1018,6 +1001,36 @@ impl AuditTimestamp {
     }
 }
 
+/// Serializes one bounded audit event as NDJSON bytes.
+fn serialize_event(event: &AuditEvent, max_event_bytes: usize) -> Result<Vec<u8>, AuditError> {
+    let mut serialized = serialize_json_event(event);
+    if serialized.len() > max_event_bytes {
+        return Err(AuditError::EventTooLarge {
+            bytes: serialized.len(),
+            max: max_event_bytes,
+        });
+    }
+    serialized.push(b'\n');
+    Ok(serialized)
+}
+
+/// Serializes the current audit event schema.
+fn serialize_json_event(event: &AuditEvent) -> Vec<u8> {
+    serde_json::to_vec(event).expect("audit events contain only infallible JSON values")
+}
+
+/// Writes serialized audit bytes to the supplied writer.
+async fn write_serialized_event<W>(writer: &mut W, serialized: &[u8]) -> Result<(), AuditError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(serialized)
+        .await
+        .map_err(AuditError::Write)?;
+    writer.flush().await.map_err(AuditError::Write)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -1028,20 +1041,82 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        ObservedBodySummary, RequestId, ResponseBodyPrefix,
+        ObservedBodySummary, RequestId, ResponseBodyPrefix, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
     use crate::config::{GatewayConfig, UpstreamOrigin};
     use ::http::Method;
     use core::num::{NonZeroU64, NonZeroUsize};
+    use core::pin::Pin;
+    use core::task::{Context, Poll};
     use core::time::Duration;
     use pretty_assertions::assert_eq;
     use serde_json::{Map, Value};
-    use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::UNIX_EPOCH;
+    use std::{fs, io};
     use tempfile::tempdir;
+    use tokio::io::AsyncWrite;
+
+    /// Test writer that fails one write operation class.
+    #[derive(Debug)]
+    struct FailingWriter {
+        /// Operation that should fail.
+        failure: WriterFailure,
+    }
+
+    /// Test writer failure mode.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum WriterFailure {
+        /// Fail flushes.
+        Flush,
+
+        /// Fail writes.
+        Write,
+    }
+
+    impl AsyncWrite for FailingWriter {
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            match self.failure {
+                WriterFailure::Flush => Poll::Ready(Err(io::Error::other("flush failed"))),
+                WriterFailure::Write => Poll::Ready(Ok(())),
+            }
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            match self.failure {
+                WriterFailure::Flush => Poll::Ready(Ok(buf.len())),
+                WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
+            }
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            match self.failure {
+                WriterFailure::Flush => {
+                    let bytes = bufs.iter().map(|buf| buf.len()).sum();
+                    Poll::Ready(Ok(bytes))
+                }
+                WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
+            }
+        }
+    }
 
     /// Builds common request audit input for tests.
     fn request_input(
@@ -1372,6 +1447,28 @@ mod tests {
         ));
         let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
         assert_eq!(contents, "");
+    }
+
+    #[tokio::test]
+    async fn write_serialized_event_reports_write_failures() {
+        let mut writer = FailingWriter {
+            failure: WriterFailure::Write,
+        };
+
+        let result = write_serialized_event(&mut writer, b"{\"version\":3}\n").await;
+
+        assert!(matches!(result, Err(AuditError::Write(_))));
+    }
+
+    #[tokio::test]
+    async fn write_serialized_event_reports_flush_failures() {
+        let mut writer = FailingWriter {
+            failure: WriterFailure::Flush,
+        };
+
+        let result = write_serialized_event(&mut writer, b"{\"version\":3}\n").await;
+
+        assert!(matches!(result, Err(AuditError::Write(_))));
     }
 }
 

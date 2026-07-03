@@ -65,17 +65,19 @@ impl Clock for SystemClock {
 }
 
 impl ReqwestUpstreamClient {
-    /// Builds a reqwest-backed upstream client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when reqwest client construction fails.
-    pub(crate) fn new() -> Result<Self, UpstreamClientBuildError> {
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .map_err(upstream_client_build_error)?;
+    /// Builds an upstream client from a reqwest client build result.
+    fn from_build_result(
+        result: Result<reqwest::Client, reqwest::Error>,
+    ) -> Result<Self, UpstreamClientBuildError> {
+        let client = result.map_err(upstream_client_build_error)?;
         Ok(Self { client })
+    }
+
+    /// Builds a reqwest-backed upstream client.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        let result = reqwest::Client::builder().no_proxy().build();
+        Self::from_build_result(result).expect("no-proxy rustls reqwest client should build")
     }
 }
 
@@ -188,8 +190,7 @@ fn upstream_error_kind_from_reqwest(error: &impl ReqwestErrorView) -> UpstreamEr
 )]
 mod tests {
     use super::{
-        ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_client_build_error,
-        upstream_error_kind_from_reqwest,
+        ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
@@ -268,7 +269,8 @@ mod tests {
     fn build_error_display_includes_context() {
         let source =
             reqwest::Proxy::all("not a proxy URL").expect_err("invalid proxy URL should fail");
-        let error = upstream_client_build_error(source);
+        let error = ReqwestUpstreamClient::from_build_result(Err(source))
+            .expect_err("builder errors should be mapped");
 
         assert!(
             error
@@ -329,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_upstream_client_classifies_connect_failures() {
         let origin = released_origin().await;
-        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new();
         let request = empty_upstream_request(
             &origin,
             RequestTimeout::from_duration(Duration::from_secs(1)),
@@ -362,7 +364,7 @@ mod tests {
                 .await
                 .expect("garbage upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new();
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_secs(1)),
@@ -392,7 +394,7 @@ mod tests {
                 .expect("silent upstream should accept");
             sleep(Duration::from_secs(10)).await;
         }));
-        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new();
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_millis(50)),
@@ -425,7 +427,7 @@ mod tests {
                 .await
                 .expect("chunked upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new();
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_secs(1)),

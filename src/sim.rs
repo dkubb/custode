@@ -185,6 +185,19 @@ enum ScriptedUpstreamBehavior {
     StreamError,
 }
 
+/// Response stream state for the standard scripted success response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScriptedResponseStep {
+    /// Terminal delay before stream completion.
+    End,
+
+    /// First response chunk.
+    First,
+
+    /// Second response chunk.
+    Second,
+}
+
 impl ScenarioAdmission {
     /// Every scenario admission variant.
     const ALL: [Self; 2] = [Self::Open, Self::Saturated];
@@ -243,15 +256,13 @@ impl AuditSink for MemoryAuditSink {
                 "scripted audit failure",
             )))));
         }
-        let result = serde_json::to_value(event)
-            .map_err(AuditError::Serialize)
-            .map(|value| {
-                self.events
-                    .lock()
-                    .expect("memory audit sink should not be poisoned")
-                    .push(value);
-            });
-        Box::pin(future::ready(result))
+        let value =
+            serde_json::to_value(event).expect("audit events contain only infallible JSON values");
+        self.events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .push(value);
+        Box::pin(future::ready(Ok(())))
     }
 }
 
@@ -262,6 +273,15 @@ impl Clock for FixedClock {
 }
 
 impl MemoryAuditSink {
+    /// Returns the number of audit events attempted by this sink.
+    #[must_use]
+    pub(super) fn event_count(&self) -> usize {
+        *self
+            .event_count
+            .lock()
+            .expect("memory audit event count should not be poisoned")
+    }
+
     /// Builds an audit sink that fails on a specific event ordinal.
     #[must_use]
     pub(super) fn failing_on(event: NonZeroUsize) -> (Self, Arc<Mutex<Vec<Value>>>) {
@@ -616,15 +636,19 @@ fn scripted_response() -> UpstreamResponse {
     UpstreamResponse::new(
         StatusCode::CREATED,
         ::http::HeaderMap::new(),
-        stream::unfold(0_u8, |step| async move {
+        stream::unfold(ScriptedResponseStep::First, |step| async move {
             match step {
-                0 => Some((Ok(Bytes::from_static(b"script")), 1)),
-                1 => Some((Ok(Bytes::from_static(b"ed")), 2)),
-                2 => {
+                ScriptedResponseStep::First => Some((
+                    Ok(Bytes::from_static(b"script")),
+                    ScriptedResponseStep::Second,
+                )),
+                ScriptedResponseStep::Second => {
+                    Some((Ok(Bytes::from_static(b"ed")), ScriptedResponseStep::End))
+                }
+                ScriptedResponseStep::End => {
                     sleep(Duration::from_secs(1)).await;
                     None
                 }
-                _ => None,
             }
         })
         .boxed(),

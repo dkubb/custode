@@ -1,8 +1,6 @@
 //! Axum request and response wiring.
 
-use crate::adapters::{
-    ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
-};
+use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds, SystemClock};
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
 use crate::audit::{
     AuditDenialReason, AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditWriter,
@@ -25,7 +23,8 @@ use axum::http::{Request, Response, StatusCode};
 use axum::response::IntoResponse as _;
 use axum::{Router, routing::any};
 use core::convert::Infallible;
-use core::future::IntoFuture;
+use core::future::{Future, IntoFuture as _};
+use core::pin::Pin;
 use futures_util::StreamExt as _;
 use futures_util::future::{self, Either};
 use std::io;
@@ -40,10 +39,6 @@ use tokio_stream::wrappers::ReceiverStream;
 /// Serving runtime error.
 #[derive(Debug, Error)]
 pub(crate) enum ServeError {
-    /// Upstream client could not be built.
-    #[error("{0}")]
-    Client(UpstreamClientBuildError),
-
     /// Gateway request handling failed fatally.
     #[error("{0}")]
     Gateway(#[from] GatewayError),
@@ -105,6 +100,9 @@ enum ResponseStreamOutcome {
     UpstreamResponseStreamFailed,
 }
 
+/// Server task future shape observed by the shutdown coordinator.
+type ServerFuture = Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>>;
+
 impl ResponseAuditContext {
     /// Writes the terminal response audit event.
     async fn audit(self, stream_outcome: ResponseStreamOutcome) -> Result<(), GatewayError> {
@@ -161,34 +159,26 @@ async fn accept_allowed_target(
 ) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
         let target = synthetic_target(uri);
-        gateway
-            .audit_denial(
-                request_id.clone(),
-                method,
-                target,
-                None,
-                AuditDenialReason::ConnectUnsupported,
-            )
-            .await?;
-        return Ok(Err(status_response(
-            AuditDenialReason::ConnectUnsupported.status(),
-        )));
+        return reject_allowed_target(
+            gateway,
+            request_id,
+            method,
+            target,
+            AuditDenialReason::ConnectUnsupported,
+        )
+        .await;
     }
 
     if uri.authority().is_some() {
         let target = synthetic_target(uri);
-        gateway
-            .audit_denial(
-                request_id.clone(),
-                method,
-                target,
-                None,
-                AuditDenialReason::AbsoluteFormUnsupported,
-            )
-            .await?;
-        return Ok(Err(status_response(
-            AuditDenialReason::AbsoluteFormUnsupported.status(),
-        )));
+        return reject_allowed_target(
+            gateway,
+            request_id,
+            method,
+            target,
+            AuditDenialReason::AbsoluteFormUnsupported,
+        )
+        .await;
     }
 
     let target = match AcceptedTarget::new(uri.path(), uri.query()) {
@@ -196,10 +186,7 @@ async fn accept_allowed_target(
         Err(reason) => {
             let denial = denial_reason_from_rejection(reason);
             let target = synthetic_target(uri);
-            gateway
-                .audit_denial(request_id.clone(), method, target, None, denial)
-                .await?;
-            return Ok(Err(status_response(denial.status())));
+            return reject_allowed_target(gateway, request_id, method, target, denial).await;
         }
     };
 
@@ -207,12 +194,37 @@ async fn accept_allowed_target(
         Ok(allowed_target) => Ok(Ok(allowed_target)),
         Err(reason) => {
             let denial = denial_reason_from_rejection(reason);
-            gateway
-                .audit_denial(request_id.clone(), method, target.into(), None, denial)
-                .await?;
-            Ok(Err(status_response(denial.status())))
+            reject_allowed_target(gateway, request_id, method, target.into(), denial).await
         }
     }
+}
+
+/// Audits an allowlist rejection and returns the rejected target response.
+async fn reject_allowed_target(
+    gateway: &Gateway,
+    request_id: &RequestId,
+    method: &Method,
+    target: AuditTarget,
+    reason: AuditDenialReason,
+) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
+    let response =
+        audit_denial_status(gateway, request_id.clone(), method, target, None, reason).await?;
+    Ok(Err(response))
+}
+
+/// Audits a request denial and returns its status response.
+async fn audit_denial_status(
+    gateway: &Gateway,
+    request_id: RequestId,
+    method: &Method,
+    target: AuditTarget,
+    request_body: Option<&AccountedBody>,
+    reason: AuditDenialReason,
+) -> Result<Response<Body>, GatewayError> {
+    gateway
+        .audit_denial(request_id, method, target, request_body, reason)
+        .await?;
+    Ok(status_response(reason.status()))
 }
 
 /// Handles one proxied request.
@@ -278,16 +290,15 @@ async fn handle_request(
             Ok(request_headers) => request_headers,
             Err(error) => {
                 let reason = denial_reason_from_request_header(error);
-                gateway
-                    .audit_denial(
-                        request_id,
-                        &method,
-                        target.target().clone().into(),
-                        None,
-                        reason,
-                    )
-                    .await?;
-                return Ok(status_response(reason.status()));
+                return audit_denial_status(
+                    &gateway,
+                    request_id,
+                    &method,
+                    target.target().clone().into(),
+                    None,
+                    reason,
+                )
+                .await;
             }
         };
 
@@ -300,30 +311,26 @@ async fn handle_request(
         Ok(Ok(request_body)) => request_body,
         Ok(Err(error)) => {
             let reason = denial_reason_from_request_body(&error);
-            gateway
-                .audit_denial(
-                    request_id,
-                    &method,
-                    target.target().clone().into(),
-                    None,
-                    reason,
-                )
-                .await?;
-            return Ok(status_response(reason.status()));
+            return audit_denial_status(
+                &gateway,
+                request_id,
+                &method,
+                target.target().clone().into(),
+                None,
+                reason,
+            )
+            .await;
         }
         Err(_elapsed) => {
-            gateway
-                .audit_denial(
-                    request_id,
-                    &method,
-                    target.target().clone().into(),
-                    None,
-                    AuditDenialReason::RequestBodyTimeout,
-                )
-                .await?;
-            return Ok(status_response(
-                AuditDenialReason::RequestBodyTimeout.status(),
-            ));
+            return audit_denial_status(
+                &gateway,
+                request_id,
+                &method,
+                target.target().clone().into(),
+                None,
+                AuditDenialReason::RequestBodyTimeout,
+            )
+            .await;
         }
     };
 
@@ -362,8 +369,7 @@ async fn forward_request(
             let audit_error = audit_upstream_error(&error);
             let outcome = ResponseAuditOutcome::upstream_error(audit_error);
             let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
-            gateway.audit_response(input).await?;
-            return Ok(status_response(audit_error.status()));
+            return audit_response_status(&gateway, input, audit_error.status()).await;
         }
     };
     let status = upstream_response.status();
@@ -376,8 +382,7 @@ async fn forward_request(
             let audit_error = audit_response_header_error(error);
             let outcome = ResponseAuditOutcome::response_header_error(audit_error);
             let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
-            gateway.audit_response(input).await?;
-            return Ok(status_response(audit_error.status()));
+            return audit_response_status(&gateway, input, audit_error.status()).await;
         }
     };
     let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
@@ -399,6 +404,16 @@ async fn forward_request(
     response
         .body(Body::from_stream(stream))
         .map_err(GatewayError::ResponseBuild)
+}
+
+/// Audits a response failure and returns its status response.
+async fn audit_response_status(
+    gateway: &Gateway,
+    input: ResponseAuditInput,
+    status: StatusCode,
+) -> Result<Response<Body>, GatewayError> {
+    gateway.audit_response(input).await?;
+    Ok(status_response(status))
 }
 
 /// Streams the upstream response and writes exactly one terminal audit event.
@@ -522,7 +537,7 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
 pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
     let bind = config.bind();
     let max_concurrent_requests = config.max_concurrent_requests().get();
-    let client = ReqwestUpstreamClient::new().map_err(ServeError::Client)?;
+    let client = ReqwestUpstreamClient::new();
     let gateway = production_gateway(config)
         .await
         .map_err(ServeError::Gateway)?;
@@ -538,7 +553,8 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
         .await
         .map_err(ServeError::ServerBind)?;
 
-    run_until_server_stops(axum::serve(listener, app), fatal_receiver).await
+    let server_task = Box::pin(axum::serve(listener, app).into_future());
+    run_until_server_stops(server_task, fatal_receiver).await
 }
 
 /// Builds a gateway from production adapters.
@@ -558,11 +574,10 @@ async fn production_gateway(config: GatewayConfig) -> Result<Gateway, GatewayErr
 
 /// Runs a server until it stops or a fatal stream task error arrives.
 async fn run_until_server_stops(
-    server_task: impl IntoFuture<Output = Result<(), io::Error>>,
+    server_task: ServerFuture,
     mut fatal_receiver: mpsc::UnboundedReceiver<GatewayError>,
 ) -> Result<(), ServeError> {
-    let server =
-        Box::pin(async move { server_task.into_future().await.map_err(ServeError::Server) });
+    let server = Box::pin(async move { server_task.await.map_err(ServeError::Server) });
     let fatal = Box::pin(async move {
         fatal_receiver
             .recv()
@@ -1157,12 +1172,13 @@ mod tests {
 
     use super::{
         AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError,
-        audit_response_header_error, audit_upstream_error, denial_reason_from_request_body,
-        denial_reason_from_request_header, production_gateway, proxy, report_fatal_error,
-        response_stream, run_until_server_stops, send_stream_error, serve, synthetic_target,
+        audit_response_header_error, audit_upstream_error, denial_reason_from_rejection,
+        denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
+        proxy, report_fatal_error, response_stream, run_until_server_stops, send_stream_error,
+        serve, synthetic_target,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
-    use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
+    use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
     use crate::audit::{
         AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
     };
@@ -1245,6 +1261,19 @@ mod tests {
         Error(String),
     }
 
+    /// Test stream state for a two-chunk upstream response.
+    #[derive(Clone, Copy, Debug)]
+    enum TwoChunkStep {
+        /// Terminal delay before stream completion.
+        End,
+
+        /// First response chunk.
+        First,
+
+        /// Second response chunk.
+        Second,
+    }
+
     /// Reads and parses every event in the audit log.
     async fn audit_events(path: &Path) -> Vec<serde_json::Value> {
         read_to_string(path)
@@ -1309,6 +1338,38 @@ mod tests {
     fn allowed_target(config: &GatewayConfig, path: &str) -> AllowedTarget {
         let target = AcceptedTarget::new(path, None).expect("target should parse");
         allow_target(config, &Method::GET, target).expect("target should be allowed")
+    }
+
+    /// Builds response audit state for direct stream tests.
+    async fn response_audit_context(
+        audit: MemoryAuditSink,
+        max_response_bytes: NonZeroU64,
+    ) -> (ResponseAuditContext, mpsc::UnboundedReceiver<GatewayError>) {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let target = allowed_target(&config, "/v1/models");
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let request_body = AccountedBody::read_request(
+            Body::empty(),
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        )
+        .await
+        .expect("request body should be accounted");
+        let response_account = ResponseAccount::new(max_response_bytes);
+        let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
+        let context = ResponseAuditContext {
+            fatal_errors,
+            gateway,
+            request_body,
+            request_id: RequestId::from_parts("test", 1),
+            response_account,
+            status: StatusCode::OK,
+            target,
+        };
+        (context, fatal_receiver)
     }
 
     /// Returns the origin of a bound-then-released local port.
@@ -1449,7 +1510,7 @@ mod tests {
         config: GatewayConfig,
         permits: usize,
     ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
-        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let client = ReqwestUpstreamClient::new();
         let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
@@ -1809,6 +1870,77 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn proxy_allows_injected_upstream_stalls_inside_deadline() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let (client, upstream_requests) = ScriptedUpstreamClient::stalling(Duration::from_secs(1));
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models?limit=1")
+            .header("authorization", "Bearer harness")
+            .header("connection", "keep-alive")
+            .header("host", "proxy:8080")
+            .header("proxy-authorization", "Basic leak")
+            .header("x-request-id", "trace-1")
+            .body(Body::from("hello"))
+            .expect("request should build");
+
+        let started_at = Instant::now();
+        let response = router.oneshot(request).await.expect("proxy should respond");
+
+        assert_eq!(Instant::now(), started_at + Duration::from_secs(1));
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = to_bytes(response.into_body(), 1_024)
+            .await
+            .expect("response body should stream");
+        assert_eq!(body, Bytes::from_static(b"scripted"));
+        let requests = upstream_requests
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        assert_eq!(
+            requests,
+            [RecordedUpstreamRequest::new(
+                b"hello".to_vec(),
+                deadline,
+                vec![
+                    ("authorization".to_owned(), "Bearer harness".to_owned()),
+                    ("x-request-id".to_owned(), "trace-1".to_owned()),
+                ],
+                Method::GET,
+                "https://api.openai.com/v1/models?limit=1",
+            )]
+        );
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events, [injected_allowed_event()]);
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_times_out_slow_request_bodies_before_upstream() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let (client, upstream_requests) = ScriptedUpstreamClient::new();
@@ -2066,6 +2198,35 @@ mod tests {
             event["status"], 502_u64,
             "the audited status is what the harness receives"
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_response_header_audit_fails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(hello_upstream_router()).await;
+        let (_audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            &upstream,
+            "--allowed-operations",
+            "GET:exact:/v1/models",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+            "--max-audit-event-bytes",
+            "1",
+            "--max-response-header-bytes",
+            "1",
+        ]);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
@@ -2401,8 +2562,8 @@ mod tests {
     async fn run_until_server_stops_returns_server_success() {
         let (_fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
 
-        let result =
-            run_until_server_stops(future::ready(Ok::<(), io::Error>(())), fatal_receiver).await;
+        let server_task = Box::pin(future::ready(Ok::<(), io::Error>(())));
+        let result = run_until_server_stops(server_task, fatal_receiver).await;
 
         assert!(result.is_ok(), "a finished server should stop serving");
     }
@@ -2412,7 +2573,9 @@ mod tests {
         let (_fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
 
         let result = run_until_server_stops(
-            future::ready(Err::<(), io::Error>(io::Error::other("boom"))),
+            Box::pin(future::ready(Err::<(), io::Error>(io::Error::other(
+                "boom",
+            )))),
             fatal_receiver,
         )
         .await;
@@ -2428,9 +2591,8 @@ mod tests {
         let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel::<GatewayError>();
         drop(fatal_errors);
 
-        let result =
-            run_until_server_stops(future::pending::<Result<(), io::Error>>(), fatal_receiver)
-                .await;
+        let server_task = Box::pin(future::pending::<Result<(), io::Error>>());
+        let result = run_until_server_stops(server_task, fatal_receiver).await;
 
         assert!(
             result.is_ok(),
@@ -2464,6 +2626,30 @@ mod tests {
             denial_reason_from_request_header(HeaderError::TooLarge),
             AuditDenialReason::RequestHeadersTooLarge
         );
+    }
+
+    #[test]
+    fn target_rejections_map_to_denial_reasons() {
+        let cases = [
+            (RejectionReason::DotSegment, AuditDenialReason::DotSegment),
+            (
+                RejectionReason::InvalidPercentEncoding,
+                AuditDenialReason::InvalidPercentEncoding,
+            ),
+            (
+                RejectionReason::MethodDenied,
+                AuditDenialReason::MethodDenied,
+            ),
+            (
+                RejectionReason::NonOriginForm,
+                AuditDenialReason::NonOriginForm,
+            ),
+            (RejectionReason::PathDenied, AuditDenialReason::PathDenied),
+        ];
+
+        for (rejection, denial) in cases {
+            assert_eq!(denial_reason_from_rejection(rejection), denial);
+        }
     }
 
     #[test]
@@ -2599,21 +2785,20 @@ mod tests {
             status: StatusCode::OK,
             target,
         };
-        let upstream_body = stream::unfold(0_u8, |step| async move {
+        let upstream_body = stream::unfold(TwoChunkStep::First, |step| async move {
             match step {
-                0 => Some((
-                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
-                    1,
-                )),
-                1 => Some((
-                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"second")),
-                    2,
-                )),
-                2 => {
+                TwoChunkStep::End => {
                     sleep(Duration::from_secs(1)).await;
                     None
                 }
-                _ => None,
+                TwoChunkStep::First => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
+                    TwoChunkStep::Second,
+                )),
+                TwoChunkStep::Second => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"second")),
+                    TwoChunkStep::End,
+                )),
             }
         });
         let upstream_response =
@@ -2647,6 +2832,217 @@ mod tests {
             ),
             "unexpected fatal error: {fatal_result:?}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_reports_stream_errors_without_pending_chunks() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::iter([Err(UpstreamBodyError::new(
+            "scripted upstream stream failed",
+        ))]);
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let mut response_body = response_stream(context, upstream_response);
+
+        let result = response_body
+            .next()
+            .await
+            .expect("terminal stream error should be sent");
+
+        let error = result.expect_err("terminal item should be an error");
+        assert_eq!(error.to_string(), "scripted upstream stream failed");
+        assert!(
+            response_body.next().await.is_none(),
+            "stream should close after terminal error"
+        );
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("stream error should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_stream_failed");
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_audits_empty_successful_responses() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::empty::<Result<Bytes, UpstreamBodyError>>();
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let mut response_body = response_stream(context, upstream_response);
+
+        assert!(
+            response_body.next().await.is_none(),
+            "empty stream should complete without chunks"
+        );
+
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("empty success should be audited");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["response_body"], empty_body_value());
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_attempts_audit_when_pending_chunk_send_fails() {
+        let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
+        let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
+        let audit_observer = audit.clone();
+        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::unfold(Some(false), |state| async move {
+            match state {
+                Some(false) => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
+                    Some(true),
+                )),
+                Some(true) => {
+                    sleep(Duration::from_secs(1)).await;
+                    Some((
+                        Err(UpstreamBodyError::new("scripted upstream stream failed")),
+                        None,
+                    ))
+                }
+                None => None,
+            }
+        });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response);
+
+        yield_now().await;
+        drop(response_body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+
+        assert_eq!(audit_observer.event_count(), 1);
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert!(events.is_empty());
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("audit failure should be reported");
+        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_audits_pending_chunk_send_failures() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let audit_observer = audit.clone();
+        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::unfold(Some(false), |state| async move {
+            match state {
+                Some(false) => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
+                    Some(true),
+                )),
+                Some(true) => {
+                    sleep(Duration::from_secs(1)).await;
+                    Some((
+                        Err(UpstreamBodyError::new("scripted upstream stream failed")),
+                        None,
+                    ))
+                }
+                None => None,
+            }
+        });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response);
+
+        yield_now().await;
+        drop(response_body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+
+        assert_eq!(audit_observer.event_count(), 1);
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events
+            .first()
+            .expect("pending chunk send failure should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "downstream_closed");
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_attempts_audit_when_final_chunk_send_fails() {
+        let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
+        let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
+        let audit_observer = audit.clone();
+        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::unfold(false, |sent| async move {
+            if sent {
+                sleep(Duration::from_secs(1)).await;
+                None
+            } else {
+                Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")),
+                    true,
+                ))
+            }
+        });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response);
+
+        yield_now().await;
+        drop(response_body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+
+        assert_eq!(audit_observer.event_count(), 1);
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert!(events.is_empty());
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("audit failure should be reported");
+        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
     }
 
     #[test]
@@ -2720,9 +3116,8 @@ mod tests {
             }))
             .expect("fatal error should be sent");
 
-        let result =
-            run_until_server_stops(future::pending::<Result<(), io::Error>>(), fatal_receiver)
-                .await;
+        let server_task = Box::pin(future::pending::<Result<(), io::Error>>());
+        let result = run_until_server_stops(server_task, fatal_receiver).await;
 
         assert!(matches!(
             result,

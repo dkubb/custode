@@ -122,7 +122,7 @@ impl ResponseAccount {
     ///
     /// Returns an error when the response body exceeds the configured bound.
     pub(crate) fn add_chunk(&mut self, chunk: &[u8]) -> Result<(), BodyError> {
-        let chunk_len = u64::try_from(chunk.len()).map_err(|_error| BodyError::ResponseTooLarge)?;
+        let chunk_len = chunk_len_u64(chunk);
         let next = self
             .bytes
             .checked_add(chunk_len)
@@ -178,6 +178,11 @@ pub(crate) enum BodyError {
     /// Response exceeded its configured maximum.
     #[error("response body exceeded configured maximum")]
     ResponseTooLarge,
+}
+
+/// Returns a chunk length representable in the response byte counter.
+fn chunk_len_u64(chunk: &[u8]) -> u64 {
+    u64::try_from(chunk.len()).expect("slice length should fit in u64")
 }
 
 #[cfg(test)]
@@ -289,6 +294,19 @@ mod tests {
         let (byte_count, digest) = account.into_digest_parts();
         assert_eq!(byte_count, 4);
         assert!(digest.is_some());
+    }
+
+    #[test]
+    fn add_chunk_rejects_counter_overflow() {
+        let mut account =
+            ResponseAccount::new(NonZeroU64::new(u64::MAX).expect("limit is non-zero"));
+        account.bytes = u64::MAX;
+
+        let result = account.add_chunk(b"x");
+
+        assert_eq!(result, Err(BodyError::ResponseTooLarge));
+        let (byte_count, _digest) = account.into_digest_parts();
+        assert_eq!(byte_count, u64::MAX);
     }
 
     #[test]
