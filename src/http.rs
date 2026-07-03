@@ -1194,7 +1194,8 @@ mod tests {
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
     use crate::ports::{
-        UpstreamBodyError, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamResponse,
+        RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline, UpstreamError,
+        UpstreamErrorKind, UpstreamResponse,
     };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
@@ -1266,6 +1267,16 @@ mod tests {
 
         /// Response body ended with an error.
         Error(String),
+    }
+
+    /// Request id source that always reports exhaustion.
+    #[derive(Debug)]
+    struct ExhaustedRequestIds;
+
+    impl RequestIdSource for ExhaustedRequestIds {
+        fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
+            Err(RequestIdError::SequenceExhausted)
+        }
     }
 
     /// Test stream state for a two-chunk upstream response.
@@ -2483,6 +2494,72 @@ mod tests {
             .expect("proxy should respond");
 
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_the_permit_denial_request_id_exhausts() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let (audit, audit_recorder) = MemoryAuditSink::new();
+        let audit_observer = audit.clone();
+        let (client, _upstream_recorder) = ScriptedUpstreamClient::new();
+        let (fatal_errors, _fatal_receiver) = mpsc::unbounded_channel();
+        let gateway = Gateway::from_ports(config, audit, FixedClock, ExhaustedRequestIds);
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(0)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+        let audit_events_empty = audit_recorder
+            .lock()
+            .expect("memory audit recorder should not be poisoned")
+            .is_empty();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(audit_observer.event_count(), 0);
+        assert!(audit_events_empty, "request id failure should not audit");
+    }
+
+    #[tokio::test]
+    async fn proxy_fails_when_request_id_exhausts_after_admission() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let (audit, audit_recorder) = MemoryAuditSink::new();
+        let audit_observer = audit.clone();
+        let (client, _upstream_recorder) = ScriptedUpstreamClient::new();
+        let (fatal_errors, _fatal_receiver) = mpsc::unbounded_channel();
+        let gateway = Gateway::from_ports(config, audit, FixedClock, ExhaustedRequestIds);
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("proxy should respond");
+        let audit_events_empty = audit_recorder
+            .lock()
+            .expect("memory audit recorder should not be poisoned")
+            .is_empty();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(audit_observer.event_count(), 0);
+        assert!(audit_events_empty, "request id failure should not audit");
     }
 
     #[tokio::test]
