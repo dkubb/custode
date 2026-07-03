@@ -486,20 +486,25 @@ fn response_stream(
             pending = Some(chunk);
         }
 
-        match context
+        if let Some(final_chunk) = pending
+            && sender.send(Ok(final_chunk)).await.is_err()
+        {
+            if let Err(audit_error) = context
+                .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                    error_class: "downstream_closed".to_owned(),
+                })
+                .await
+            {
+                tracing::error!(%audit_error, "failed to audit downstream close");
+            }
+            return;
+        }
+
+        if let Err(error) = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await
         {
-            Ok(()) => {
-                if let Some(final_chunk) = pending
-                    && sender.send(Ok(final_chunk)).await.is_err()
-                {
-                    tracing::debug!("failed to send audited final response chunk");
-                }
-            }
-            Err(error) => {
-                send_stream_error(&sender, Err(error), "audit failed".to_owned()).await;
-            }
+            send_stream_error(&sender, Err(error), "audit failed".to_owned()).await;
         }
     });
 
@@ -1125,8 +1130,9 @@ mod tests {
     use super::{
         AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, production_gateway,
         proxy, report_fatal_error, request_body_error_status, request_header_error_class,
-        request_header_error_status, response_header_error_class, run_until_server_stops,
-        send_stream_error, serve, synthetic_target, upstream_error_class, upstream_error_status,
+        request_header_error_status, response_header_error_class, response_stream,
+        run_until_server_stops, send_stream_error, serve, synthetic_target, upstream_error_class,
+        upstream_error_status,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
@@ -1135,14 +1141,16 @@ mod tests {
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
-    use crate::ports::{UpstreamDeadline, UpstreamError, UpstreamErrorKind};
+    use crate::ports::{
+        UpstreamBodyError, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamResponse,
+    };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
         ScenarioBounds, ScenarioRequest, ScenarioUpstream, ScriptedUpstreamClient,
     };
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
-    use axum::http::{Request, StatusCode};
+    use axum::http::{HeaderMap, Request, StatusCode};
     use axum::{
         Router,
         routing::{any, get},
@@ -1165,7 +1173,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{Semaphore, mpsc};
     use tokio::task::yield_now;
-    use tokio::time::{Instant, sleep};
+    use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
 
     /// Test wrapper that parses serve arguments.
@@ -2385,6 +2393,85 @@ mod tests {
         send_stream_error(&sender, Ok(()), "stream failed".to_owned()).await;
 
         assert!(sender.is_closed(), "receiver should be gone");
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_audits_final_chunk_disconnects_before_allowed_completion() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let gateway =
+            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let request_body = AccountedBody::read_request(
+            Body::empty(),
+            NonZeroUsize::new(1).expect("limit should be non-zero"),
+        )
+        .await
+        .expect("request body should be accounted");
+        let response_account =
+            ResponseAccount::new(NonZeroU64::new(1_024).expect("limit should be non-zero"));
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let context = ResponseAuditContext {
+            fatal_errors,
+            gateway,
+            method: Method::GET,
+            request_body,
+            request_id: RequestId::from_parts("test", 1),
+            response_account,
+            status: 200,
+            target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
+        };
+        let upstream_body = stream::unfold(0_u8, |step| async move {
+            match step {
+                0 => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
+                    1,
+                )),
+                1 => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"second")),
+                    2,
+                )),
+                2 => {
+                    sleep(Duration::from_secs(1)).await;
+                    None
+                }
+                _ => None,
+            }
+        });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let mut response_body = response_stream(context, upstream_response);
+
+        let first = response_body
+            .next()
+            .await
+            .expect("first response chunk should be sent")
+            .expect("first response chunk should be ok");
+        assert_eq!(first, Bytes::from_static(b"first"));
+        drop(response_body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("disconnect should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "downstream_closed");
+        assert_eq!(event["response_body_observed"], true);
+        assert_eq!(event["response_bytes"], 11_u64);
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
     }
 
     #[test]
