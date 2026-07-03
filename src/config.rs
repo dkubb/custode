@@ -257,7 +257,7 @@ impl AllowedOperation {
 
     /// Returns true if this operation accepts the method and path.
     #[must_use]
-    pub(crate) fn matches(&self, method: &Method, path: &str) -> bool {
+    pub(crate) fn matches(&self, method: &Method, path: &OriginFormPath) -> bool {
         self.method == *method && self.path.matches(path)
     }
 
@@ -312,13 +312,14 @@ impl AllowedPath {
 
     /// Returns true if this allowed path accepts the incoming path.
     #[must_use]
-    pub(crate) fn matches(&self, path: &str) -> bool {
+    pub(crate) fn matches(&self, path: &OriginFormPath) -> bool {
+        let path_text = path.as_str();
         match self.kind {
-            AllowedPathKind::Exact => path == self.value.as_str(),
+            AllowedPathKind::Exact => path_text == self.value.as_str(),
             AllowedPathKind::Prefix => {
                 let prefix_text = self.value.as_str();
-                path == prefix_text
-                    || path
+                path_text == prefix_text
+                    || path_text
                         .strip_prefix(prefix_text)
                         .is_some_and(|suffix| suffix.starts_with('/'))
             }
@@ -545,9 +546,9 @@ impl UpstreamOrigin {
 
     /// Joins an accepted origin-form path and query onto this origin.
     #[must_use]
-    pub(crate) fn join_path_query(&self, path: &str, query: Option<&str>) -> Url {
+    pub(crate) fn join_path_query(&self, path: &OriginFormPath, query: Option<&str>) -> Url {
         let mut url = self.url.clone();
-        url.set_path(path);
+        url.set_path(path.as_str());
         url.set_query(query);
         url
     }
@@ -668,6 +669,7 @@ mod tests {
         MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
         UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
+    use crate::target::OriginFormPath;
     use core::net::SocketAddr;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
@@ -691,6 +693,11 @@ mod tests {
             request_timeout_secs: 120,
             upstream_origin: "https://api.openai.com".to_owned(),
         }
+    }
+
+    /// Parses a test origin-form path.
+    fn origin_form_path(path: &str) -> OriginFormPath {
+        OriginFormPath::parse(path).expect("test path should parse")
     }
 
     #[test]
@@ -719,8 +726,10 @@ mod tests {
         let operation =
             AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse");
 
-        assert!(operation.matches(&http::Method::GET, "/v1/models"));
-        assert!(!operation.matches(&http::Method::POST, "/v1/models"));
+        let path = origin_form_path("/v1/models");
+
+        assert!(operation.matches(&http::Method::GET, &path));
+        assert!(!operation.matches(&http::Method::POST, &path));
     }
 
     #[test]
@@ -766,8 +775,9 @@ mod tests {
         let origin =
             UpstreamOrigin::parse("https://api.example.com:8443").expect("origin should parse");
 
-        let with_query = origin.join_path_query("/v1/models", Some("limit=1"));
-        let without_query = origin.join_path_query("/v1/models", None);
+        let path = origin_form_path("/v1/models");
+        let with_query = origin.join_path_query(&path, Some("limit=1"));
+        let without_query = origin.join_path_query(&path, None);
 
         assert_eq!(
             with_query.as_str(),
@@ -929,7 +939,9 @@ mod tests {
             .first()
             .expect("one operation should be configured");
         assert_eq!(config.allowed_operations().len(), 1);
-        assert!(operation.matches(&http::Method::GET, "/v1/models"));
+        let path = origin_form_path("/v1/models");
+
+        assert!(operation.matches(&http::Method::GET, &path));
         assert_eq!(
             config.audit_log(),
             &PathBuf::from("/var/log/custode/proxy.ndjson")
@@ -1073,6 +1085,7 @@ mod proptests {
         MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
         UpstreamOrigin, parse_allowed_operations, tests::serve_args,
     };
+    use crate::target::OriginFormPath;
     use ::http::Method;
     use core::iter;
     use core::net::SocketAddr;
@@ -1312,25 +1325,33 @@ mod proptests {
                 .expect("generated methods are valid tokens");
             let other_method = Method::from_bytes(b"ZZ")
                 .expect("two-letter tokens are valid methods");
+            let parsed_path = OriginFormPath::parse(&path)
+                .expect("generated paths should parse");
 
             prop_assert!(operation.has_method(&parsed_method));
             prop_assert!(!operation.has_method(&other_method));
-            prop_assert!(operation.matches(&parsed_method, &path));
-            prop_assert!(!operation.matches(&other_method, &path));
+            prop_assert!(operation.matches(&parsed_method, &parsed_path));
+            prop_assert!(!operation.matches(&other_method, &parsed_path));
         }
 
         #[test]
         fn exact_paths_match_only_themselves(
             path in allowed_path_valid(),
-            suffix in "[A-Za-z0-9_.-]{1,8}",
+            suffix in allowed_path_segment_valid(),
         ) {
             let allowed = AllowedPath::exact(&path).expect("generated path should parse");
             let child = format!("{path}/{suffix}");
             let extended = format!("{path}{suffix}");
+            let parsed_path = OriginFormPath::parse(&path)
+                .expect("generated paths should parse");
+            let parsed_child = OriginFormPath::parse(&child)
+                .expect("child path should parse");
+            let parsed_extended = OriginFormPath::parse(&extended)
+                .expect("extended path should parse");
 
-            prop_assert!(allowed.matches(&path));
-            prop_assert!(!allowed.matches(&child));
-            prop_assert!(!allowed.matches(&extended));
+            prop_assert!(allowed.matches(&parsed_path));
+            prop_assert!(!allowed.matches(&parsed_child));
+            prop_assert!(!allowed.matches(&parsed_extended));
         }
 
         #[test]
@@ -1467,15 +1488,21 @@ mod proptests {
         #[test]
         fn prefix_matching_is_segment_bounded(
             prefix in allowed_path_valid(),
-            suffix in "[A-Za-z0-9_.-]{1,8}",
+            suffix in allowed_path_segment_valid(),
         ) {
             let allowed = AllowedPath::prefix(&prefix).expect("generated prefix should parse");
             let child = format!("{prefix}/{suffix}");
             let sibling = format!("{prefix}{suffix}");
+            let parsed_prefix = OriginFormPath::parse(&prefix)
+                .expect("generated prefix should parse");
+            let parsed_child = OriginFormPath::parse(&child)
+                .expect("child path should parse");
+            let parsed_sibling = OriginFormPath::parse(&sibling)
+                .expect("sibling path should parse");
 
-            prop_assert!(allowed.matches(&prefix));
-            prop_assert!(allowed.matches(&child));
-            prop_assert!(!allowed.matches(&sibling));
+            prop_assert!(allowed.matches(&parsed_prefix));
+            prop_assert!(allowed.matches(&parsed_child));
+            prop_assert!(!allowed.matches(&parsed_sibling));
         }
 
         #[test]
@@ -1495,8 +1522,10 @@ mod proptests {
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
         ) {
             let parsed = UpstreamOrigin::parse(&origin).expect("generated origin should parse");
+            let parsed_path = OriginFormPath::parse(&path)
+                .expect("generated path should parse");
 
-            let joined = parsed.join_path_query(&path, query.as_deref());
+            let joined = parsed.join_path_query(&parsed_path, query.as_deref());
 
             let expected = query.as_deref().map_or_else(
                 || format!("{}{path}", parsed.as_str()),

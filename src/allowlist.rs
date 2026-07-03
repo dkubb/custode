@@ -42,6 +42,12 @@ impl AcceptedTarget {
         })
     }
 
+    /// Returns the accepted origin-form path witness.
+    #[must_use]
+    pub(crate) const fn origin_form_path(&self) -> &OriginFormPath {
+        &self.path
+    }
+
     /// Returns the accepted path.
     #[must_use]
     pub(crate) fn path(&self) -> &str {
@@ -94,7 +100,7 @@ fn is_allowed(config: &GatewayConfig, method: &Method, target: &AcceptedTarget) 
     config
         .allowed_operations()
         .iter()
-        .any(|operation| operation.matches(method, target.path()))
+        .any(|operation| operation.matches(method, target.origin_form_path()))
 }
 
 /// Returns the rejection reason for a denied method.
@@ -150,6 +156,7 @@ pub(crate) fn allow_target(
 mod tests {
     use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::{AllowedPath, GatewayConfig};
+    use crate::target::OriginFormPath;
     use ::http::Method;
     use core::num::NonZeroUsize;
     use pretty_assertions::assert_eq;
@@ -163,13 +170,18 @@ mod tests {
         )
     }
 
+    /// Parses a test origin-form path.
+    fn origin_form_path(path: &str) -> OriginFormPath {
+        OriginFormPath::parse(path).expect("test path should parse")
+    }
+
     #[test]
     fn prefix_matches_path_segments_only() {
         let allowed = AllowedPath::prefix("/v1/responses").expect("prefix should be valid");
 
-        assert!(allowed.matches("/v1/responses"));
-        assert!(allowed.matches("/v1/responses/abc"));
-        assert!(!allowed.matches("/v1/responses-abc"));
+        assert!(allowed.matches(&origin_form_path("/v1/responses")));
+        assert!(allowed.matches(&origin_form_path("/v1/responses/abc")));
+        assert!(!allowed.matches(&origin_form_path("/v1/responses-abc")));
     }
 
     #[test]
