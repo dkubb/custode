@@ -4,7 +4,7 @@ use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{GatewayConfig, UpstreamOrigin};
 use ::http::{Method, StatusCode};
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 use serde::Serialize;
 use std::io;
 use std::path::PathBuf;
@@ -341,7 +341,7 @@ pub(crate) struct AuditWriter {
     /// Audit log file guarded for append writes.
     file: Arc<Mutex<File>>,
     /// Maximum serialized event bytes.
-    max_event_bytes: usize,
+    max_event_bytes: NonZeroUsize,
 }
 
 /// Request identity used in audit events.
@@ -947,7 +947,7 @@ impl AuditWriter {
             })?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
-            max_event_bytes: config.max_audit_event_bytes().get(),
+            max_event_bytes: config.max_audit_event_bytes(),
         })
     }
 
@@ -1002,12 +1002,16 @@ impl AuditTimestamp {
 }
 
 /// Serializes one bounded audit event as NDJSON bytes.
-fn serialize_event(event: &AuditEvent, max_event_bytes: usize) -> Result<Vec<u8>, AuditError> {
+fn serialize_event(
+    event: &AuditEvent,
+    max_event_bytes: NonZeroUsize,
+) -> Result<Vec<u8>, AuditError> {
     let mut serialized = serialize_json_event(event);
-    if serialized.len() > max_event_bytes {
+    let max = max_event_bytes.get();
+    if serialized.len() > max {
         return Err(AuditError::EventTooLarge {
             bytes: serialized.len(),
-            max: max_event_bytes,
+            max,
         });
     }
     serialized.push(b'\n');
