@@ -4,7 +4,10 @@ use crate::adapters::{
     ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
 };
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
-use crate::audit::{AuditDenialReason, AuditTarget, AuditUpstreamError, AuditWriter, RequestId};
+use crate::audit::{
+    AuditDenialReason, AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditWriter,
+    RequestId,
+};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
@@ -375,18 +378,19 @@ async fn forward_request(
     ) {
         Ok(response_headers) => response_headers,
         Err(error) => {
+            let audit_error = audit_response_header_error(error);
             let input = ResponseAuditInput {
                 method: method.to_string(),
                 outcome: ResponseAuditOutcome::response_header_error(
-                    response_header_error_class(error),
-                    StatusCode::BAD_GATEWAY,
+                    audit_error.error_class(),
+                    audit_error.status(),
                 ),
                 request_body,
                 request_id,
                 target: accepted_target,
             };
             gateway.audit_response(input).await?;
-            return Ok(status_response(StatusCode::BAD_GATEWAY));
+            return Ok(status_response(audit_error.status()));
         }
     };
     let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
@@ -635,11 +639,11 @@ const fn denial_reason_from_rejection(reason: RejectionReason) -> AuditDenialRea
     }
 }
 
-/// Maps response header errors to audit classes.
-const fn response_header_error_class(error: HeaderError) -> &'static str {
+/// Maps response header errors to closed response-header errors.
+const fn audit_response_header_error(error: HeaderError) -> AuditResponseHeaderError {
     match error {
-        HeaderError::InvalidConnectionHeader => "invalid_response_connection_header",
-        HeaderError::TooLarge => "response_headers_too_large",
+        HeaderError::InvalidConnectionHeader => AuditResponseHeaderError::InvalidConnectionHeader,
+        HeaderError::TooLarge => AuditResponseHeaderError::TooLarge,
     }
 }
 
@@ -1166,14 +1170,16 @@ mod tests {
     }
 
     use super::{
-        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, audit_upstream_error,
-        denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
-        proxy, report_fatal_error, response_header_error_class, response_stream,
-        run_until_server_stops, send_stream_error, serve, synthetic_target,
+        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError,
+        audit_response_header_error, audit_upstream_error, denial_reason_from_request_body,
+        denial_reason_from_request_header, production_gateway, proxy, report_fatal_error,
+        response_stream, run_until_server_stops, send_stream_error, serve, synthetic_target,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditDenialReason, AuditError, AuditUpstreamError, RequestId};
+    use crate::audit::{
+        AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
+    };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
@@ -2377,14 +2383,14 @@ mod tests {
     }
 
     #[test]
-    fn response_header_error_class_covers_every_variant() {
+    fn response_header_errors_map_to_audit_errors() {
         assert_eq!(
-            response_header_error_class(HeaderError::InvalidConnectionHeader),
-            "invalid_response_connection_header"
+            audit_response_header_error(HeaderError::InvalidConnectionHeader),
+            AuditResponseHeaderError::InvalidConnectionHeader
         );
         assert_eq!(
-            response_header_error_class(HeaderError::TooLarge),
-            "response_headers_too_large"
+            audit_response_header_error(HeaderError::TooLarge),
+            AuditResponseHeaderError::TooLarge
         );
     }
 

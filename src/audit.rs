@@ -72,6 +72,16 @@ pub(crate) enum AuditDenialReason {
     TooManyRequests,
 }
 
+/// Closed response-header audit error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuditResponseHeaderError {
+    /// Response `Connection` header contained an invalid dynamic header name.
+    InvalidConnectionHeader,
+
+    /// Response headers exceeded the configured byte limit.
+    TooLarge,
+}
+
 /// Closed upstream request audit error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuditUpstreamError {
@@ -391,6 +401,25 @@ impl AuditDenialReason {
             Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestHeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
             Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+}
+
+impl AuditResponseHeaderError {
+    /// Returns the stable audit error class.
+    #[must_use]
+    pub(crate) const fn error_class(self) -> &'static str {
+        match self {
+            Self::InvalidConnectionHeader => "invalid_response_connection_header",
+            Self::TooLarge => "response_headers_too_large",
+        }
+    }
+
+    /// Returns the response status for this response-header failure.
+    #[must_use]
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::InvalidConnectionHeader | Self::TooLarge => StatusCode::BAD_GATEWAY,
         }
     }
 }
