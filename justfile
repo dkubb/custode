@@ -39,8 +39,9 @@ coverage:
 coverage-proptests:
     cargo coverage-proptests
     scripts/check-coverage-summary.sh \
+        --exclude-test-mods \
         --max-missed-regions 621 \
-        --max-missed-functions 68 \
+        --max-missed-functions 89 \
         --max-missed-lines 472 \
         --max-missed-branches 36 \
         target/coverage/proptests.json

@@ -153,7 +153,7 @@ The local gate vocabulary is:
   missed regions, functions, lines, and branches are all zero.
 - `just coverage-proptests` reports `cargo llvm-cov` proptest-only coverage
   and fails when missed regions, functions, lines, or branches exceed the
-  documented ratchet.
+  documented ratchet outside inline test modules.
 - `just mutants` runs `cargo-mutants` mutation testing.
 - `just check` runs formatting, linting, tests, and the Dockerfile check.
 - `just ci` runs `check` plus `deny`.
