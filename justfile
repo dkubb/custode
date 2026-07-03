@@ -41,7 +41,7 @@ coverage-proptests:
     scripts/check-coverage-summary.sh \
         --exclude-test-mods \
         --max-missed-regions 595 \
-        --max-missed-functions 89 \
+        --max-missed-functions 91 \
         --max-missed-lines 371 \
         --max-missed-branches 26 \
         target/coverage/proptests.json

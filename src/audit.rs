@@ -366,8 +366,13 @@ pub(crate) struct AuditWriter {
 }
 
 /// Request identity used in audit events.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub(crate) struct RequestId(String);
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RequestId {
+    /// Bounded per-run token.
+    run_token: RunToken,
+    /// Non-zero per-run sequence.
+    sequence: NonZeroU64,
+}
 
 /// Bounded per-run token used in request identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1046,8 +1051,26 @@ impl RequestId {
     /// to the same audit log.
     #[must_use]
     pub(crate) fn from_parts(run_token: &RunToken, sequence: NonZeroU64) -> Self {
-        let sequence_value = sequence.get();
-        Self(format!("req-{run_token}-{sequence_value:016x}"))
+        Self {
+            run_token: run_token.clone(),
+            sequence,
+        }
+    }
+}
+
+impl fmt::Display for RequestId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sequence = self.sequence.get();
+        write!(f, "req-{}-{sequence:016x}", self.run_token)
+    }
+}
+
+impl Serialize for RequestId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.collect_str(self)
     }
 }
 
@@ -1686,7 +1709,7 @@ mod proptests {
     use core::time::Duration;
     use proptest::prelude::*;
     use proptest::{collection, option};
-    use serde_json::{Map, Value};
+    use serde_json::{Map, Value, value::to_raw_value};
     use std::time::UNIX_EPOCH;
 
     /// Returns body length as a `u64`.
@@ -1732,6 +1755,23 @@ mod proptests {
                 Value::String("empty".to_owned()),
             )])),
         );
+    }
+
+    #[test]
+    fn request_id_serializes_as_wire_text_across_json_encoders() {
+        let sequence = NonZeroU64::new(15).expect("sequence should be non-zero");
+        let request_id = RequestId::from_parts(&RunToken::for_test("7e57-c0de"), sequence);
+        let expected = "\"req-7e57-c0de-000000000000000f\"";
+
+        let string = serde_json::to_string(&request_id).expect("request id should serialize");
+        let bytes = serde_json::to_vec(&request_id).expect("request id should serialize");
+        let raw_value = to_raw_value(&request_id).expect("request id should serialize");
+        let value = serde_json::to_value(request_id).expect("request id should serialize");
+
+        assert_eq!(string, expected);
+        assert_eq!(bytes, expected.as_bytes());
+        assert_eq!(raw_value.get(), expected);
+        assert_eq!(value.as_str(), Some("req-7e57-c0de-000000000000000f"));
     }
 
     /// Generates observed non-empty body bytes.
