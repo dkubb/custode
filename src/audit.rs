@@ -285,11 +285,19 @@ enum AuditBodySummaryKind {
     NotObserved,
 }
 
-/// Observed body summary recorded in audit events.
+/// Body summary after bytes were observed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ObservedBodySummary {
-    /// Observed body summary.
-    summary: AuditBodySummary,
+pub(crate) enum ObservedBodySummary {
+    /// Body was observed and empty.
+    Empty,
+
+    /// Body was observed and non-empty.
+    NonEmpty {
+        /// Body digest.
+        blake3: BodyDigest,
+        /// Body byte count.
+        bytes: NonZeroU64,
+    },
 }
 
 /// Accepted response prefix for oversized response-body failures.
@@ -507,19 +515,20 @@ impl ObservedBodySummary {
     #[must_use]
     pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
         let (byte_count, response_digest) = response_account.into_digest_parts();
-        let summary = response_digest.map_or_else(AuditBodySummary::empty, |digest| {
-            AuditBodySummary::non_empty(
-                digest,
-                NonZeroU64::new(byte_count).expect("response body digest requires non-zero bytes"),
-            )
-        });
-        Self { summary }
+        response_digest.map_or(Self::Empty, |digest| Self::NonEmpty {
+            blake3: digest,
+            bytes: NonZeroU64::new(byte_count)
+                .expect("response body digest requires non-zero bytes"),
+        })
     }
 
     /// Returns the underlying audit body summary.
     #[must_use]
     const fn into_summary(self) -> AuditBodySummary {
-        self.summary
+        match self {
+            Self::Empty => AuditBodySummary::empty(),
+            Self::NonEmpty { blake3, bytes } => AuditBodySummary::non_empty(blake3, bytes),
+        }
     }
 }
 
@@ -529,12 +538,10 @@ impl ResponseBodyPrefix {
     pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
         let (byte_count, response_digest) = response_account.into_digest_parts();
         response_digest.map_or(Self::NoneAccepted, |digest| {
-            Self::Accepted(ObservedBodySummary {
-                summary: AuditBodySummary::non_empty(
-                    digest,
-                    NonZeroU64::new(byte_count)
-                        .expect("response body digest requires non-zero bytes"),
-                ),
+            Self::Accepted(ObservedBodySummary::NonEmpty {
+                blake3: digest,
+                bytes: NonZeroU64::new(byte_count)
+                    .expect("response body digest requires non-zero bytes"),
             })
         })
     }
@@ -1659,11 +1666,9 @@ mod tests {
 
         assert_eq!(
             prefix,
-            ResponseBodyPrefix::Accepted(ObservedBodySummary {
-                summary: AuditBodySummary::non_empty(
-                    BodyDigest::from_bytes(b"accepted"),
-                    NonZeroU64::new(8).expect("accepted body should be non-empty"),
-                ),
+            ResponseBodyPrefix::Accepted(ObservedBodySummary::NonEmpty {
+                blake3: BodyDigest::from_bytes(b"accepted"),
+                bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
             }),
         );
     }
@@ -2193,8 +2198,9 @@ mod proptests {
 
     /// Returns an observed body summary for observed bytes.
     fn observed_body_summary(bytes: &[u8]) -> ObservedBodySummary {
-        ObservedBodySummary {
-            summary: body_summary(bytes),
+        ObservedBodySummary::NonEmpty {
+            blake3: BodyDigest::from_bytes(bytes),
+            bytes: NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
         }
     }
 
