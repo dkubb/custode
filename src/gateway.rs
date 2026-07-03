@@ -3,7 +3,8 @@
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
     AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget,
-    AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary, RequestId,
+    AuditUpstreamError, AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary,
+    RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -105,10 +106,8 @@ enum ResponseAuditOutcomeKind {
 
     /// Upstream request failed before a response completed.
     UpstreamError {
-        /// Stable error class.
-        error_class: &'static str,
-        /// Response status returned to the harness.
-        status: StatusCode,
+        /// Upstream request error.
+        error: AuditUpstreamError,
     },
 
     /// Upstream response stream failed after upstream I/O started.
@@ -179,12 +178,9 @@ impl ResponseAuditOutcome {
 
     /// Creates an upstream-error outcome.
     #[must_use]
-    pub(crate) const fn upstream_error(error_class: &'static str, status: StatusCode) -> Self {
+    pub(crate) const fn upstream_error(error: AuditUpstreamError) -> Self {
         Self {
-            kind: ResponseAuditOutcomeKind::UpstreamError {
-                error_class,
-                status,
-            },
+            kind: ResponseAuditOutcomeKind::UpstreamError { error },
         }
     }
 
@@ -287,10 +283,9 @@ impl Gateway {
                 status,
                 upstream,
             ),
-            ResponseAuditOutcomeKind::UpstreamError {
-                error_class,
-                status,
-            } => AuditEventInput::upstream_error(request, error_class, status, upstream),
+            ResponseAuditOutcomeKind::UpstreamError { error } => {
+                AuditEventInput::upstream_error(request, error, upstream)
+            }
         };
         let event = AuditEvent::new_at(event_input, self.clock.now());
         self.audit.append_event(&event).await?;

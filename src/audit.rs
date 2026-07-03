@@ -72,6 +72,19 @@ pub(crate) enum AuditDenialReason {
     TooManyRequests,
 }
 
+/// Closed upstream request audit error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuditUpstreamError {
+    /// Gateway could not connect to the upstream.
+    Connect,
+
+    /// Upstream request failed after connection setup.
+    Request,
+
+    /// Upstream request timed out.
+    Timeout,
+}
+
 /// Audit log error.
 #[derive(Debug, Error)]
 pub(crate) enum AuditError {
@@ -219,10 +232,8 @@ enum AuditOutcomeKind {
 
     /// Upstream request failed before a response completed.
     UpstreamError {
-        /// Stable error class.
-        error_class: String,
-        /// Response status returned to the harness.
-        status: StatusCode,
+        /// Upstream error.
+        error: AuditUpstreamError,
         /// Upstream target.
         upstream: AuditUpstreamTarget,
     },
@@ -384,6 +395,27 @@ impl AuditDenialReason {
     }
 }
 
+impl AuditUpstreamError {
+    /// Returns the stable audit error class.
+    #[must_use]
+    const fn error_class(self) -> &'static str {
+        match self {
+            Self::Connect => "upstream_connect_failed",
+            Self::Request => "upstream_request_failed",
+            Self::Timeout => "upstream_timeout",
+        }
+    }
+
+    /// Returns the response status for this upstream failure.
+    #[must_use]
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::Connect | Self::Request => StatusCode::BAD_GATEWAY,
+            Self::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        }
+    }
+}
+
 impl AuditEventInput {
     /// Creates an allowed audit event input.
     #[must_use]
@@ -449,11 +481,10 @@ impl AuditEventInput {
     #[must_use]
     pub(crate) fn upstream_error(
         request: ObservedAuditRequestInput,
-        error_class: impl Into<String>,
-        status: StatusCode,
+        error: AuditUpstreamError,
         upstream: AuditUpstreamTarget,
     ) -> Self {
-        let outcome = AuditOutcome::upstream_error(error_class, status, upstream);
+        let outcome = AuditOutcome::upstream_error(error, upstream);
         Self {
             outcome,
             request: request.into_request(),
@@ -529,17 +560,9 @@ impl AuditOutcome {
 
     /// Creates an upstream-error outcome.
     #[must_use]
-    fn upstream_error(
-        error_class: impl Into<String>,
-        status: StatusCode,
-        upstream: AuditUpstreamTarget,
-    ) -> Self {
+    const fn upstream_error(error: AuditUpstreamError, upstream: AuditUpstreamTarget) -> Self {
         Self {
-            kind: AuditOutcomeKind::UpstreamError {
-                error_class: error_class.into(),
-                status,
-                upstream,
-            },
+            kind: AuditOutcomeKind::UpstreamError { error, upstream },
         }
     }
 }
@@ -716,15 +739,11 @@ impl AuditEvent {
                 Some(status.as_u16()),
                 Some(upstream),
             ),
-            AuditOutcomeKind::UpstreamError {
-                error_class,
-                status,
-                upstream,
-            } => (
+            AuditOutcomeKind::UpstreamError { error, upstream } => (
                 AuditDecision::UpstreamError,
-                Some(error_class),
+                Some(error.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                Some(status.as_u16()),
+                Some(error.status().as_u16()),
                 Some(upstream),
             ),
         };
@@ -1188,7 +1207,8 @@ mod tests {
 mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
-        AuditRequestInput, AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
+        AuditRequestInput, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
+        ObservedBodySummary, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1252,6 +1272,15 @@ mod proptests {
         }
     }
 
+    /// Returns one closed upstream error from a generated index.
+    const fn upstream_error(index: u8) -> AuditUpstreamError {
+        match index {
+            0 => AuditUpstreamError::Timeout,
+            1 => AuditUpstreamError::Connect,
+            _ => AuditUpstreamError::Request,
+        }
+    }
+
     /// Returns the serialized audit body summary for unobserved body bytes.
     fn not_observed_body_value() -> Value {
         Value::Object(Map::from_iter([(
@@ -1279,6 +1308,7 @@ mod proptests {
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
             denial_kind in 0_u8..12,
+            upstream_error_kind in 0_u8..3,
             method in "[A-Z]{3,8}",
             path in raw_path(),
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
@@ -1340,14 +1370,17 @@ mod proptests {
                     status.as_u16(),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
-                _ => (
-                    AuditOutcome::upstream_error(error_class.clone(), status, upstream),
-                    "upstream_error",
-                    Some(error_class.as_str()),
-                    not_observed_body_value(),
-                    status.as_u16(),
-                    Some((upstream_path.as_str(), upstream_query.as_deref())),
-                ),
+                _ => {
+                    let error = upstream_error(upstream_error_kind);
+                    (
+                        AuditOutcome::upstream_error(error, upstream),
+                        "upstream_error",
+                        Some(error.error_class()),
+                        not_observed_body_value(),
+                        error.status().as_u16(),
+                        Some((upstream_path.as_str(), upstream_query.as_deref())),
+                    )
+                }
             };
             let request = AuditRequestInput::new(
                 method,

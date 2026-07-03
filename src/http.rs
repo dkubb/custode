@@ -4,7 +4,7 @@ use crate::adapters::{
     ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
 };
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
-use crate::audit::{AuditDenialReason, AuditTarget, AuditWriter, RequestId};
+use crate::audit::{AuditDenialReason, AuditTarget, AuditUpstreamError, AuditWriter, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
@@ -356,16 +356,16 @@ async fn forward_request(
     let upstream_response = match client.send(upstream_request).await {
         Ok(upstream_response) => upstream_response,
         Err(error) => {
-            let status = upstream_error_status(&error);
+            let audit_error = audit_upstream_error(&error);
             let input = ResponseAuditInput {
                 method: method.to_string(),
-                outcome: ResponseAuditOutcome::upstream_error(upstream_error_class(&error), status),
+                outcome: ResponseAuditOutcome::upstream_error(audit_error),
                 request_body,
                 request_id,
                 target: accepted_target,
             };
             gateway.audit_response(input).await?;
-            return Ok(status_response(status));
+            return Ok(status_response(audit_error.status()));
         }
     };
     let status = upstream_response.status();
@@ -643,20 +643,12 @@ const fn response_header_error_class(error: HeaderError) -> &'static str {
     }
 }
 
-/// Maps upstream request errors to audit classes.
-const fn upstream_error_class(error: &UpstreamError) -> &'static str {
+/// Maps upstream request errors to closed audit errors.
+const fn audit_upstream_error(error: &UpstreamError) -> AuditUpstreamError {
     match error.kind() {
-        UpstreamErrorKind::Timeout => "upstream_timeout",
-        UpstreamErrorKind::Connect => "upstream_connect_failed",
-        UpstreamErrorKind::Request => "upstream_request_failed",
-    }
-}
-
-/// Maps upstream request errors to response statuses.
-const fn upstream_error_status(error: &UpstreamError) -> StatusCode {
-    match error.kind() {
-        UpstreamErrorKind::Timeout => StatusCode::GATEWAY_TIMEOUT,
-        UpstreamErrorKind::Connect | UpstreamErrorKind::Request => StatusCode::BAD_GATEWAY,
+        UpstreamErrorKind::Timeout => AuditUpstreamError::Timeout,
+        UpstreamErrorKind::Connect => AuditUpstreamError::Connect,
+        UpstreamErrorKind::Request => AuditUpstreamError::Request,
     }
 }
 
@@ -1174,15 +1166,14 @@ mod tests {
     }
 
     use super::{
-        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError,
+        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, audit_upstream_error,
         denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
         proxy, report_fatal_error, response_header_error_class, response_stream,
-        run_until_server_stops, send_stream_error, serve, synthetic_target, upstream_error_class,
-        upstream_error_status,
+        run_until_server_stops, send_stream_error, serve, synthetic_target,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditDenialReason, AuditError, RequestId};
+    use crate::audit::{AuditDenialReason, AuditError, AuditUpstreamError, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
@@ -2398,27 +2389,23 @@ mod tests {
     }
 
     #[test]
-    fn upstream_error_mappings_classify_connect_failures() {
-        let error = UpstreamError::new(UpstreamErrorKind::Connect, "connect failed");
+    fn upstream_errors_map_to_audit_errors() {
+        let connect_error = UpstreamError::new(UpstreamErrorKind::Connect, "connect failed");
 
-        assert_eq!(upstream_error_class(&error), "upstream_connect_failed");
-        assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);
-    }
-
-    #[test]
-    fn upstream_error_mappings_classify_timeouts() {
-        let error = UpstreamError::new(UpstreamErrorKind::Timeout, "timed out");
-
-        assert_eq!(upstream_error_class(&error), "upstream_timeout");
-        assert_eq!(upstream_error_status(&error), StatusCode::GATEWAY_TIMEOUT);
-    }
-
-    #[test]
-    fn upstream_error_mappings_classify_protocol_failures() {
-        let error = UpstreamError::new(UpstreamErrorKind::Request, "protocol failed");
-
-        assert_eq!(upstream_error_class(&error), "upstream_request_failed");
-        assert_eq!(upstream_error_status(&error), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            audit_upstream_error(&connect_error),
+            AuditUpstreamError::Connect
+        );
+        let timeout_error = UpstreamError::new(UpstreamErrorKind::Timeout, "timed out");
+        assert_eq!(
+            audit_upstream_error(&timeout_error),
+            AuditUpstreamError::Timeout
+        );
+        let request_error = UpstreamError::new(UpstreamErrorKind::Request, "protocol failed");
+        assert_eq!(
+            audit_upstream_error(&request_error),
+            AuditUpstreamError::Request
+        );
     }
 
     #[test]
