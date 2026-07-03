@@ -98,7 +98,7 @@ pub(crate) struct AuditEvent {
 /// Body accounting summary recorded in audit events.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub(crate) struct AuditBodySummary {
+struct AuditBodySummary {
     /// Closed body-summary state.
     kind: AuditBodySummaryKind,
 }
@@ -250,7 +250,7 @@ pub(crate) struct AuditTimestamp(String);
 impl AuditBodySummary {
     /// Creates an empty body summary.
     #[must_use]
-    pub(crate) const fn empty() -> Self {
+    const fn empty() -> Self {
         Self {
             kind: AuditBodySummaryKind::Empty,
         }
@@ -258,7 +258,7 @@ impl AuditBodySummary {
 
     /// Creates an observed body summary from a request body.
     #[must_use]
-    pub(crate) fn from_request_body(request_body: &AccountedBody) -> Self {
+    fn from_request_body(request_body: &AccountedBody) -> Self {
         request_body.digest().map_or_else(Self::empty, |digest| {
             Self::non_empty(
                 digest,
@@ -278,7 +278,7 @@ impl AuditBodySummary {
 
     /// Creates an unobserved body summary.
     #[must_use]
-    pub(crate) const fn not_observed() -> Self {
+    const fn not_observed() -> Self {
         Self {
             kind: AuditBodySummaryKind::NotObserved,
         }
