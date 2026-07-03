@@ -9,12 +9,13 @@ use core::num::NonZeroU64;
 use non_empty_string::NonEmptyString;
 use serde::{Serialize, Serializer};
 use std::io;
+use std::io::SeekFrom;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
 use tokio::fs::{File, OpenOptions, create_dir_all};
-use tokio::io::{AsyncWrite, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _};
 use tokio::sync::Mutex;
 
 /// Hex bytes in one half of a per-run token.
@@ -175,6 +176,13 @@ pub(crate) enum AuditError {
         path: PathBuf,
         /// I/O source error.
         source: io::Error,
+    },
+
+    /// Audit log ended with a partial NDJSON event.
+    #[error("audit path {path} has a partial final event")]
+    TornLog {
+        /// Path that failed.
+        path: PathBuf,
     },
 
     /// Audit log write failed.
@@ -1017,17 +1025,23 @@ impl AuditWriter {
                     source,
                 })?;
         }
-        let file = OpenOptions::new()
+        let mut audit_file = OpenOptions::new()
             .append(true)
             .create(true)
+            .read(true)
             .open(path)
             .await
             .map_err(|source| AuditError::Open {
                 path: path.to_owned(),
                 source,
             })?;
+        if has_torn_log_tail(&mut audit_file).await {
+            return Err(AuditError::TornLog {
+                path: path.to_owned(),
+            });
+        }
         Ok(Self {
-            file: Arc::new(Mutex::new(file)),
+            file: Arc::new(Mutex::new(audit_file)),
             max_event_bytes: config.max_audit_event_bytes(),
         })
     }
@@ -1129,6 +1143,26 @@ impl AuditTimestamp {
     pub(crate) fn now() -> Self {
         Self(humantime::format_rfc3339_nanos(SystemTime::now()).to_string())
     }
+}
+
+/// Returns whether a non-empty audit log lacks an NDJSON newline tail.
+async fn has_torn_log_tail(file: &mut File) -> bool {
+    let length = file
+        .metadata()
+        .await
+        .expect("opened audit log metadata should be readable");
+    if length.len() == 0 {
+        return false;
+    }
+
+    file.seek(SeekFrom::End(-1))
+        .await
+        .expect("opened non-empty audit log should seek to final byte");
+    let mut final_byte = [0_u8; 1];
+    file.read_exact(&mut final_byte)
+        .await
+        .expect("opened non-empty audit log final byte should be readable");
+    final_byte != *b"\n"
 }
 
 /// Validates the run token grammar.
@@ -1617,6 +1651,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_accepts_newline_terminated_audit_logs() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(&audit_log, b"{\"version\":3}\n").expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("audit writer should open");
+
+        writer
+            .write_event(&denied_event())
+            .await
+            .expect("event should append");
+
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        let mut lines = contents.lines();
+        let first = lines.next().expect("existing audit line should remain");
+        let second = lines.next().expect("appended audit line should exist");
+        let value: serde_json::Value =
+            serde_json::from_str(second).expect("appended audit line should be valid JSON");
+        let object = value
+            .as_object()
+            .expect("appended audit line should be an object");
+        let decision = object.get("decision").expect("decision should exist");
+
+        assert_eq!(first, "{\"version\":3}");
+        assert_eq!(decision, "denied");
+        assert_eq!(lines.next(), None);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_partial_final_audit_events() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(&audit_log, b"{\"version\":3}").expect("partial log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(matches!(result, Err(AuditError::TornLog { path }) if path == audit_log));
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        assert_eq!(contents, "{\"version\":3}");
+    }
+
+    #[tokio::test]
     async fn write_event_appends_one_ndjson_line() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
@@ -1731,20 +1810,24 @@ mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, AuditUpstreamTarget, ObservedBodySummary, RequestId,
+        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
         ResponseBodyPrefix, RunToken, RunTokenError,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::{ResponseBodyBytes, UpstreamOrigin};
+    use crate::config::{GatewayConfig, ResponseBodyBytes, UpstreamOrigin};
     use ::http::Method;
     use ::http::StatusCode;
     use core::num::NonZeroU64;
+    use core::num::NonZeroUsize;
     use core::time::Duration;
     use proptest::prelude::*;
     use proptest::{collection, option};
     use serde_json::{Map, Value, value::to_raw_value};
+    use std::fs;
     use std::time::UNIX_EPOCH;
+    use tempfile::tempdir;
+    use tokio::runtime::{Builder, Runtime};
 
     /// Returns body length as a `u64`.
     fn body_len(bytes: &[u8]) -> u64 {
@@ -1904,6 +1987,49 @@ mod proptests {
     /// Returns the fixed upstream origin used by serialization proptests.
     fn upstream_origin() -> UpstreamOrigin {
         UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse")
+    }
+
+    /// Returns an audit event byte limit large enough for open-only tests.
+    fn roomy_event_limit() -> NonZeroUsize {
+        NonZeroUsize::new(4096).expect("event limit should be non-zero")
+    }
+
+    /// Returns a local runtime for audit writer tests.
+    fn audit_runtime() -> Runtime {
+        Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("audit runtime should build")
+    }
+
+    /// Opens an audit writer on a local test runtime.
+    fn open_writer(config: &GatewayConfig) -> Result<AuditWriter, super::AuditError> {
+        audit_runtime().block_on(AuditWriter::open(config))
+    }
+
+    #[test]
+    fn open_classifies_existing_log_tails() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let empty_log = directory.path().join("empty.ndjson");
+        let complete_log = directory.path().join("complete.ndjson");
+        let torn_log = directory.path().join("torn.ndjson");
+        fs::write(&complete_log, b"{\"version\":3}\n").expect("complete log should be written");
+        fs::write(&torn_log, b"{\"version\":3}").expect("torn log should be written");
+
+        let empty_result = open_writer(&GatewayConfig::for_test(empty_log, roomy_event_limit()));
+        let complete_result =
+            open_writer(&GatewayConfig::for_test(complete_log, roomy_event_limit()));
+        let torn_result = open_writer(&GatewayConfig::for_test(
+            torn_log.clone(),
+            roomy_event_limit(),
+        ));
+
+        empty_result.expect("missing audit log should open");
+        complete_result.expect("newline-terminated audit log should open");
+        assert!(matches!(
+            torn_result,
+            Err(super::AuditError::TornLog { path }) if path == torn_log
+        ));
     }
 
     proptest! {
