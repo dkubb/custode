@@ -1,5 +1,6 @@
 //! Gateway configuration parsing.
 
+use crate::target::OriginFormPath;
 use ::http::Method;
 use clap::Args;
 use core::net::SocketAddr;
@@ -40,7 +41,7 @@ pub(crate) struct AllowedPath {
     /// Match mode.
     kind: AllowedPathKind,
     /// Path value.
-    value: String,
+    value: OriginFormPath,
 }
 
 /// Allowed path match mode.
@@ -80,8 +81,10 @@ pub(crate) enum ConfigError {
         operation: String,
     },
 
-    /// Path did not begin with `/`.
-    #[error("allowed path {path:?} must begin with /")]
+    /// Path was not a supported origin-form path.
+    #[error(
+        "allowed path {path:?} must be origin-form without dot segments or invalid percent-encoding"
+    )]
     InvalidAllowedPath {
         /// Invalid path.
         path: String,
@@ -646,14 +649,10 @@ fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperat
 }
 
 /// Parses an allowed path string.
-fn parse_allowed_path(path: &str) -> Result<String, ConfigError> {
-    if path.starts_with('/') {
-        Ok(path.to_owned())
-    } else {
-        Err(ConfigError::InvalidAllowedPath {
-            path: path.to_owned(),
-        })
-    }
+fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
+    OriginFormPath::parse(path).map_err(|_error| ConfigError::InvalidAllowedPath {
+        path: path.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -700,6 +699,19 @@ mod tests {
             AllowedPath::exact("v1/models"),
             Err(ConfigError::InvalidAllowedPath { .. }),
         ));
+    }
+
+    #[test]
+    fn allowed_path_rejects_dot_segments_and_invalid_percent_encoding() {
+        for path in ["/v1/../models", "/v1/%zz"] {
+            assert!(
+                matches!(
+                    AllowedPath::exact(path),
+                    Err(ConfigError::InvalidAllowedPath { .. }),
+                ),
+                "path {path:?} should fail closed",
+            );
+        }
     }
 
     #[test]
@@ -1104,15 +1116,31 @@ mod proptests {
         prop_oneof![Just("exact".to_owned()), Just("prefix".to_owned())]
     }
 
-    /// Allowed paths: `/`-joined segments, biased toward a colon suffix
-    /// because everything after the second delimiter belongs to the path.
-    fn allowed_path_valid() -> impl Strategy<Value = String> {
-        let base = collection::vec("[A-Za-z0-9_.-]{1,8}", 1..4)
-            .prop_map(|segments| format!("/{}", segments.join("/")));
+    /// Allowed path segments that are not dot segments.
+    fn allowed_path_segment_valid() -> impl Strategy<Value = String> {
         prop_oneof![
-            4 => collection::vec("[A-Za-z0-9_.-]{1,8}", 1..4)
-                .prop_map(|segments| format!("/{}", segments.join("/"))),
-            1 => base.prop_map(|path| format!("{path}:v1")),
+            4 => "[A-Za-z0-9_-]{1,8}",
+            1 => prop_oneof![
+                Just("...".to_owned()),
+                Just("a.".to_owned()),
+                Just(".a".to_owned()),
+                Just("a.b".to_owned()),
+            ],
+        ]
+    }
+
+    /// Allowed paths built from valid path segments.
+    fn allowed_path_plain() -> impl Strategy<Value = String> {
+        collection::vec(allowed_path_segment_valid(), 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
+    }
+
+    /// Allowed paths, biased toward a colon suffix because everything after
+    /// the second delimiter belongs to the path.
+    fn allowed_path_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => allowed_path_plain(),
+            1 => allowed_path_plain().prop_map(|path| format!("{path}:v1")),
         ]
     }
 
@@ -1126,9 +1154,13 @@ mod proptests {
         prop_oneof![1 => Just(1_usize), 4 => 1_usize..=max]
     }
 
-    /// Paths missing the required leading slash (first invalid form).
+    /// Paths outside the configured allowed path grammar.
     fn allowed_path_invalid() -> impl Strategy<Value = String> {
-        "[A-Za-z0-9_.-][A-Za-z0-9/_.-]{0,12}"
+        prop_oneof![
+            "[A-Za-z0-9_.-][A-Za-z0-9/_.-]{0,12}",
+            allowed_path_valid().prop_map(|path| format!("{path}/..")),
+            allowed_path_valid().prop_map(|path| format!("{path}%zz")),
+        ]
     }
 
     /// Accepted request paths: no dot segments, mirroring what the request

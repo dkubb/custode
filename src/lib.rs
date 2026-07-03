@@ -25,5 +25,6 @@ pub mod ports;
 pub mod process;
 #[cfg(test)]
 mod sim;
+pub mod target;
 
 pub use process::Cli;

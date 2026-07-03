@@ -1,13 +1,14 @@
 //! Method and path allowlist decisions.
 
 use crate::config::GatewayConfig;
+use crate::target::{OriginFormPath, OriginFormPathError, has_valid_percent_encoding};
 use ::http::Method;
 
 /// Request target accepted by the gateway.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AcceptedTarget {
     /// Origin-form path.
-    path: String,
+    path: OriginFormPath,
     /// Optional query string without `?`.
     query: Option<String>,
 }
@@ -30,21 +31,13 @@ impl AcceptedTarget {
     /// query contains invalid percent-encoding, or when the path contains a
     /// literal or percent-encoded dot segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
-        if !path.starts_with('/') {
-            return Err(RejectionReason::NonOriginForm);
-        }
-        if !has_valid_percent_encoding(path) {
-            return Err(RejectionReason::InvalidPercentEncoding);
-        }
+        let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
         if query.is_some_and(|value| !has_valid_percent_encoding(value)) {
             return Err(RejectionReason::InvalidPercentEncoding);
         }
-        if has_dot_segment(path) {
-            return Err(RejectionReason::DotSegment);
-        }
 
         Ok(Self {
-            path: path.to_owned(),
+            path: accepted_path,
             query: query.map(str::to_owned),
         })
     }
@@ -52,7 +45,7 @@ impl AcceptedTarget {
     /// Returns the accepted path.
     #[must_use]
     pub(crate) fn path(&self) -> &str {
-        &self.path
+        self.path.as_str()
     }
 
     /// Returns the accepted query.
@@ -95,35 +88,6 @@ pub(crate) enum RejectionReason {
     PathDenied,
 }
 
-/// Decoded dot-segment recognition state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DotSegmentState {
-    /// No dot bytes have been decoded.
-    Empty,
-    /// One dot byte has been decoded.
-    OneDot,
-    /// More than two dot bytes have been decoded.
-    TooLong,
-    /// Two dot bytes have been decoded.
-    TwoDots,
-}
-
-impl DotSegmentState {
-    /// Advances the state after decoding one dot byte.
-    const fn accept_dot(self) -> Self {
-        match self {
-            Self::Empty => Self::OneDot,
-            Self::OneDot => Self::TwoDots,
-            Self::TooLong | Self::TwoDots => Self::TooLong,
-        }
-    }
-
-    /// Returns true when the state is a forbidden dot segment.
-    const fn is_rejected(self) -> bool {
-        matches!(self, Self::OneDot | Self::TwoDots)
-    }
-}
-
 /// Checks whether a request is allowed by the configured method and path sets.
 #[must_use]
 fn is_allowed(config: &GatewayConfig, method: &Method, target: &AcceptedTarget) -> bool {
@@ -144,6 +108,15 @@ fn rejection_for(config: &GatewayConfig, method: &Method) -> RejectionReason {
         RejectionReason::PathDenied
     } else {
         RejectionReason::MethodDenied
+    }
+}
+
+/// Maps origin-form path errors into request rejection reasons.
+const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReason {
+    match error {
+        OriginFormPathError::DotSegment => RejectionReason::DotSegment,
+        OriginFormPathError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
+        OriginFormPathError::NonOriginForm => RejectionReason::NonOriginForm,
     }
 }
 
@@ -168,94 +141,6 @@ pub(crate) fn allow_target(
     }
 }
 
-/// Returns true when all percent escape sequences have two hex digits.
-fn has_valid_percent_encoding(path: &str) -> bool {
-    let mut bytes = path.as_bytes().iter().copied();
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            let Some(first) = bytes.next() else {
-                return false;
-            };
-            let Some(second) = bytes.next() else {
-                return false;
-            };
-            if !first.is_ascii_hexdigit() || !second.is_ascii_hexdigit() {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Returns true when any path segment decodes exactly to `.` or `..`.
-fn has_dot_segment(path: &str) -> bool {
-    path.split('/').any(segment_is_dot_segment)
-}
-
-/// Returns true when a path segment is a literal or percent-encoded dot segment.
-fn segment_is_dot_segment(segment: &str) -> bool {
-    let mut state = DotSegmentState::Empty;
-    let mut bytes = segment.as_bytes().iter().copied();
-    while let Some(byte) = bytes.next() {
-        let decoded = if byte == b'%' {
-            let Some(first) = bytes.next() else {
-                return false;
-            };
-            let Some(second) = bytes.next() else {
-                return false;
-            };
-            let Some(decoded) = decode_hex_pair(first, second) else {
-                return false;
-            };
-            decoded
-        } else {
-            byte
-        };
-
-        if decoded != b'.' {
-            return false;
-        }
-        state = state.accept_dot();
-        if state == DotSegmentState::TooLong {
-            return false;
-        }
-    }
-
-    state.is_rejected()
-}
-
-/// Decodes two ASCII hex digits into one byte.
-fn decode_hex_pair(first: u8, second: u8) -> Option<u8> {
-    let high = hex_value(first)?;
-    let low = hex_value(second)?;
-    // The nibbles occupy disjoint bit ranges, so `|` is exact here and a
-    // `^` mutation is equivalent.
-    Some((high << 4) | low)
-}
-
-/// Decodes one ASCII hex digit.
-const fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0' => Some(0),
-        b'1' => Some(1),
-        b'2' => Some(2),
-        b'3' => Some(3),
-        b'4' => Some(4),
-        b'5' => Some(5),
-        b'6' => Some(6),
-        b'7' => Some(7),
-        b'8' => Some(8),
-        b'9' => Some(9),
-        b'A' | b'a' => Some(10),
-        b'B' | b'b' => Some(11),
-        b'C' | b'c' => Some(12),
-        b'D' | b'd' => Some(13),
-        b'E' | b'e' => Some(14),
-        b'F' | b'f' => Some(15),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -263,7 +148,7 @@ const fn hex_value(byte: u8) -> Option<u8> {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{AcceptedTarget, DotSegmentState, RejectionReason, is_allowed, rejection_for};
+    use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::{AllowedPath, GatewayConfig};
     use ::http::Method;
     use core::num::NonZeroUsize;
@@ -321,33 +206,6 @@ mod tests {
             AcceptedTarget::new("/v1/responses/%2E/models", None),
             Err(RejectionReason::DotSegment),
         );
-    }
-
-    #[test]
-    fn hex_value_decodes_every_hex_digit() {
-        let digits = b"0123456789ABCDEF";
-        let lowercase = b"0123456789abcdef";
-
-        for (value, (upper, lower)) in digits.iter().zip(lowercase).enumerate() {
-            let expected = Some(u8::try_from(value).expect("hex values fit in u8"));
-            assert_eq!(super::hex_value(*upper), expected, "byte {upper:#x}");
-            assert_eq!(super::hex_value(*lower), expected, "byte {lower:#x}");
-        }
-    }
-
-    #[test]
-    fn hex_value_rejects_non_hex_bytes() {
-        for byte in [b'g', b'G', b'z', b'/', b':', b'@', b'`', 0, 0xFF] {
-            assert_eq!(super::hex_value(byte), None, "byte {byte:#x}");
-        }
-    }
-
-    #[test]
-    fn decode_hex_pair_combines_nibbles() {
-        assert_eq!(super::decode_hex_pair(b'2', b'e'), Some(0x2e));
-        assert_eq!(super::decode_hex_pair(b'3', b'0'), Some(0x30));
-        assert_eq!(super::decode_hex_pair(b'z', b'0'), None);
-        assert_eq!(super::decode_hex_pair(b'0', b'z'), None);
     }
 
     #[test]
@@ -418,44 +276,6 @@ mod tests {
             rejection_for(&config, &Method::DELETE),
             RejectionReason::MethodDenied,
         );
-    }
-
-    #[test]
-    fn accept_dot_walks_every_transition() {
-        let transitions = [
-            (DotSegmentState::Empty, DotSegmentState::OneDot),
-            (DotSegmentState::OneDot, DotSegmentState::TwoDots),
-            (DotSegmentState::TwoDots, DotSegmentState::TooLong),
-            (DotSegmentState::TooLong, DotSegmentState::TooLong),
-        ];
-
-        for (state, expected) in transitions {
-            assert_eq!(state.accept_dot(), expected, "state {state:?}");
-        }
-    }
-
-    #[test]
-    fn is_rejected_forbids_exactly_one_and_two_dots() {
-        let expected = [
-            (DotSegmentState::Empty, false),
-            (DotSegmentState::OneDot, true),
-            (DotSegmentState::TooLong, false),
-            (DotSegmentState::TwoDots, true),
-        ];
-
-        for (state, rejected) in expected {
-            assert_eq!(state.is_rejected(), rejected, "state {state:?}");
-        }
-    }
-
-    #[test]
-    fn segment_is_dot_segment_tolerates_malformed_escapes() {
-        // Truncated and non-hex escapes are rejected by percent-encoding
-        // validation before segment checks; the early returns here keep the
-        // function total over arbitrary segment inputs.
-        assert!(!super::segment_is_dot_segment("%"));
-        assert!(!super::segment_is_dot_segment("%2"));
-        assert!(!super::segment_is_dot_segment("%zz"));
     }
 }
 
@@ -544,16 +364,6 @@ mod proptests {
         ]
     }
 
-    /// Segments with a representative malformed escape: truncated at the
-    /// end of the segment or made of a non-hex pair.
-    fn segment_malformed_escape() -> impl Strategy<Value = String> {
-        (
-            "[.]{0,2}",
-            prop_oneof![Just(String::new()), "[0-9a-fA-F]", "[g-zG-Z]{2}"],
-        )
-            .prop_map(|(dots, escape)| format!("{dots}%{escape}"))
-    }
-
     /// Segments that decode exactly to `.` or `..` in any encoding mix.
     fn segment_dot() -> impl Strategy<Value = String> {
         prop_oneof![
@@ -627,15 +437,6 @@ mod proptests {
                 AcceptedTarget::new(&path, None),
                 Err(RejectionReason::NonOriginForm)
             );
-        }
-
-        #[test]
-        fn segment_scanning_is_total_over_malformed_escapes(
-            segment in segment_malformed_escape(),
-        ) {
-            // Percent validation rejects these before segment scanning at
-            // runtime; the scanner must still stay total over them.
-            prop_assert!(!super::segment_is_dot_segment(&segment));
         }
 
         #[test]
