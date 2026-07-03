@@ -2,8 +2,8 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
-    AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget, AuditUpstreamTarget,
-    ObservedAuditRequestInput, ObservedBodySummary, RequestId,
+    AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget,
+    AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -215,8 +215,7 @@ impl Gateway {
         method: &Method,
         target: AuditTarget,
         request_body: Option<&AccountedBody>,
-        error_class: &'static str,
-        status: u16,
+        reason: AuditDenialReason,
     ) -> Result<(), GatewayError> {
         let request = AuditRequestInput::for_denial(
             method.to_string(),
@@ -225,10 +224,7 @@ impl Gateway {
             request_body,
             self.config.upstream_origin().as_str().to_owned(),
         );
-        let event = AuditEvent::new_at(
-            AuditEventInput::denied(request, error_class, status),
-            self.clock.now(),
-        );
+        let event = AuditEvent::new_at(AuditEventInput::denied(request, reason), self.clock.now());
         self.audit.append_event(&event).await?;
         Ok(())
     }
@@ -343,7 +339,7 @@ mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditError, AuditTarget, AuditWriter, RequestId};
+    use crate::audit::{AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
     use ::http::{Method, StatusCode};
@@ -455,8 +451,7 @@ mod tests {
                 &Method::CONNECT,
                 AuditTarget::from_uri_parts("/", None),
                 None,
-                "connect_unsupported",
-                405,
+                AuditDenialReason::ConnectUnsupported,
             )
             .await
             .expect("denial audit should be written");
@@ -482,8 +477,7 @@ mod tests {
                 &Method::DELETE,
                 AuditTarget::from_uri_parts("/v1/models", None),
                 Some(&request_body),
-                "method_denied",
-                403,
+                AuditDenialReason::MethodDenied,
             )
             .await
             .expect("denial audit should be written");
@@ -504,8 +498,7 @@ mod tests {
                 &Method::POST,
                 AuditTarget::from_uri_parts("/v1/other", None),
                 Some(&request_body),
-                "path_denied",
-                403,
+                AuditDenialReason::PathDenied,
             )
             .await
             .expect("denial audit should be written");

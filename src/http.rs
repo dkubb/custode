@@ -166,7 +166,6 @@ async fn accept_allowed_target(
     request_body: &AccountedBody,
 ) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
-        let denial = AuditDenialReason::ConnectUnsupported;
         let target = synthetic_target(uri);
         gateway
             .audit_denial(
@@ -174,15 +173,15 @@ async fn accept_allowed_target(
                 method,
                 target,
                 Some(request_body),
-                denial.error_class(),
-                denial.status().as_u16(),
+                AuditDenialReason::ConnectUnsupported,
             )
             .await?;
-        return Ok(Err(status_response(denial.status())));
+        return Ok(Err(status_response(
+            AuditDenialReason::ConnectUnsupported.status(),
+        )));
     }
 
     if uri.authority().is_some() {
-        let denial = AuditDenialReason::AbsoluteFormUnsupported;
         let target = synthetic_target(uri);
         gateway
             .audit_denial(
@@ -190,11 +189,12 @@ async fn accept_allowed_target(
                 method,
                 target,
                 Some(request_body),
-                denial.error_class(),
-                denial.status().as_u16(),
+                AuditDenialReason::AbsoluteFormUnsupported,
             )
             .await?;
-        return Ok(Err(status_response(denial.status())));
+        return Ok(Err(status_response(
+            AuditDenialReason::AbsoluteFormUnsupported.status(),
+        )));
     }
 
     let target = match AcceptedTarget::new(uri.path(), uri.query()) {
@@ -208,8 +208,7 @@ async fn accept_allowed_target(
                     method,
                     target,
                     Some(request_body),
-                    denial.error_class(),
-                    denial.status().as_u16(),
+                    denial,
                 )
                 .await?;
             return Ok(Err(status_response(denial.status())));
@@ -226,8 +225,7 @@ async fn accept_allowed_target(
                     method,
                     target.into(),
                     Some(request_body),
-                    denial.error_class(),
-                    denial.status().as_u16(),
+                    denial,
                 )
                 .await?;
             Ok(Err(status_response(denial.status())))
@@ -243,7 +241,6 @@ async fn proxy(
     let _permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
-            let denial = AuditDenialReason::TooManyRequests;
             let request_id = state.gateway.next_request_id();
             let method = request.method().clone();
             let target = synthetic_target(request.uri());
@@ -254,15 +251,14 @@ async fn proxy(
                     &method,
                     target,
                     None,
-                    denial.error_class(),
-                    denial.status().as_u16(),
+                    AuditDenialReason::TooManyRequests,
                 )
                 .await
                 .is_err()
             {
                 return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
-            return Ok(denial.status().into_response());
+            return Ok(AuditDenialReason::TooManyRequests.status().into_response());
         }
     };
 
@@ -296,14 +292,7 @@ async fn handle_request(
             Err(error) => {
                 let reason = denial_reason_from_request_body(&error);
                 gateway
-                    .audit_denial(
-                        request_id,
-                        &method,
-                        synthetic_target(&uri),
-                        None,
-                        reason.error_class(),
-                        reason.status().as_u16(),
-                    )
+                    .audit_denial(request_id, &method, synthetic_target(&uri), None, reason)
                     .await?;
                 return Ok(status_response(reason.status()));
             }
@@ -326,8 +315,7 @@ async fn handle_request(
                         &method,
                         target.target().clone().into(),
                         Some(&request_body),
-                        reason.error_class(),
-                        reason.status().as_u16(),
+                        reason,
                     )
                     .await?;
                 return Ok(status_response(reason.status()));

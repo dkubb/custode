@@ -201,10 +201,8 @@ enum AuditOutcomeKind {
 
     /// Request was denied before upstream I/O.
     Denied {
-        /// Stable error class.
-        error_class: String,
-        /// Response status returned to the harness.
-        status: u16,
+        /// Denial reason.
+        reason: AuditDenialReason,
     },
 
     /// Response handling failed.
@@ -350,7 +348,7 @@ impl ObservedBodySummary {
 impl AuditDenialReason {
     /// Returns the stable audit error class.
     #[must_use]
-    pub(crate) const fn error_class(self) -> &'static str {
+    const fn error_class(self) -> &'static str {
         match self {
             Self::AbsoluteFormUnsupported => "absolute_form_unsupported",
             Self::ConnectUnsupported => "connect_unsupported",
@@ -404,12 +402,8 @@ impl AuditEventInput {
 
     /// Creates a denied audit event input.
     #[must_use]
-    pub(crate) fn denied(
-        request: AuditRequestInput,
-        error_class: impl Into<String>,
-        status: u16,
-    ) -> Self {
-        let outcome = AuditOutcome::denied(error_class, status);
+    pub(crate) const fn denied(request: AuditRequestInput, reason: AuditDenialReason) -> Self {
+        let outcome = AuditOutcome::denied(reason);
         Self { outcome, request }
     }
 
@@ -486,12 +480,9 @@ impl AuditOutcome {
 
     /// Creates a denied outcome.
     #[must_use]
-    fn denied(error_class: impl Into<String>, status: u16) -> Self {
+    const fn denied(reason: AuditDenialReason) -> Self {
         Self {
-            kind: AuditOutcomeKind::Denied {
-                error_class: error_class.into(),
-                status,
-            },
+            kind: AuditOutcomeKind::Denied { reason },
         }
     }
 
@@ -706,14 +697,11 @@ impl AuditEvent {
                 Some(status.as_u16()),
                 Some(upstream),
             ),
-            AuditOutcomeKind::Denied {
-                error_class,
-                status,
-            } => (
+            AuditOutcomeKind::Denied { reason } => (
                 AuditDecision::Denied,
-                Some(error_class),
+                Some(reason.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                Some(status),
+                Some(reason.status().as_u16()),
                 None,
             ),
             AuditOutcomeKind::ResponseError {
@@ -865,8 +853,9 @@ impl AuditTimestamp {
 )]
 mod tests {
     use super::{
-        AuditBodySummary, AuditDecision, AuditError, AuditEvent, AuditEventInput, AuditOutcome,
-        AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter, RequestId,
+        AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
+        AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
+        RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::config::GatewayConfig;
@@ -898,12 +887,11 @@ mod tests {
     fn denied_input(
         method: &str,
         target: AuditTarget,
-        error_class: &str,
-        status: u16,
+        reason: AuditDenialReason,
     ) -> AuditEventInput {
         AuditEventInput::new(
             request_input(method, target, AuditBodySummary::empty()),
-            AuditOutcome::denied(error_class, status),
+            AuditOutcome::denied(reason),
         )
     }
 
@@ -912,8 +900,7 @@ mod tests {
         AuditEvent::new(denied_input(
             "DELETE",
             AuditTarget::from_uri_parts("/v1/models", None),
-            "method_denied",
-            403,
+            AuditDenialReason::MethodDenied,
         ))
     }
 
@@ -943,8 +930,7 @@ mod tests {
         let input = denied_input(
             "CONNECT",
             AuditTarget::from_uri_parts("/v1/models", None),
-            "connect_unsupported",
-            405,
+            AuditDenialReason::ConnectUnsupported,
         );
 
         let event = AuditEvent::new(input);
@@ -956,7 +942,7 @@ mod tests {
     #[test]
     fn new_preserves_rejected_raw_path() {
         let target = AuditTarget::from_uri_parts("/v1/responses/%2e%2e/models", Some("limit=1"));
-        let input = denied_input("GET", target, "dot_segment", 400);
+        let input = denied_input("GET", target, AuditDenialReason::DotSegment);
 
         let event = AuditEvent::new(input);
 
@@ -984,8 +970,7 @@ mod tests {
         let input = denied_input(
             "DELETE",
             AuditTarget::from_uri_parts("/v1/models", None),
-            "method_not_allowed",
-            403,
+            AuditDenialReason::MethodDenied,
         );
 
         let value = serde_json::to_value(AuditEvent::new(input)).expect("event should serialize");
@@ -1202,8 +1187,8 @@ mod tests {
 )]
 mod proptests {
     use super::{
-        AuditBodySummary, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
-        AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
+        AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
+        AuditRequestInput, AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1249,6 +1234,24 @@ mod proptests {
         collection::vec(any::<u8>(), 1..33)
     }
 
+    /// Returns one closed denial reason from a generated index.
+    const fn denial_reason(index: u8) -> AuditDenialReason {
+        match index {
+            0 => AuditDenialReason::AbsoluteFormUnsupported,
+            1 => AuditDenialReason::ConnectUnsupported,
+            2 => AuditDenialReason::DotSegment,
+            3 => AuditDenialReason::InvalidPercentEncoding,
+            4 => AuditDenialReason::InvalidRequestConnectionHeader,
+            5 => AuditDenialReason::MethodDenied,
+            6 => AuditDenialReason::NonOriginForm,
+            7 => AuditDenialReason::PathDenied,
+            8 => AuditDenialReason::RequestBodyReadFailed,
+            9 => AuditDenialReason::RequestBodyTooLarge,
+            10 => AuditDenialReason::RequestHeadersTooLarge,
+            _ => AuditDenialReason::TooManyRequests,
+        }
+    }
+
     /// Returns the serialized audit body summary for unobserved body bytes.
     fn not_observed_body_value() -> Value {
         Value::Object(Map::from_iter([(
@@ -1275,6 +1278,7 @@ mod proptests {
         #[test]
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
+            denial_kind in 0_u8..12,
             method in "[A-Z]{3,8}",
             path in raw_path(),
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
@@ -1296,21 +1300,33 @@ mod proptests {
             let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
             let upstream =
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
-            let (outcome, decision, expected_error, expected_response_body, expected_upstream) = match outcome_kind {
+            let (
+                outcome,
+                decision,
+                expected_error,
+                expected_response_body,
+                expected_status,
+                expected_upstream,
+            ) = match outcome_kind {
                 0 => (
                     AuditOutcome::allowed(observed_response_body, status, upstream),
                     "allowed",
                     None,
                     body_value(response_bytes, &response_digest),
+                    status.as_u16(),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
-                1 => (
-                    AuditOutcome::denied(error_class.clone(), status.as_u16()),
-                    "denied",
-                    Some(error_class.as_str()),
-                    not_observed_body_value(),
-                    None,
-                ),
+                1 => {
+                    let reason = denial_reason(denial_kind);
+                    (
+                        AuditOutcome::denied(reason),
+                        "denied",
+                        Some(reason.error_class()),
+                        not_observed_body_value(),
+                        reason.status().as_u16(),
+                        None,
+                    )
+                }
                 2 => (
                     AuditOutcome::response_error(
                         error_class.clone(),
@@ -1321,6 +1337,7 @@ mod proptests {
                     "response_error",
                     Some(error_class.as_str()),
                     body_value(response_bytes, &response_digest),
+                    status.as_u16(),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 _ => (
@@ -1328,6 +1345,7 @@ mod proptests {
                     "upstream_error",
                     Some(error_class.as_str()),
                     not_observed_body_value(),
+                    status.as_u16(),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
             };
@@ -1356,7 +1374,7 @@ mod proptests {
                 prop_assert!(object["upstream_query"].is_null());
             }
             prop_assert_eq!(object["query"].is_null(), query.is_none());
-            prop_assert_eq!(object["status"].as_u64(), Some(u64::from(status.as_u16())));
+            prop_assert_eq!(object["status"].as_u64(), Some(u64::from(expected_status)));
             prop_assert_eq!(
                 &object["request_body"],
                 &body_value(request_bytes, &request_digest)
