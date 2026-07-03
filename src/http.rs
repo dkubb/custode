@@ -2515,21 +2515,12 @@ mod tests {
     async fn proxy_fails_when_response_header_audit_fails() {
         let directory = tempdir().expect("temporary directory should be created");
         let upstream = spawn_upstream(hello_upstream_router()).await;
-        let (_audit_log, audit_text) = audit_paths(directory.path());
-        let config = config_from_args(&[
-            "--upstream-origin",
-            &upstream,
-            "--allowed-operations",
-            "GET:exact:/v1/models",
-            "--audit-log",
-            &audit_text,
-            "--bind",
-            "127.0.0.1:0",
-            "--max-audit-event-bytes",
-            "1",
-            "--max-response-header-bytes",
-            "1",
-        ]);
+        let (base_config, _audit_log) = runtime_config(directory.path(), &upstream);
+        let config = base_config
+            .with_max_audit_event_bytes(NonZeroUsize::new(1).expect("limit should be non-zero"))
+            .with_max_response_header_bytes(
+                NonZeroUsize::new(1).expect("limit should be non-zero"),
+            );
         let (router, _fatal_receiver) = proxy_router(config, 1).await;
 
         let response = router
@@ -2663,19 +2654,9 @@ mod tests {
     async fn proxy_reports_a_fatal_error_when_the_completion_audit_fails() {
         let directory = tempdir().expect("temporary directory should be created");
         let upstream = spawn_upstream(hello_upstream_router()).await;
-        let (_audit_log, audit_text) = audit_paths(directory.path());
-        let config = config_from_args(&[
-            "--upstream-origin",
-            &upstream,
-            "--allowed-operations",
-            "GET:exact:/v1/models",
-            "--audit-log",
-            &audit_text,
-            "--bind",
-            "127.0.0.1:0",
-            "--max-audit-event-bytes",
-            "1",
-        ]);
+        let (base_config, _audit_log) = runtime_config(directory.path(), &upstream);
+        let config = base_config
+            .with_max_audit_event_bytes(NonZeroUsize::new(1).expect("limit should be non-zero"));
         let (router, mut fatal_receiver) = proxy_router(config, 1).await;
 
         let response = router
@@ -2704,19 +2685,9 @@ mod tests {
     async fn proxy_reports_a_fatal_error_when_the_disconnect_audit_fails() {
         let directory = tempdir().expect("temporary directory should be created");
         let upstream = spawn_upstream(slow_upstream_router()).await;
-        let (_audit_log, audit_text) = audit_paths(directory.path());
-        let config = config_from_args(&[
-            "--upstream-origin",
-            &upstream,
-            "--allowed-operations",
-            "GET:exact:/v1/models",
-            "--audit-log",
-            &audit_text,
-            "--bind",
-            "127.0.0.1:0",
-            "--max-audit-event-bytes",
-            "1",
-        ]);
+        let (base_config, _audit_log) = runtime_config(directory.path(), &upstream);
+        let config = base_config
+            .with_max_audit_event_bytes(NonZeroUsize::new(1).expect("limit should be non-zero"));
         let (router, mut fatal_receiver) = proxy_router(config, 1).await;
 
         let response = router

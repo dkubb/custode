@@ -347,7 +347,7 @@ CUSTODE_MAX_REQUEST_BYTES=10485760
 CUSTODE_MAX_RESPONSE_HEADER_BYTES=65536
 CUSTODE_MAX_RESPONSE_BYTES=104857600
 CUSTODE_MAX_CONCURRENT_REQUESTS=8
-CUSTODE_MAX_AUDIT_EVENT_BYTES=16384
+CUSTODE_MAX_AUDIT_EVENT_BYTES=65536
 ```
 
 `CUSTODE_UPSTREAM_ORIGIN` and `CUSTODE_ALLOWED_OPERATIONS` have no defaults:
@@ -381,6 +381,8 @@ Configuration parsing is fail-closed:
   bytes 4,096; incoming query bytes 8,192; allowed operation bytes 4,160;
   allowed operations 256; upstream origin bytes 255; request timeout 3,600
   seconds.
+- `CUSTODE_MAX_AUDIT_EVENT_BYTES` MUST also be at least 65,536 bytes, so every
+  admitted target under the current audit schema remains serializable.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.

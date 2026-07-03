@@ -13,6 +13,8 @@ use url::Url;
 
 /// Maximum serialized audit event bytes, including the NDJSON newline.
 const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
+/// Minimum serialized audit event bytes required for every admitted target.
+pub(crate) const MIN_AUDIT_EVENT_BYTES: usize = 0x0001_0000;
 /// Maximum configured allowed operation bytes.
 const MAX_ALLOWED_OPERATION_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES + 64;
 /// Maximum configured allowed operations.
@@ -103,6 +105,17 @@ pub(crate) enum ConfigError {
         name: &'static str,
         /// Maximum accepted value.
         max: u128,
+        /// Supplied value.
+        value: u128,
+    },
+
+    /// A numeric bound was below the supported minimum.
+    #[error("{name} must be at least {min}, got {value}")]
+    BoundTooSmall {
+        /// Bound name.
+        name: &'static str,
+        /// Minimum accepted value.
+        min: u128,
         /// Supplied value.
         value: u128,
     },
@@ -265,7 +278,11 @@ pub(crate) struct ServeArgs {
     bind: SocketAddr,
 
     /// Maximum serialized audit event bytes, including the NDJSON newline.
-    #[arg(long, env = "CUSTODE_MAX_AUDIT_EVENT_BYTES", default_value_t = 16_384)]
+    #[arg(
+        long,
+        env = "CUSTODE_MAX_AUDIT_EVENT_BYTES",
+        default_value_t = MIN_AUDIT_EVENT_BYTES
+    )]
     max_audit_event_bytes: usize,
 
     /// Maximum concurrent gateway requests.
@@ -428,11 +445,10 @@ impl AllowedPath {
 }
 
 impl AuditEventBytes {
-    /// Parses a test limit through the production bounds.
+    /// Builds a test-only limit for audit serialization failure paths.
     #[cfg(test)]
-    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
-        Self::parse("CUSTODE_MAX_AUDIT_EVENT_BYTES", value.get())
-            .expect("test audit event byte limit should be valid")
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
+        Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -442,7 +458,15 @@ impl AuditEventBytes {
 
     /// Parses and bounds audit event bytes.
     fn parse(name: &'static str, raw_value: usize) -> Result<Self, ConfigError> {
-        bounded_non_zero_usize(name, raw_value, MAX_AUDIT_EVENT_BYTES).map(Self)
+        let value = bounded_non_zero_usize(name, raw_value, MAX_AUDIT_EVENT_BYTES)?;
+        if value.get() < MIN_AUDIT_EVENT_BYTES {
+            return Err(ConfigError::BoundTooSmall {
+                name,
+                min: usize_to_u128(MIN_AUDIT_EVENT_BYTES),
+                value: usize_to_u128(raw_value),
+            });
+        }
+        Ok(Self(value))
     }
 }
 
@@ -600,7 +624,7 @@ impl GatewayConfig {
             audit_log,
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
             max_audit_event_bytes: AuditEventBytes::for_test(
-                NonZeroUsize::new(0x4000).expect("limit should be non-zero"),
+                NonZeroUsize::new(MIN_AUDIT_EVENT_BYTES).expect("limit should be non-zero"),
             ),
             max_concurrent_requests: ConcurrentRequests::for_test(
                 NonZeroUsize::new(8).expect("limit should be non-zero"),
@@ -703,11 +727,33 @@ impl GatewayConfig {
         &self.upstream_origin
     }
 
+    /// Returns this config with a replacement audit event byte limit.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn with_max_audit_event_bytes(
+        mut self,
+        max_audit_event_bytes: NonZeroUsize,
+    ) -> Self {
+        self.max_audit_event_bytes = AuditEventBytes::for_test(max_audit_event_bytes);
+        self
+    }
+
     /// Returns this config with a replacement response body byte limit.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_max_response_bytes(mut self, max_response_bytes: NonZeroU64) -> Self {
         self.max_response_bytes = ResponseBodyBytes::for_test(max_response_bytes);
+        self
+    }
+
+    /// Returns this config with a replacement response header byte limit.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_max_response_header_bytes(
+        mut self,
+        max_response_header_bytes: NonZeroUsize,
+    ) -> Self {
+        self.max_response_header_bytes = ResponseHeaderBytes::for_test(max_response_header_bytes);
         self
     }
 }
@@ -931,8 +977,8 @@ mod tests {
         AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
         MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
-        MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, ServeArgs, UpstreamOrigin,
-        non_zero_usize, parse_allowed_operations, usize_to_u128,
+        MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
+        UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -949,7 +995,7 @@ mod tests {
             allowed_operations: vec!["GET:exact:/v1/models".to_owned()],
             audit_log: PathBuf::from("/var/log/custode/proxy.ndjson"),
             bind: "127.0.0.1:8080".parse().expect("bind address should parse"),
-            max_audit_event_bytes: 0x4000,
+            max_audit_event_bytes: MIN_AUDIT_EVENT_BYTES,
             max_concurrent_requests: 8,
             max_request_bytes: 10_485_760,
             max_request_header_bytes: 0x8000,
@@ -993,6 +1039,7 @@ mod tests {
         assert_eq!(MAX_ALLOWED_OPERATION_BYTES, 4_160);
         assert_eq!(MAX_ALLOWED_OPERATIONS, 256);
         assert_eq!(MAX_AUDIT_EVENT_BYTES, 0x0010_0000);
+        assert_eq!(MIN_AUDIT_EVENT_BYTES, 0x0001_0000);
         assert_eq!(MAX_REQUEST_BYTES, 0x4000_0000);
         assert_eq!(MAX_REQUEST_HEADER_BYTES, 0x0010_0000);
         assert_eq!(MAX_RESPONSE_BYTES, 0x4000_0000);
@@ -1412,6 +1459,25 @@ mod tests {
     }
 
     #[test]
+    fn too_small_audit_event_bound_fails_closed_with_the_env_name() {
+        let mut args = serve_args();
+        let too_small = MIN_AUDIT_EVENT_BYTES
+            .checked_sub(1)
+            .expect("minimum should be above zero");
+        args.max_audit_event_bytes = too_small;
+
+        let error = GatewayConfig::try_from(args).expect_err("small bound should fail");
+
+        assert!(matches!(
+            error,
+            ConfigError::BoundTooSmall { name, min, value }
+                if name == "CUSTODE_MAX_AUDIT_EVENT_BYTES"
+                    && min == expected_usize_u128(MIN_AUDIT_EVENT_BYTES)
+                    && value == expected_usize_u128(too_small),
+        ));
+    }
+
+    #[test]
     fn serve_args_accept_the_supported_maximum_bounds() {
         let mut args = serve_args();
         args.max_audit_event_bytes = MAX_AUDIT_EVENT_BYTES;
@@ -1467,7 +1533,7 @@ mod tests {
                 .parse::<SocketAddr>()
                 .expect("bind address should parse")
         );
-        assert_eq!(config.max_audit_event_bytes().get(), 0x4000);
+        assert_eq!(config.max_audit_event_bytes().get(), MIN_AUDIT_EVENT_BYTES);
         assert_eq!(config.max_concurrent_requests().get(), 8);
         assert_eq!(config.max_request_bytes().get(), 10_485_760);
         assert_eq!(config.max_request_header_bytes().get(), 0x8000);
@@ -1598,8 +1664,8 @@ mod proptests {
         AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
         MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
-        MAX_RESPONSE_HEADER_BYTES, ServeArgs, UpstreamOrigin, parse_allowed_operations,
-        tests::serve_args,
+        MAX_RESPONSE_HEADER_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
+        parse_allowed_operations, tests::serve_args, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use ::http::Method;
@@ -1686,6 +1752,15 @@ mod proptests {
     /// Supported non-zero `usize` bounds biased toward the low boundary.
     fn bound_usize(max: usize) -> impl Strategy<Value = usize> {
         prop_oneof![1 => Just(1_usize), 4 => 1_usize..=max]
+    }
+
+    /// Supported audit event byte bounds biased toward both accepted edges.
+    fn audit_event_bound() -> impl Strategy<Value = usize> {
+        prop_oneof![
+            1 => Just(MIN_AUDIT_EVENT_BYTES),
+            1 => Just(MAX_AUDIT_EVENT_BYTES),
+            4 => MIN_AUDIT_EVENT_BYTES..=MAX_AUDIT_EVENT_BYTES,
+        ]
     }
 
     /// Paths outside the configured allowed path grammar.
@@ -1977,7 +2052,7 @@ mod proptests {
         #[test]
         fn serve_args_with_non_zero_bounds_convert(
             port in port_any(),
-            max_audit_event_bytes in bound_usize(MAX_AUDIT_EVENT_BYTES),
+            max_audit_event_bytes in audit_event_bound(),
             max_concurrent_requests in bound_usize(MAX_CONCURRENT_REQUESTS),
             max_request_bytes in bound_usize(MAX_REQUEST_BYTES),
             max_request_header_bytes in bound_usize(MAX_REQUEST_HEADER_BYTES),
@@ -2073,6 +2148,26 @@ mod proptests {
             let is_zero_bound =
                 matches!(error, ConfigError::ZeroBound { name } if name == expected_name);
             prop_assert!(is_zero_bound);
+        }
+
+        #[test]
+        fn serve_args_with_too_small_audit_event_bounds_fail_closed(
+            max_audit_event_bytes in 1_usize..MIN_AUDIT_EVENT_BYTES,
+        ) {
+            let mut args = serve_args();
+            args.max_audit_event_bytes = max_audit_event_bytes;
+
+            let error = GatewayConfig::try_from(args)
+                .expect_err("too-small audit event bound should fail");
+
+            let is_too_small = matches!(
+                error,
+                ConfigError::BoundTooSmall { name, min, value }
+                    if name == "CUSTODE_MAX_AUDIT_EVENT_BYTES"
+                        && min == usize_to_u128(MIN_AUDIT_EVENT_BYTES)
+                        && value == usize_to_u128(max_audit_event_bytes)
+            );
+            prop_assert!(is_too_small);
         }
 
         #[test]

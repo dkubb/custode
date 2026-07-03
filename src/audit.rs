@@ -1411,13 +1411,14 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditTarget,
-        AuditTimestamp, AuditWriter, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
-        ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
+        AuditTimestamp, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RUN_TOKEN_BYTES,
+        RequestId, ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
         inspect_audit_log_tail, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::{GatewayConfig, ResponseBodyBytes, UpstreamOrigin};
+    use crate::config::{GatewayConfig, MIN_AUDIT_EVENT_BYTES, ResponseBodyBytes, UpstreamOrigin};
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, StatusCode};
     use core::num::{NonZeroU64, NonZeroUsize};
     use core::pin::Pin;
@@ -2216,6 +2217,41 @@ mod tests {
             .write_event(&event)
             .await
             .expect("an event exactly at the limit should be written");
+
+        let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
+        assert_eq!(contents.lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn write_event_accepts_maximum_admitted_target_at_the_minimum() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES - 1));
+        let query = "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES);
+        let accepted =
+            AcceptedTarget::new(&path, Some(&query)).expect("maximum admitted target should parse");
+        let upstream = AuditUpstreamTarget::from(&accepted);
+        let input = request_input(
+            "GET",
+            AuditTarget::from(accepted),
+            AuditBodySummary::empty(),
+        );
+        let event = AuditEvent::new(AuditEventInput::new(
+            input,
+            AuditOutcome::allowed(ObservedBodySummary::Empty, StatusCode::OK, upstream),
+        ));
+        let config = GatewayConfig::for_test(
+            audit_log.clone(),
+            NonZeroUsize::new(MIN_AUDIT_EVENT_BYTES).expect("minimum should be non-zero"),
+        );
+        let writer = AuditWriter::open(&config)
+            .await
+            .expect("audit writer should open");
+
+        writer
+            .write_event(&event)
+            .await
+            .expect("a maximum admitted target should fit in the minimum event limit");
 
         let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
         assert_eq!(contents.lines().count(), 1);
