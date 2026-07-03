@@ -111,26 +111,33 @@ summary_report() {
 	local max_branches="${5}"
 
 	jq --raw-output '
-    .data[0].totals as $totals |
+    def require_number($metric; $field):
+      .data[0].totals[$metric][$field] as $value |
+      if ($value | type) == "number" then
+        $value
+      else
+        error("coverage summary missing numeric field: " + $metric + "." + $field)
+      end;
+
     [
       [
         "regions",
-        (($totals.regions.count // 0) - ($totals.regions.covered // 0)),
+        (require_number("regions"; "count") - require_number("regions"; "covered")),
         $max_regions
       ],
       [
         "functions",
-        (($totals.functions.count // 0) - ($totals.functions.covered // 0)),
+        (require_number("functions"; "count") - require_number("functions"; "covered")),
         $max_functions
       ],
       [
         "lines",
-        (($totals.lines.count // 0) - ($totals.lines.covered // 0)),
+        (require_number("lines"; "count") - require_number("lines"; "covered")),
         $max_lines
       ],
       [
         "branches",
-        (($totals.branches.count // 0) - ($totals.branches.covered // 0)),
+        (require_number("branches"; "count") - require_number("branches"; "covered")),
         $max_branches
       ]
     ] |

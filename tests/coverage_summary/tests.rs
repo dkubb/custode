@@ -45,6 +45,18 @@ fn run_coverage_summary(branches: &str, max_missed_branches: u32) -> Output {
         .expect("coverage script should run")
 }
 
+fn run_summary_fixture(fixture: &str) -> Output {
+    let directory = tempdir().expect("temporary directory should be created");
+    let summary = directory.path().join("coverage.json");
+    fs::write(&summary, fixture).expect("coverage fixture should be written");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-coverage-summary.sh");
+    Command::new(script)
+        .arg(summary)
+        .output()
+        .expect("coverage script should run")
+}
+
 fn assert_branch_failure(output: Output, missed: u32, maximum: u32) {
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
 
@@ -53,6 +65,18 @@ fn assert_branch_failure(output: Output, missed: u32, maximum: u32) {
         stderr.contains(&format!(
             "coverage metric branches has {missed} missed states; max is {maximum}"
         )),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn summary_requires_numeric_totals() {
+    let output = run_summary_fixture(r#"{"data":[{"totals":{}}]}"#);
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_ne!(output.status.code(), Some(0_i32));
+    assert!(
+        stderr.contains("coverage summary missing numeric field: regions."),
         "{stderr}"
     );
 }
