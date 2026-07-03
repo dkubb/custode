@@ -12,6 +12,7 @@
 
 export CUSTODE_UPSTREAM_ORIGIN="${CUSTODE_UPSTREAM_ORIGIN:-https://api.anthropic.com}"
 export CUSTODE_ALLOWED_OPERATIONS="${CUSTODE_ALLOWED_OPERATIONS:-POST:prefix:/v1/messages,GET:prefix:/v1/models}"
+export COMPOSE_PROJECT_NAME="custode_container_test_$$"
 
 readonly TAP_TEST_COUNT=6
 
