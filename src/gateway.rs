@@ -3,7 +3,7 @@
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
     AuditBodySummary, AuditError, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
-    AuditTarget, AuditUpstreamTarget, RequestId,
+    AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -74,7 +74,7 @@ enum ResponseAuditOutcomeKind {
     /// Request was allowed and completed normally.
     Allowed {
         /// Response body summary.
-        response_body: AuditBodySummary,
+        response_body: ObservedBodySummary,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -84,7 +84,7 @@ enum ResponseAuditOutcomeKind {
         /// Stable error class.
         error_class: String,
         /// Response body summary.
-        response_body: AuditBodySummary,
+        response_body: Option<ObservedBodySummary>,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -104,7 +104,7 @@ impl ResponseAuditOutcome {
     pub(crate) fn allowed(response_account: &ResponseAccount, status: u16) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::Allowed {
-                response_body: AuditBodySummary::from_response_account(response_account),
+                response_body: ObservedBodySummary::from_response_account(response_account),
                 status,
             },
         }
@@ -126,7 +126,7 @@ impl ResponseAuditOutcome {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseError {
                 error_class: error_class.into(),
-                response_body: AuditBodySummary::from_response_account(response_account),
+                response_body: Some(ObservedBodySummary::from_response_account(response_account)),
                 status,
             },
         }
@@ -138,7 +138,7 @@ impl ResponseAuditOutcome {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseError {
                 error_class: error_class.into(),
-                response_body: AuditBodySummary::not_observed(),
+                response_body: None,
                 status,
             },
         }
@@ -205,9 +205,24 @@ impl Gateway {
             } => AuditOutcome::allowed(response_body, status, upstream),
             ResponseAuditOutcomeKind::ResponseError {
                 error_class,
-                response_body,
+                response_body: Some(response_body),
                 status,
-            } => AuditOutcome::response_error(error_class, response_body, status, upstream),
+            } => AuditOutcome::response_error(
+                error_class,
+                response_body.into_summary(),
+                status,
+                upstream,
+            ),
+            ResponseAuditOutcomeKind::ResponseError {
+                error_class,
+                response_body: None,
+                status,
+            } => AuditOutcome::response_error(
+                error_class,
+                AuditBodySummary::not_observed(),
+                status,
+                upstream,
+            ),
             ResponseAuditOutcomeKind::UpstreamError {
                 error_class,
                 status,

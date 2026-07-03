@@ -114,6 +114,13 @@ pub(crate) enum AuditBodySummary {
     NotObserved,
 }
 
+/// Observed body summary recorded in audit events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ObservedBodySummary {
+    /// Observed body summary.
+    summary: AuditBodySummary,
+}
+
 /// Input used to construct an audit event.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuditEventInput {
@@ -129,7 +136,7 @@ pub(crate) enum AuditOutcome {
     /// Request was allowed and completed normally.
     Allowed {
         /// Response body summary.
-        response_body: AuditBodySummary,
+        response_body: ObservedBodySummary,
         /// Response status returned to the harness.
         status: u16,
         /// Upstream target.
@@ -237,20 +244,6 @@ impl AuditBodySummary {
         })
     }
 
-    /// Creates an observed body summary from a response body account.
-    #[must_use]
-    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
-        response_account
-            .finalize_digest()
-            .map_or_else(Self::empty, |digest| {
-                Self::non_empty(
-                    digest,
-                    NonZeroU64::new(response_account.byte_count())
-                        .expect("response body digest requires non-zero bytes"),
-                )
-            })
-    }
-
     /// Creates a non-empty body summary.
     #[must_use]
     pub(crate) const fn non_empty(blake3: BodyDigest, bytes: NonZeroU64) -> Self {
@@ -261,6 +254,30 @@ impl AuditBodySummary {
     #[must_use]
     pub(crate) const fn not_observed() -> Self {
         Self::NotObserved
+    }
+}
+
+impl ObservedBodySummary {
+    /// Creates an observed body summary from a response body account.
+    #[must_use]
+    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
+        let summary =
+            response_account
+                .finalize_digest()
+                .map_or_else(AuditBodySummary::empty, |digest| {
+                    AuditBodySummary::non_empty(
+                        digest,
+                        NonZeroU64::new(response_account.byte_count())
+                            .expect("response body digest requires non-zero bytes"),
+                    )
+                });
+        Self { summary }
+    }
+
+    /// Returns the underlying audit body summary.
+    #[must_use]
+    pub(crate) const fn into_summary(self) -> AuditBodySummary {
+        self.summary
     }
 }
 
@@ -276,7 +293,7 @@ impl AuditOutcome {
     /// Creates an allowed outcome.
     #[must_use]
     pub(crate) const fn allowed(
-        response_body: AuditBodySummary,
+        response_body: ObservedBodySummary,
         status: u16,
         upstream: AuditUpstreamTarget,
     ) -> Self {
@@ -428,7 +445,7 @@ impl AuditEvent {
             } => (
                 AuditDecision::Allowed,
                 None,
-                response_body,
+                response_body.into_summary(),
                 Some(status),
                 Some(upstream),
             ),
@@ -929,7 +946,7 @@ mod tests {
 mod proptests {
     use super::{
         AuditBodySummary, AuditEvent, AuditEventInput, AuditOutcome, AuditRequestInput,
-        AuditTarget, AuditUpstreamTarget, RequestId,
+        AuditTarget, AuditUpstreamTarget, ObservedBodySummary, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -951,6 +968,13 @@ mod proptests {
             BodyDigest::from_bytes(bytes),
             NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
         )
+    }
+
+    /// Returns an observed body summary for observed bytes.
+    fn observed_body_summary(bytes: &[u8]) -> ObservedBodySummary {
+        ObservedBodySummary {
+            summary: body_summary(bytes),
+        }
     }
 
     /// Returns the serialized non-empty body summary for observed bytes.
@@ -1004,13 +1028,14 @@ mod proptests {
             let request_bytes = body_len(&request_body_bytes);
             let request_digest = BodyDigest::from_bytes(&request_body_bytes).to_hex_string();
             let response_body = body_summary(&response_body_bytes);
+            let observed_response_body = observed_body_summary(&response_body_bytes);
             let response_bytes = body_len(&response_body_bytes);
             let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
             let upstream =
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
             let (outcome, decision, expected_error, expected_response_body, expected_upstream) = match outcome_kind {
                 0 => (
-                    AuditOutcome::allowed(response_body, status, upstream),
+                    AuditOutcome::allowed(observed_response_body, status, upstream),
                     "allowed",
                     None,
                     body_value(response_bytes, &response_digest),
