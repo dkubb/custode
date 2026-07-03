@@ -401,8 +401,11 @@ exceeded after response streaming starts, the gateway terminates the stream,
 writes a `response_error` audit event, and fails closed.
 
 If a required audit event cannot be written before a response to the harness
-has started, the gateway returns an HTTP 500 without forwarding the request
-upstream, instead of an unaudited response.
+has started, the gateway returns an HTTP 500 instead of an unaudited harness
+response. If the failure is detected before upstream I/O, the provider is not
+contacted. If the failure is detected after upstream I/O has already occurred,
+such as while auditing an upstream response-header failure, the provider
+request cannot be undone but the harness still receives only the HTTP 500.
 If a required audit event cannot be written after an upstream response has
 started, including after the upstream response body has been fully forwarded,
 the gateway exits the process with a non-zero status so the container fails
