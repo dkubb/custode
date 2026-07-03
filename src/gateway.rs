@@ -64,7 +64,14 @@ pub(crate) struct ResponseAuditInput {
 
 /// Closed response audit outcome.
 #[derive(Debug)]
-pub(crate) enum ResponseAuditOutcome {
+pub(crate) struct ResponseAuditOutcome {
+    /// Internal response audit outcome.
+    kind: ResponseAuditOutcomeKind,
+}
+
+/// Closed response audit outcome variants.
+#[derive(Debug)]
+enum ResponseAuditOutcomeKind {
     /// Request was allowed and completed normally.
     Allowed {
         /// Response body summary.
@@ -96,10 +103,18 @@ impl ResponseAuditOutcome {
     /// Creates an allowed response outcome.
     #[must_use]
     pub(crate) fn allowed(response_account: &ResponseAccount, status: u16) -> Self {
-        Self::Allowed {
-            response_body: response_body_summary(response_account),
-            status,
+        Self {
+            kind: ResponseAuditOutcomeKind::Allowed {
+                response_body: response_body_summary(response_account),
+                status,
+            },
         }
+    }
+
+    /// Consumes the outcome into its internal variant.
+    #[must_use]
+    fn into_kind(self) -> ResponseAuditOutcomeKind {
+        self.kind
     }
 
     /// Creates a response-error outcome.
@@ -109,29 +124,35 @@ impl ResponseAuditOutcome {
         response_account: &ResponseAccount,
         status: u16,
     ) -> Self {
-        Self::ResponseError {
-            error_class: error_class.into(),
-            response_body: response_body_summary(response_account),
-            status,
+        Self {
+            kind: ResponseAuditOutcomeKind::ResponseError {
+                error_class: error_class.into(),
+                response_body: response_body_summary(response_account),
+                status,
+            },
         }
     }
 
     /// Creates a response-error outcome before response body bytes were observed.
     #[must_use]
     pub(crate) fn response_error_without_body(error_class: impl Into<String>, status: u16) -> Self {
-        Self::ResponseError {
-            error_class: error_class.into(),
-            response_body: AuditBodySummary::not_observed(),
-            status,
+        Self {
+            kind: ResponseAuditOutcomeKind::ResponseError {
+                error_class: error_class.into(),
+                response_body: AuditBodySummary::not_observed(),
+                status,
+            },
         }
     }
 
     /// Creates an upstream-error outcome.
     #[must_use]
     pub(crate) fn upstream_error(error_class: impl Into<String>, status: u16) -> Self {
-        Self::UpstreamError {
-            error_class: error_class.into(),
-            status,
+        Self {
+            kind: ResponseAuditOutcomeKind::UpstreamError {
+                error_class: error_class.into(),
+                status,
+            },
         }
     }
 }
@@ -176,17 +197,17 @@ impl Gateway {
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
         let upstream = AuditUpstreamTarget::from(&input.target);
-        let outcome = match input.outcome {
-            ResponseAuditOutcome::Allowed {
+        let outcome = match input.outcome.into_kind() {
+            ResponseAuditOutcomeKind::Allowed {
                 response_body,
                 status,
             } => AuditOutcome::allowed(response_body, status, upstream),
-            ResponseAuditOutcome::ResponseError {
+            ResponseAuditOutcomeKind::ResponseError {
                 error_class,
                 response_body,
                 status,
             } => AuditOutcome::response_error(error_class, response_body, status, upstream),
-            ResponseAuditOutcome::UpstreamError {
+            ResponseAuditOutcomeKind::UpstreamError {
                 error_class,
                 status,
             } => AuditOutcome::upstream_error(error_class, status, upstream),
