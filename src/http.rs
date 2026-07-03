@@ -422,10 +422,24 @@ fn response_stream(
 
     tokio::spawn(async move {
         let mut stream = upstream_response.into_body();
+        let mut pending = None;
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(error) => {
+                Err(upstream_body_error) => {
+                    if let Some(previous_chunk) = pending.take()
+                        && sender.send(Ok(previous_chunk)).await.is_err()
+                    {
+                        if let Err(audit_error) = context
+                            .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                                error_class: "downstream_closed".to_owned(),
+                            })
+                            .await
+                        {
+                            tracing::error!(%audit_error, "failed to audit downstream close");
+                        }
+                        return;
+                    }
                     let error_class = "upstream_response_stream_failed".to_owned();
                     send_stream_error(
                         &sender,
@@ -434,12 +448,26 @@ fn response_stream(
                                 error_class,
                             })
                             .await,
-                        error.to_string(),
+                        upstream_body_error.to_string(),
                     )
                     .await;
                     return;
                 }
             };
+
+            if let Some(previous_chunk) = pending.take()
+                && sender.send(Ok(previous_chunk)).await.is_err()
+            {
+                if let Err(audit_error) = context
+                    .audit_after_response_started(ResponseStreamOutcome::ResponseError {
+                        error_class: "downstream_closed".to_owned(),
+                    })
+                    .await
+                {
+                    tracing::error!(%audit_error, "failed to audit downstream close");
+                }
+                return;
+            }
 
             if let Err(_error) = context.response_account.add_chunk(&chunk) {
                 let error_class = "response_body_too_large".to_owned();
@@ -456,24 +484,23 @@ fn response_stream(
                 return;
             }
 
-            if sender.send(Ok(chunk)).await.is_err() {
-                if let Err(error) = context
-                    .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                        error_class: "downstream_closed".to_owned(),
-                    })
-                    .await
-                {
-                    tracing::error!(%error, "failed to audit downstream close");
-                }
-                return;
-            }
+            pending = Some(chunk);
         }
 
-        if let Err(error) = context
+        match context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await
         {
-            tracing::error!(%error, "failed to audit completed response");
+            Ok(()) => {
+                if let Some(final_chunk) = pending
+                    && sender.send(Ok(final_chunk)).await.is_err()
+                {
+                    tracing::debug!("failed to send audited final response chunk");
+                }
+            }
+            Err(error) => {
+                send_stream_error(&sender, Err(error), "audit failed".to_owned()).await;
+            }
         }
     });
 
@@ -777,9 +804,6 @@ mod tests {
                 | (ScenarioAdmission::Open, _, _, ScenarioUpstream::Timeout) => {
                     ScenarioBody::Complete(Bytes::new())
                 }
-                (ScenarioAdmission::Open, _, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
-                    ScenarioBody::Complete(Bytes::from_static(b"scripted"))
-                }
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::FailFirst,
@@ -788,6 +812,9 @@ mod tests {
                 ) => ScenarioBody::Error(
                     "failed to write audit event: scripted audit failure".to_owned(),
                 ),
+                (ScenarioAdmission::Open, _, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
+                    ScenarioBody::Complete(Bytes::from_static(b"scripted"))
+                }
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
@@ -1953,10 +1980,13 @@ mod tests {
             .await
             .expect("proxy should respond");
 
-        let body = to_bytes(response.into_body(), 1_024)
+        let error = to_bytes(response.into_body(), 1_024)
             .await
-            .expect("response body should stream");
-        assert_eq!(body, Bytes::from_static(b"hello"));
+            .expect_err("completion audit failure should fail the response body");
+        assert!(
+            error.to_string().contains("audit event has"),
+            "response body error should report the audit failure: {error}"
+        );
         let fatal = fatal_receiver
             .recv()
             .await
