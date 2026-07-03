@@ -104,7 +104,8 @@ pub(crate) struct AuditEvent {
 }
 
 /// Body accounting summary recorded in audit events.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum AuditBodySummary {
     /// Body was observed and empty.
     Empty,

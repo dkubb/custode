@@ -5,6 +5,7 @@ use blake3::{Hash, Hasher};
 use core::error::Error as CoreError;
 use core::num::{NonZeroU64, NonZeroUsize};
 use http_body_util::LengthLimitError;
+use serde::{Serialize, Serializer};
 use thiserror::Error;
 
 /// Body bytes plus accounting metadata.
@@ -91,6 +92,15 @@ impl BodyDigest {
     #[must_use]
     pub(crate) fn to_hex_string(self) -> String {
         self.0.to_hex().to_string()
+    }
+}
+
+impl Serialize for BodyDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_hex_string())
     }
 }
 
