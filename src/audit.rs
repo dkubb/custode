@@ -75,6 +75,8 @@ pub(crate) struct AuditEvent {
     path: String,
     /// Request query string without `?`.
     query: Option<String>,
+    /// Request body summary.
+    request_body: AuditBodySummary,
     /// Request body digest.
     request_body_blake3: Option<String>,
     /// Whether request body bytes were observed.
@@ -83,6 +85,8 @@ pub(crate) struct AuditEvent {
     request_bytes: u64,
     /// Request identity.
     request_id: RequestId,
+    /// Response body summary.
+    response_body: AuditBodySummary,
     /// Response body digest.
     response_body_blake3: Option<String>,
     /// Whether response body bytes were observed.
@@ -233,8 +237,7 @@ impl AuditBodySummary {
         Self::Empty
     }
 
-    /// Consumes the summary into serialized audit body fields.
-    #[must_use]
+    /// Returns the legacy flat event fields for this body summary.
     fn into_event_fields(self) -> (Option<String>, bool, u64) {
         match self {
             Self::Empty => (None, true, 0),
@@ -466,17 +469,18 @@ impl AuditEvent {
             request_body.into_event_fields();
         let (response_body_blake3, response_body_observed, response_bytes) =
             response_body.into_event_fields();
-
         Self {
             decision,
             error_class,
             method,
             path: target.path().to_owned(),
             query: target.query().map(str::to_owned),
+            request_body,
             request_body_blake3,
             request_body_observed,
             request_bytes,
             request_id,
+            response_body,
             response_body_blake3,
             response_body_observed,
             response_bytes,
@@ -600,6 +604,7 @@ mod tests {
     use core::num::NonZeroUsize;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
+    use serde_json::{Map, Value};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::UNIX_EPOCH;
@@ -641,6 +646,22 @@ mod tests {
             "method_denied",
             403,
         ))
+    }
+
+    /// Expected serialized empty body summary.
+    fn empty_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("empty".to_owned()),
+        )]))
+    }
+
+    /// Expected serialized unobserved body summary.
+    fn not_observed_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("not_observed".to_owned()),
+        )]))
     }
 
     /// A roomy audit event limit for tests that should not hit the bound.
@@ -709,10 +730,12 @@ mod tests {
             "query",
             "request_body_blake3",
             "request_body_observed",
+            "request_body",
             "request_bytes",
             "request_id",
             "response_body_blake3",
             "response_body_observed",
+            "response_body",
             "response_bytes",
             "status",
             "timestamp",
@@ -733,8 +756,12 @@ mod tests {
         assert!(object["query"].is_null());
         assert!(object["request_body_blake3"].is_null());
         assert_eq!(object["request_body_observed"], true);
+        assert_eq!(object["request_body"], empty_body_value());
+        assert_eq!(object["request_bytes"], 0_u64);
         assert!(object["response_body_blake3"].is_null());
         assert_eq!(object["response_body_observed"], false);
+        assert_eq!(object["response_body"], not_observed_body_value());
+        assert_eq!(object["response_bytes"], 0_u64);
         assert_eq!(object["status"], 403_u64);
     }
 
@@ -927,6 +954,7 @@ mod proptests {
     use core::time::Duration;
     use proptest::prelude::*;
     use proptest::{collection, option};
+    use serde_json::{Map, Value};
     use std::time::UNIX_EPOCH;
 
     /// Returns body length as a `u64`.
@@ -942,9 +970,26 @@ mod proptests {
         )
     }
 
+    /// Returns the serialized non-empty body summary for observed bytes.
+    fn body_value(bytes: u64, digest: &str) -> Value {
+        Value::Object(Map::from_iter([
+            ("blake3".to_owned(), Value::String(digest.to_owned())),
+            ("bytes".to_owned(), Value::from(bytes)),
+            ("state".to_owned(), Value::String("non_empty".to_owned())),
+        ]))
+    }
+
     /// Generates observed non-empty body bytes.
     fn non_empty_body() -> impl Strategy<Value = Vec<u8>> {
         collection::vec(any::<u8>(), 1..33)
+    }
+
+    /// Returns the serialized audit body summary for unobserved body bytes.
+    fn not_observed_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("not_observed".to_owned()),
+        )]))
     }
 
     /// Raw request paths: origin-form spellings biased with the empty path
@@ -980,21 +1025,19 @@ mod proptests {
             let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
             let upstream =
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
-            let (outcome, decision, expected_error, expected_response_digest, expected_response_bytes, expected_upstream) = match outcome_kind {
+            let (outcome, decision, expected_error, expected_response_body, expected_upstream) = match outcome_kind {
                 0 => (
                     AuditOutcome::allowed(response_body, status, upstream),
                     "allowed",
                     None,
-                    Some(response_digest.as_str()),
-                    response_bytes,
+                    body_value(response_bytes, &response_digest),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 1 => (
                     AuditOutcome::denied(error_class.clone(), status),
                     "denied",
                     Some(error_class.as_str()),
-                    None,
-                    0,
+                    not_observed_body_value(),
                     None,
                 ),
                 2 => (
@@ -1006,16 +1049,14 @@ mod proptests {
                     ),
                     "response_error",
                     Some(error_class.as_str()),
-                    Some(response_digest.as_str()),
-                    response_bytes,
+                    body_value(response_bytes, &response_digest),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 _ => (
                     AuditOutcome::upstream_error(error_class.clone(), status, upstream),
                     "upstream_error",
                     Some(error_class.as_str()),
-                    None,
-                    0,
+                    not_observed_body_value(),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
             };
@@ -1032,7 +1073,7 @@ mod proptests {
                 .expect("event should serialize");
             let object = value.as_object().expect("event should be a JSON object");
 
-            prop_assert_eq!(object.len(), 18);
+            prop_assert_eq!(object.len(), 20);
             prop_assert_eq!(object["decision"].as_str(), Some(decision));
             let expected_path = if path.is_empty() { "/" } else { path.as_str() };
             prop_assert_eq!(object["path"].as_str(), Some(expected_path));
@@ -1046,18 +1087,11 @@ mod proptests {
             prop_assert_eq!(object["query"].is_null(), query.is_none());
             prop_assert_eq!(object["status"].as_u64(), Some(u64::from(status)));
             prop_assert_eq!(
-                object["request_body_blake3"].as_str(),
-                Some(request_digest.as_str())
+                &object["request_body"],
+                &body_value(request_bytes, &request_digest)
             );
-            prop_assert_eq!(object["request_body_observed"].as_bool(), Some(true));
-            prop_assert_eq!(object["response_body_blake3"].as_str(), expected_response_digest);
-            prop_assert_eq!(
-                object["response_body_observed"].as_bool(),
-                Some(expected_response_digest.is_some())
-            );
+            prop_assert_eq!(&object["response_body"], &expected_response_body);
             prop_assert_eq!(object["error_class"].as_str(), expected_error);
-            prop_assert_eq!(object["request_bytes"].as_u64(), Some(request_bytes));
-            prop_assert_eq!(object["response_bytes"].as_u64(), Some(expected_response_bytes));
         }
 
         #[test]

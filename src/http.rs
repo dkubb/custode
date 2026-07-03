@@ -688,11 +688,11 @@ mod tests {
         use axum::body::Bytes;
         use http::{Method, StatusCode};
         use proptest::prelude::*;
-        use serde_json::Value;
+        use serde_json::{Map, Value};
         use tokio::runtime::Builder;
 
         /// Serialized audit event field names.
-        const AUDIT_FIELDS: [&str; 18] = [
+        const AUDIT_FIELDS: [&str; 20] = [
             "decision",
             "error_class",
             "method",
@@ -700,10 +700,12 @@ mod tests {
             "query",
             "request_body_blake3",
             "request_body_observed",
+            "request_body",
             "request_bytes",
             "request_id",
             "response_body_blake3",
             "response_body_observed",
+            "response_body",
             "response_bytes",
             "status",
             "timestamp",
@@ -713,13 +715,37 @@ mod tests {
             "version",
         ];
 
-        /// Returns a digest field for an optional body.
-        fn body_digest_value(body: &[u8]) -> Value {
+        /// Returns the serialized audit body summary for observed body bytes.
+        fn audit_body_value(body: &[u8]) -> Result<Value, TestCaseError> {
             if body.is_empty() {
-                Value::Null
+                Ok(empty_body_value())
             } else {
-                Value::String(blake3::hash(body).to_hex().to_string())
+                Ok(Value::Object(Map::from_iter([
+                    (
+                        "blake3".to_owned(),
+                        Value::String(blake3::hash(body).to_hex().to_string()),
+                    ),
+                    (
+                        "bytes".to_owned(),
+                        Value::from(
+                            u64::try_from(body.len()).map_err(|_error| {
+                                TestCaseError::fail("body length should fit u64")
+                            })?,
+                        ),
+                    ),
+                    ("state".to_owned(), Value::String("non_empty".to_owned())),
+                ])))
             }
+        }
+
+        fn audit_body_flat_fields(summary: &Value) -> (Value, bool, u64) {
+            let digest = summary.get("blake3").cloned().unwrap_or(Value::Null);
+            let observed = summary.get("state").and_then(Value::as_str) != Some("not_observed");
+            let bytes = summary
+                .get("bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            (digest, observed, bytes)
         }
 
         /// Returns lower-case headers named by generated connection headers.
@@ -751,55 +777,52 @@ mod tests {
         /// Returns the expected audit decision tuple for a recording scenario.
         fn expected_audit_outcome(
             scenario: &Scenario,
-        ) -> (&'static str, Value, StatusCode, u64, Value, bool, bool) {
+        ) -> Result<(&'static str, Value, StatusCode, u64, Value, bool), TestCaseError> {
             match (scenario.admission(), scenario.bounds(), scenario.upstream()) {
-                (ScenarioAdmission::Saturated, _, _) => (
+                (ScenarioAdmission::Saturated, _, _) => Ok((
                     "denied",
                     Value::String("too_many_requests".to_owned()),
                     StatusCode::TOO_MANY_REQUESTS,
                     0,
-                    Value::Null,
+                    not_observed_body_value(),
                     false,
-                    false,
-                ),
-                (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => (
+                )),
+                (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => Ok((
                     "upstream_error",
                     Value::String("upstream_timeout".to_owned()),
                     StatusCode::GATEWAY_TIMEOUT,
                     0,
-                    Value::Null,
-                    false,
+                    not_observed_body_value(),
                     true,
-                ),
-                (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _) => (
+                )),
+                (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _) => Ok((
                     "response_error",
                     Value::String("response_body_too_large".to_owned()),
                     StatusCode::CREATED,
                     0,
-                    Value::Null,
+                    empty_body_value(),
                     true,
-                    true,
-                ),
+                )),
                 (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::StreamError) => {
-                    (
+                    Ok((
                         "response_error",
                         Value::String("upstream_response_stream_failed".to_owned()),
                         StatusCode::CREATED,
                         5,
-                        body_digest_value(b"first"),
+                        audit_body_value(b"first")?,
                         true,
-                        true,
-                    )
+                    ))
                 }
-                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => (
-                    "allowed",
-                    Value::Null,
-                    StatusCode::CREATED,
-                    8,
-                    body_digest_value(b"scripted"),
-                    true,
-                    true,
-                ),
+                (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => {
+                    Ok((
+                        "allowed",
+                        Value::Null,
+                        StatusCode::CREATED,
+                        8,
+                        audit_body_value(b"scripted")?,
+                        true,
+                    ))
+                }
             }
         }
 
@@ -902,18 +925,29 @@ mod tests {
             ) && !connection_headers.iter().any(|dynamic| dynamic == name)
         }
 
-        /// Returns the body bytes that should be represented in the audit log.
-        fn request_body_for_audit(scenario: &Scenario) -> &[u8] {
+        /// Returns the body state that should be represented in the audit log.
+        fn request_body_value_for_audit(scenario: &Scenario) -> Result<Value, TestCaseError> {
             if scenario.admission() == ScenarioAdmission::Saturated {
-                &[]
+                Ok(not_observed_body_value())
             } else {
-                scenario.request().body()
+                audit_body_value(scenario.request().body())
             }
         }
 
-        /// Returns whether the request body was observed for audit purposes.
-        const fn request_body_observed(scenario: &Scenario) -> bool {
-            matches!(scenario.admission(), ScenarioAdmission::Open)
+        /// Returns the serialized audit body summary for unobserved body bytes.
+        fn not_observed_body_value() -> Value {
+            Value::Object(Map::from_iter([(
+                "state".to_owned(),
+                Value::String("not_observed".to_owned()),
+            )]))
+        }
+
+        /// Returns the serialized audit body summary for observed empty body bytes.
+        fn empty_body_value() -> Value {
+            Value::Object(Map::from_iter([(
+                "state".to_owned(),
+                Value::String("empty".to_owned()),
+            )]))
         }
 
         /// Returns the request path from a generated target.
@@ -944,15 +978,13 @@ mod tests {
                 prop_assert!(object.contains_key(field), "missing audit field {field}");
             }
 
-            let (
-                decision,
-                error_class,
-                status,
-                response_bytes,
-                response_digest,
-                response_body_observed,
-                has_upstream,
-            ) = expected_audit_outcome(scenario);
+            let (decision, error_class, status, response_bytes, response_body, has_upstream) =
+                expected_audit_outcome(scenario)?;
+            let request_body = request_body_value_for_audit(scenario)?;
+            let (request_digest, request_observed, request_bytes) =
+                audit_body_flat_fields(&request_body);
+            let (response_digest, response_observed, flat_response_bytes) =
+                audit_body_flat_fields(&response_body);
             let path = request_path(scenario.request().target());
             let query = query_value(scenario.request().target());
             prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
@@ -963,28 +995,20 @@ mod tests {
             );
             prop_assert_eq!(&object["path"], &Value::String(path.to_owned()));
             prop_assert_eq!(&object["query"], &query);
-            prop_assert_eq!(
-                &object["request_body_blake3"],
-                &body_digest_value(request_body_for_audit(scenario))
-            );
+            prop_assert_eq!(&object["request_body_blake3"], &request_digest);
             prop_assert_eq!(
                 &object["request_body_observed"],
-                &Value::Bool(request_body_observed(scenario))
+                &Value::Bool(request_observed)
             );
-            prop_assert_eq!(
-                &object["request_bytes"],
-                &Value::from(
-                    u64::try_from(request_body_for_audit(scenario).len()).map_err(|_error| {
-                        TestCaseError::fail("request body length should fit u64")
-                    })?
-                )
-            );
+            prop_assert_eq!(&object["request_body"], &request_body);
+            prop_assert_eq!(&object["request_bytes"], &Value::from(request_bytes));
             prop_assert_eq!(&object["response_body_blake3"], &response_digest);
             prop_assert_eq!(
                 &object["response_body_observed"],
-                &Value::Bool(response_body_observed)
+                &Value::Bool(response_observed)
             );
-            prop_assert_eq!(&object["response_bytes"], &Value::from(response_bytes));
+            prop_assert_eq!(&object["response_body"], &response_body);
+            prop_assert_eq!(&object["response_bytes"], &Value::from(flat_response_bytes));
             prop_assert!(
                 response_bytes <= max_response_bytes(scenario),
                 "audited response bytes exceeded scenario bound"
@@ -1231,6 +1255,45 @@ mod tests {
         (audit_log, text)
     }
 
+    /// Expected serialized empty body summary.
+    fn empty_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("empty".to_owned()),
+        )]))
+    }
+
+    fn body_digest_value(body: &[u8]) -> Value {
+        if body.is_empty() {
+            Value::Null
+        } else {
+            Value::String(blake3::hash(body).to_hex().to_string())
+        }
+    }
+
+    /// Expected serialized non-empty body summary.
+    fn non_empty_body_value(body: &[u8]) -> Value {
+        Value::Object(Map::from_iter([
+            (
+                "blake3".to_owned(),
+                Value::String(blake3::hash(body).to_hex().to_string()),
+            ),
+            (
+                "bytes".to_owned(),
+                Value::from(u64::try_from(body.len()).expect("test body length should fit u64")),
+            ),
+            ("state".to_owned(), Value::String("non_empty".to_owned())),
+        ]))
+    }
+
+    /// Expected serialized unobserved body summary.
+    fn not_observed_body_value() -> Value {
+        Value::Object(Map::from_iter([(
+            "state".to_owned(),
+            Value::String("not_observed".to_owned()),
+        )]))
+    }
+
     /// Builds an empty-body request for the supplied method and target.
     fn build_request(method: Method, target: &str) -> Request<Body> {
         Request::builder()
@@ -1275,9 +1338,10 @@ mod tests {
             ("query".to_owned(), Value::String("limit=1".to_owned())),
             (
                 "request_body_blake3".to_owned(),
-                Value::String(blake3::hash(b"hello").to_hex().to_string()),
+                body_digest_value(b"hello"),
             ),
             ("request_body_observed".to_owned(), Value::Bool(true)),
+            ("request_body".to_owned(), non_empty_body_value(b"hello")),
             ("request_bytes".to_owned(), Value::from(5_u64)),
             (
                 "request_id".to_owned(),
@@ -1285,9 +1349,13 @@ mod tests {
             ),
             (
                 "response_body_blake3".to_owned(),
-                Value::String(blake3::hash(b"scripted").to_hex().to_string()),
+                body_digest_value(b"scripted"),
             ),
             ("response_body_observed".to_owned(), Value::Bool(true)),
+            (
+                "response_body".to_owned(),
+                non_empty_body_value(b"scripted"),
+            ),
             ("response_bytes".to_owned(), Value::from(8_u64)),
             ("status".to_owned(), Value::from(201_u64)),
             (
@@ -1326,6 +1394,7 @@ mod tests {
             ("query".to_owned(), Value::Null),
             ("request_body_blake3".to_owned(), Value::Null),
             ("request_body_observed".to_owned(), Value::Bool(true)),
+            ("request_body".to_owned(), empty_body_value()),
             ("request_bytes".to_owned(), Value::from(0_u64)),
             (
                 "request_id".to_owned(),
@@ -1333,6 +1402,7 @@ mod tests {
             ),
             ("response_body_blake3".to_owned(), Value::Null),
             ("response_body_observed".to_owned(), Value::Bool(false)),
+            ("response_body".to_owned(), not_observed_body_value()),
             ("response_bytes".to_owned(), Value::from(0_u64)),
             ("status".to_owned(), Value::from(504_u64)),
             (
