@@ -1,7 +1,7 @@
 //! Bounded body accounting helpers.
 
 use axum::body::{Body, to_bytes};
-use blake3::Hasher;
+use blake3::{Hash, Hasher};
 use core::error::Error as CoreError;
 use core::num::{NonZeroU64, NonZeroUsize};
 use http_body_util::LengthLimitError;
@@ -13,8 +13,12 @@ pub(crate) struct AccountedBody {
     /// Raw body bytes.
     bytes: Vec<u8>,
     /// BLAKE3 digest for non-empty bodies.
-    digest: Option<String>,
+    digest: Option<BodyDigest>,
 }
+
+/// BLAKE3 digest for observed non-empty body bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BodyDigest(Hash);
 
 impl AccountedBody {
     /// Returns the byte count.
@@ -31,8 +35,8 @@ impl AccountedBody {
 
     /// Returns the BLAKE3 digest when the body is non-empty.
     #[must_use]
-    pub(crate) fn digest(&self) -> Option<&str> {
-        self.digest.as_deref()
+    pub(crate) const fn digest(&self) -> Option<BodyDigest> {
+        self.digest
     }
 
     /// Creates body accounting from bytes.
@@ -41,9 +45,7 @@ impl AccountedBody {
         let digest = if bytes.is_empty() {
             None
         } else {
-            let mut hasher = Hasher::new();
-            hasher.update(&bytes);
-            Some(hasher.finalize().to_hex().to_string())
+            Some(BodyDigest::from_bytes(&bytes))
         };
         Self { bytes, digest }
     }
@@ -69,6 +71,26 @@ impl AccountedBody {
             }
         })?;
         Ok(Self::from_bytes(bytes.to_vec()))
+    }
+}
+
+impl BodyDigest {
+    /// Creates a body digest from complete body bytes.
+    #[must_use]
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes))
+    }
+
+    /// Creates a body digest from a streaming hasher.
+    #[must_use]
+    fn from_hasher(hasher: &Hasher) -> Self {
+        Self(hasher.finalize())
+    }
+
+    /// Returns the digest as lowercase BLAKE3 hex.
+    #[must_use]
+    pub(crate) fn to_hex_string(self) -> String {
+        self.0.to_hex().to_string()
     }
 }
 
@@ -111,11 +133,11 @@ impl ResponseAccount {
 
     /// Finalizes the response digest.
     #[must_use]
-    pub(crate) fn finalize_digest(&self) -> Option<String> {
+    pub(crate) fn finalize_digest(&self) -> Option<BodyDigest> {
         if self.bytes == 0 {
             None
         } else {
-            Some(self.hasher.finalize().to_hex().to_string())
+            Some(BodyDigest::from_hasher(&self.hasher))
         }
     }
 
@@ -172,7 +194,7 @@ pub(crate) enum BodyError {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{AccountedBody, BodyError, RequestBodyError, ResponseAccount};
+    use super::{AccountedBody, BodyDigest, BodyError, RequestBodyError, ResponseAccount};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
     use futures_util::stream;
@@ -181,6 +203,11 @@ mod tests {
 
     /// BLAKE3 digest of `hello`, computed independently with `b3sum`.
     const HELLO_DIGEST: &str = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
+
+    /// Returns digest hex for assertion output.
+    fn digest_hex(digest: Option<BodyDigest>) -> Option<String> {
+        digest.map(BodyDigest::to_hex_string)
+    }
 
     /// A roomy body limit for tests that should not hit the bound.
     fn roomy_limit() -> NonZeroUsize {
@@ -195,7 +222,10 @@ mod tests {
 
         assert_eq!(accounted.bytes(), b"hello");
         assert_eq!(accounted.byte_count(), 5);
-        assert_eq!(accounted.digest(), Some(HELLO_DIGEST));
+        assert_eq!(
+            digest_hex(accounted.digest()).as_deref(),
+            Some(HELLO_DIGEST)
+        );
     }
 
     #[tokio::test]
@@ -298,6 +328,9 @@ mod tests {
             .add_chunk(b"lo")
             .expect("second chunk should fit within the limit");
 
-        assert_eq!(account.finalize_digest().as_deref(), Some(HELLO_DIGEST));
+        assert_eq!(
+            digest_hex(account.finalize_digest()).as_deref(),
+            Some(HELLO_DIGEST)
+        );
     }
 }

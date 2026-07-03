@@ -241,7 +241,7 @@ fn request_body_summary(request_body: &AccountedBody) -> AuditBodySummary {
         .digest()
         .map_or_else(AuditBodySummary::empty, |digest| {
             AuditBodySummary::non_empty(
-                digest.to_owned(),
+                digest,
                 NonZeroU64::new(request_body.byte_count())
                     .expect("request body digest requires non-zero bytes"),
             )

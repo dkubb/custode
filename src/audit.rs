@@ -1,6 +1,7 @@
 //! Audit event schema and writer.
 
 use crate::allowlist::AcceptedTarget;
+use crate::body::BodyDigest;
 use crate::config::GatewayConfig;
 use core::num::NonZeroU64;
 use serde::Serialize;
@@ -111,7 +112,7 @@ pub(crate) enum AuditBodySummary {
     /// Body was observed and non-empty.
     NonEmpty {
         /// Body digest.
-        blake3: String,
+        blake3: BodyDigest,
         /// Body byte count.
         bytes: NonZeroU64,
     },
@@ -236,14 +237,14 @@ impl AuditBodySummary {
     fn into_event_fields(self) -> (Option<String>, bool, u64) {
         match self {
             Self::Empty => (None, true, 0),
-            Self::NonEmpty { blake3, bytes } => (Some(blake3), true, bytes.get()),
+            Self::NonEmpty { blake3, bytes } => (Some(blake3.to_hex_string()), true, bytes.get()),
             Self::NotObserved => (None, false, 0),
         }
     }
 
     /// Creates a non-empty body summary.
     #[must_use]
-    pub(crate) const fn non_empty(blake3: String, bytes: NonZeroU64) -> Self {
+    pub(crate) const fn non_empty(blake3: BodyDigest, bytes: NonZeroU64) -> Self {
         Self::NonEmpty { blake3, bytes }
     }
 
@@ -920,15 +921,29 @@ mod proptests {
         AuditTarget, AuditUpstreamTarget, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
+    use crate::body::BodyDigest;
     use core::num::NonZeroU64;
     use core::time::Duration;
-    use proptest::option;
     use proptest::prelude::*;
+    use proptest::{collection, option};
     use std::time::UNIX_EPOCH;
 
-    /// BLAKE3 hex digest shaped strings.
-    fn hex_digest() -> impl Strategy<Value = String> {
-        "[0-9a-f]{64}"
+    /// Returns body length as a `u64`.
+    fn body_len(bytes: &[u8]) -> u64 {
+        u64::try_from(bytes.len()).expect("generated body length should fit u64")
+    }
+
+    /// Returns a non-empty audit body summary for observed bytes.
+    fn body_summary(bytes: &[u8]) -> AuditBodySummary {
+        AuditBodySummary::non_empty(
+            BodyDigest::from_bytes(bytes),
+            NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
+        )
+    }
+
+    /// Generates observed non-empty body bytes.
+    fn non_empty_body() -> impl Strategy<Value = Vec<u8>> {
+        collection::vec(any::<u8>(), 1..33)
     }
 
     /// Raw request paths: origin-form spellings biased with the empty path
@@ -950,24 +965,18 @@ mod proptests {
             upstream_path in "/[A-Za-z0-9/_-]{0,20}",
             upstream_query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
             status in any::<u16>(),
-            request_bytes in 1_u64..=u64::MAX,
-            response_bytes in 1_u64..=u64::MAX,
-            request_digest in hex_digest(),
-            response_digest in hex_digest(),
+            request_body_bytes in non_empty_body(),
+            response_body_bytes in non_empty_body(),
             error_class in "[a-z_]{1,20}",
             run_token in "[0-9a-f]{1,16}",
             sequence in any::<u64>(),
         ) {
-            let request_body = AuditBodySummary::non_empty(
-                request_digest.clone(),
-                NonZeroU64::new(request_bytes)
-                    .expect("generated request byte count should be non-zero"),
-            );
-            let response_body = AuditBodySummary::non_empty(
-                response_digest.clone(),
-                NonZeroU64::new(response_bytes)
-                    .expect("generated response byte count should be non-zero"),
-            );
+            let request_body = body_summary(&request_body_bytes);
+            let request_bytes = body_len(&request_body_bytes);
+            let request_digest = BodyDigest::from_bytes(&request_body_bytes).to_hex_string();
+            let response_body = body_summary(&response_body_bytes);
+            let response_bytes = body_len(&response_body_bytes);
+            let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
             let upstream =
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
             let (outcome, decision, expected_error, expected_response_digest, expected_response_bytes, expected_upstream) = match outcome_kind {
