@@ -1678,7 +1678,7 @@ mod proptests {
         ResponseBodyPrefix, RunToken,
     };
     use crate::allowlist::AcceptedTarget;
-    use crate::body::BodyDigest;
+    use crate::body::{BodyDigest, ResponseAccount};
     use crate::config::UpstreamOrigin;
     use ::http::Method;
     use ::http::StatusCode;
@@ -1716,6 +1716,22 @@ mod proptests {
             ("bytes".to_owned(), Value::from(bytes)),
             ("state".to_owned(), Value::String("non_empty".to_owned())),
         ]))
+    }
+
+    #[test]
+    fn empty_response_account_serializes_as_empty_body() {
+        let account = ResponseAccount::new(NonZeroU64::new(1).expect("limit should be non-zero"));
+        let summary = ObservedBodySummary::from_response_account(account).into_summary();
+
+        let value = serde_json::to_value(summary).expect("summary should serialize");
+
+        assert_eq!(
+            value,
+            Value::Object(Map::from_iter([(
+                "state".to_owned(),
+                Value::String("empty".to_owned()),
+            )])),
+        );
     }
 
     /// Generates observed non-empty body bytes.

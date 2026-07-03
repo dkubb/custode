@@ -37,13 +37,13 @@ coverage:
     scripts/check-coverage-summary.sh target/coverage/unit.json
 
 coverage-proptests:
-    cargo coverage-proptests
+    PROPTEST_RNG_SEED=00000000000000000000000000000014 cargo coverage-proptests
     scripts/check-coverage-summary.sh \
         --exclude-test-mods \
-        --max-missed-regions 621 \
+        --max-missed-regions 595 \
         --max-missed-functions 89 \
-        --max-missed-lines 472 \
-        --max-missed-branches 36 \
+        --max-missed-lines 371 \
+        --max-missed-branches 26 \
         target/coverage/proptests.json
 
 mutants:
