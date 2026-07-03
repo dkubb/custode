@@ -7,7 +7,6 @@ ignore = []
 
 [licenses]
 allow = [
-  "0BSD",
   "Apache-2.0 WITH LLVM-exception",
   "Apache-2.0",
   "BSD-2-Clause",
@@ -19,7 +18,6 @@ allow = [
   "MIT",
   "Unicode-3.0",
   "Unlicense",
-  "Zlib",
 ]
 exceptions = []
 
@@ -28,14 +26,17 @@ ignore = false
 registries = []
 
 [bans]
-multiple-versions = "warn"
+multiple-versions = "deny"
 wildcards = "allow"
 highlight = "all"
 workspace-default-features = "allow"
 external-default-features = "allow"
 allow = []
 deny = []
-skip = []
+skip = [
+  { crate = "syn@1.0.109", reason = "non-empty-string 0.2.6 depends on delegate, whose proc macro still uses syn 1; no newer non-empty-string release is available" },
+  { crate = "windows-sys@0.52.0", reason = "ring 0.17 depends on this Windows support crate while current CLI/runtime dependencies use windows-sys 0.61" },
+]
 
 [sources]
 unknown-registry = "deny"
