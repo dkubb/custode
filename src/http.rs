@@ -154,6 +154,7 @@ async fn accept_allowed_target(
     request_id: &RequestId,
     method: &Method,
     uri: &Uri,
+    request_body: &AccountedBody,
 ) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
         let target = synthetic_target(uri);
@@ -162,7 +163,7 @@ async fn accept_allowed_target(
                 request_id.clone(),
                 method,
                 target,
-                None,
+                Some(request_body),
                 RejectionReason::ConnectUnsupported.error_class(),
                 StatusCode::METHOD_NOT_ALLOWED.as_u16(),
             )
@@ -177,7 +178,7 @@ async fn accept_allowed_target(
                 request_id.clone(),
                 method,
                 target,
-                None,
+                Some(request_body),
                 RejectionReason::AbsoluteFormUnsupported.error_class(),
                 StatusCode::BAD_REQUEST.as_u16(),
             )
@@ -194,7 +195,7 @@ async fn accept_allowed_target(
                     request_id.clone(),
                     method,
                     target,
-                    None,
+                    Some(request_body),
                     reason.error_class(),
                     StatusCode::BAD_REQUEST.as_u16(),
                 )
@@ -211,7 +212,7 @@ async fn accept_allowed_target(
                     request_id.clone(),
                     method,
                     target.into(),
-                    None,
+                    Some(request_body),
                     reason.error_class(),
                     StatusCode::FORBIDDEN.as_u16(),
                 )
@@ -275,10 +276,30 @@ async fn handle_request(
     let uri = parts.uri;
     let headers = parts.headers;
 
-    let target = match accept_allowed_target(&gateway, &request_id, &method, &uri).await? {
-        Ok(target) => target,
-        Err(response) => return Ok(response),
-    };
+    let request_body =
+        match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
+            Ok(request_body) => request_body,
+            Err(error) => {
+                let status = request_body_error_status(&error);
+                gateway
+                    .audit_denial(
+                        request_id,
+                        &method,
+                        synthetic_target(&uri),
+                        None,
+                        error.error_class(),
+                        status.as_u16(),
+                    )
+                    .await?;
+                return Ok(status_response(status));
+            }
+        };
+
+    let target =
+        match accept_allowed_target(&gateway, &request_id, &method, &uri, &request_body).await? {
+            Ok(target) => target,
+            Err(response) => return Ok(response),
+        };
 
     let request_headers =
         match forward_request_headers(&headers, gateway.config().max_request_header_bytes()) {
@@ -290,27 +311,8 @@ async fn handle_request(
                         request_id,
                         &method,
                         target.target().clone().into(),
-                        None,
+                        Some(&request_body),
                         request_header_error_class(error),
-                        status.as_u16(),
-                    )
-                    .await?;
-                return Ok(status_response(status));
-            }
-        };
-
-    let request_body =
-        match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
-            Ok(request_body) => request_body,
-            Err(error) => {
-                let status = request_body_error_status(&error);
-                gateway
-                    .audit_denial(
-                        request_id,
-                        &method,
-                        target.target().clone().into(),
-                        None,
-                        error.error_class(),
                         status.as_u16(),
                     )
                     .await?;
@@ -1667,16 +1669,24 @@ mod tests {
         let directory = tempdir().expect("temporary directory should be created");
         let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
         let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let body = Bytes::from_static(b"denied");
+        let request = Request::builder()
+            .method(Method::DELETE)
+            .uri("/v1/models")
+            .body(Body::from(body.clone()))
+            .expect("request should build");
 
-        let response = router
-            .oneshot(build_request(Method::DELETE, "/v1/models"))
-            .await
-            .expect("proxy should respond");
+        let response = router.oneshot(request).await.expect("proxy should respond");
 
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
         let events = audit_events(&audit_log).await;
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["error_class"], "method_denied");
+        assert_eq!(event["request_bytes"], Value::from(body.len()));
+        assert_eq!(
+            event["request_body_blake3"],
+            Value::String(blake3::hash(&body).to_hex().to_string())
+        );
     }
 
     #[tokio::test]

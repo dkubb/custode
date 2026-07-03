@@ -632,10 +632,12 @@ mod tests {
         let (upstream, recorder) = start_upstream().await;
         let gateway =
             GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+        let body = b"UNRECORDED-DENIED-BODY";
 
         let client = reqwest::Client::new();
         let response = client
             .delete(format!("{}/v1/models", gateway.base_url()))
+            .body(body.to_vec())
             .send()
             .await
             .expect("gateway request should complete");
@@ -651,6 +653,11 @@ mod tests {
         assert_eq!(events.len(), 1);
         let event = events.first().expect("one audit event should exist");
         assert_eq!(event["decision"], "denied");
+        assert_eq!(event["request_bytes"], serde_json::Value::from(body.len()));
+        assert_eq!(
+            event["request_body_blake3"],
+            serde_json::Value::String(blake3::hash(body).to_hex().to_string())
+        );
         assert!(event["upstream_path"].is_null());
     }
 
