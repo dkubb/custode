@@ -69,7 +69,7 @@ pub(crate) struct ResponseAuditOutcome {
 }
 
 /// Closed response audit outcome variants.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseAuditOutcomeKind {
     /// Request was allowed and completed normally.
     Allowed {
@@ -79,12 +79,26 @@ enum ResponseAuditOutcomeKind {
         status: u16,
     },
 
-    /// Response handling failed.
-    ResponseError {
-        /// Stable error class.
-        error_class: String,
+    /// Downstream closed before the response completed.
+    DownstreamClosed {
         /// Response body summary.
-        response_body: Option<ObservedBodySummary>,
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Response body exceeded the configured limit.
+    ResponseBodyTooLarge {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Response headers failed before response body bytes were observed.
+    ResponseHeaderError {
+        /// Stable error class.
+        error_class: &'static str,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -92,7 +106,15 @@ enum ResponseAuditOutcomeKind {
     /// Upstream request failed before a response completed.
     UpstreamError {
         /// Stable error class.
-        error_class: String,
+        error_class: &'static str,
+        /// Response status returned to the harness.
+        status: u16,
+    },
+
+    /// Upstream response stream failed after upstream I/O started.
+    UpstreamResponseStreamFailed {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -101,7 +123,7 @@ enum ResponseAuditOutcomeKind {
 impl ResponseAuditOutcome {
     /// Creates an allowed response outcome.
     #[must_use]
-    pub(crate) fn allowed(response_account: &ResponseAccount, status: u16) -> Self {
+    pub(crate) fn allowed(response_account: ResponseAccount, status: u16) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::Allowed {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -110,35 +132,40 @@ impl ResponseAuditOutcome {
         }
     }
 
-    /// Consumes the outcome into its internal variant.
+    /// Creates a downstream-closed response outcome.
     #[must_use]
-    fn into_kind(self) -> ResponseAuditOutcomeKind {
-        self.kind
-    }
-
-    /// Creates a response-error outcome.
-    #[must_use]
-    pub(crate) fn response_error(
-        error_class: impl Into<String>,
-        response_account: &ResponseAccount,
-        status: u16,
-    ) -> Self {
+    pub(crate) fn downstream_closed(response_account: ResponseAccount, status: u16) -> Self {
         Self {
-            kind: ResponseAuditOutcomeKind::ResponseError {
-                error_class: error_class.into(),
-                response_body: Some(ObservedBodySummary::from_response_account(response_account)),
+            kind: ResponseAuditOutcomeKind::DownstreamClosed {
+                response_body: ObservedBodySummary::from_response_account(response_account),
                 status,
             },
         }
     }
 
-    /// Creates a response-error outcome before response body bytes were observed.
+    /// Consumes the outcome into its internal variant.
     #[must_use]
-    pub(crate) fn response_error_without_body(error_class: impl Into<String>, status: u16) -> Self {
+    const fn into_kind(self) -> ResponseAuditOutcomeKind {
+        self.kind
+    }
+
+    /// Creates a response-body-too-large outcome.
+    #[must_use]
+    pub(crate) fn response_body_too_large(response_account: ResponseAccount, status: u16) -> Self {
         Self {
-            kind: ResponseAuditOutcomeKind::ResponseError {
-                error_class: error_class.into(),
-                response_body: None,
+            kind: ResponseAuditOutcomeKind::ResponseBodyTooLarge {
+                response_body: ObservedBodySummary::from_response_account(response_account),
+                status,
+            },
+        }
+    }
+
+    /// Creates a response-header-error outcome.
+    #[must_use]
+    pub(crate) const fn response_header_error(error_class: &'static str, status: u16) -> Self {
+        Self {
+            kind: ResponseAuditOutcomeKind::ResponseHeaderError {
+                error_class,
                 status,
             },
         }
@@ -146,10 +173,24 @@ impl ResponseAuditOutcome {
 
     /// Creates an upstream-error outcome.
     #[must_use]
-    pub(crate) fn upstream_error(error_class: impl Into<String>, status: u16) -> Self {
+    pub(crate) const fn upstream_error(error_class: &'static str, status: u16) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::UpstreamError {
-                error_class: error_class.into(),
+                error_class,
+                status,
+            },
+        }
+    }
+
+    /// Creates an upstream-response-stream-failed outcome.
+    #[must_use]
+    pub(crate) fn upstream_response_stream_failed(
+        response_account: ResponseAccount,
+        status: u16,
+    ) -> Self {
+        Self {
+            kind: ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
+                response_body: ObservedBodySummary::from_response_account(response_account),
                 status,
             },
         }
@@ -208,24 +249,42 @@ impl Gateway {
                 response_body,
                 status,
             } => AuditEventInput::allowed(request, response_body, status, upstream),
-            ResponseAuditOutcomeKind::ResponseError {
-                error_class,
-                response_body: Some(response_body),
+            ResponseAuditOutcomeKind::DownstreamClosed {
+                response_body,
                 status,
             } => AuditEventInput::response_error(
                 request,
-                error_class,
+                "downstream_closed",
                 response_body,
                 status,
                 upstream,
             ),
-            ResponseAuditOutcomeKind::ResponseError {
+            ResponseAuditOutcomeKind::ResponseBodyTooLarge {
+                response_body,
+                status,
+            } => AuditEventInput::response_error(
+                request,
+                "response_body_too_large",
+                response_body,
+                status,
+                upstream,
+            ),
+            ResponseAuditOutcomeKind::ResponseHeaderError {
                 error_class,
-                response_body: None,
                 status,
             } => {
                 AuditEventInput::response_error_without_body(request, error_class, status, upstream)
             }
+            ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
+                response_body,
+                status,
+            } => AuditEventInput::response_error(
+                request,
+                "upstream_response_stream_failed",
+                response_body,
+                status,
+                upstream,
+            ),
             ResponseAuditOutcomeKind::UpstreamError {
                 error_class,
                 status,
@@ -457,7 +516,7 @@ mod tests {
         let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
         let input = ResponseAuditInput {
             method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(&response_account, 200),
+            outcome: ResponseAuditOutcome::allowed(response_account, 200),
             request_body,
             request_id: RequestId::from_parts("run", 1),
             target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
@@ -485,7 +544,7 @@ mod tests {
             .expect("response chunk should be accounted");
         let input = ResponseAuditInput {
             method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(&response_account, 200),
+            outcome: ResponseAuditOutcome::allowed(response_account, 200),
             request_body,
             request_id: RequestId::from_parts("run", 1),
             target: AcceptedTarget::new("/v1/models", Some("limit=1"))

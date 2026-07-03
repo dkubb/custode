@@ -93,11 +93,14 @@ enum ResponseStreamOutcome {
     /// Response completed successfully.
     Allowed,
 
-    /// Response stream failed after upstream I/O started.
-    ResponseError {
-        /// Stable error class.
-        error_class: String,
-    },
+    /// Downstream closed before the response completed.
+    DownstreamClosed,
+
+    /// Response body exceeded the configured byte limit.
+    ResponseBodyTooLarge,
+
+    /// Upstream response stream failed after upstream I/O started.
+    UpstreamResponseStreamFailed,
 }
 
 impl ResponseAuditContext {
@@ -115,10 +118,16 @@ impl ResponseAuditContext {
         } = self;
         let audit_outcome = match stream_outcome {
             ResponseStreamOutcome::Allowed => {
-                ResponseAuditOutcome::allowed(&response_account, status)
+                ResponseAuditOutcome::allowed(response_account, status)
             }
-            ResponseStreamOutcome::ResponseError { error_class } => {
-                ResponseAuditOutcome::response_error(error_class, &response_account, status)
+            ResponseStreamOutcome::DownstreamClosed => {
+                ResponseAuditOutcome::downstream_closed(response_account, status)
+            }
+            ResponseStreamOutcome::ResponseBodyTooLarge => {
+                ResponseAuditOutcome::response_body_too_large(response_account, status)
+            }
+            ResponseStreamOutcome::UpstreamResponseStreamFailed => {
+                ResponseAuditOutcome::upstream_response_stream_failed(response_account, status)
             }
         };
         let input = ResponseAuditInput {
@@ -378,7 +387,7 @@ async fn forward_request(
         Err(error) => {
             let input = ResponseAuditInput {
                 method: method.to_string(),
-                outcome: ResponseAuditOutcome::response_error_without_body(
+                outcome: ResponseAuditOutcome::response_header_error(
                     response_header_error_class(error),
                     StatusCode::BAD_GATEWAY.as_u16(),
                 ),
@@ -430,22 +439,19 @@ fn response_stream(
                         && sender.send(Ok(previous_chunk)).await.is_err()
                     {
                         if let Err(audit_error) = context
-                            .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                                error_class: "downstream_closed".to_owned(),
-                            })
+                            .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                             .await
                         {
                             tracing::error!(%audit_error, "failed to audit downstream close");
                         }
                         return;
                     }
-                    let error_class = "upstream_response_stream_failed".to_owned();
                     send_stream_error(
                         &sender,
                         context
-                            .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                                error_class,
-                            })
+                            .audit_after_response_started(
+                                ResponseStreamOutcome::UpstreamResponseStreamFailed,
+                            )
                             .await,
                         upstream_body_error.to_string(),
                     )
@@ -458,9 +464,7 @@ fn response_stream(
                 && sender.send(Ok(previous_chunk)).await.is_err()
             {
                 if let Err(audit_error) = context
-                    .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                        error_class: "downstream_closed".to_owned(),
-                    })
+                    .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                     .await
                 {
                     tracing::error!(%audit_error, "failed to audit downstream close");
@@ -473,9 +477,7 @@ fn response_stream(
                 send_stream_error(
                     &sender,
                     context
-                        .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                            error_class: error_class.clone(),
-                        })
+                        .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge)
                         .await,
                     error_class,
                 )
@@ -490,9 +492,7 @@ fn response_stream(
             && sender.send(Ok(final_chunk)).await.is_err()
         {
             if let Err(audit_error) = context
-                .audit_after_response_started(ResponseStreamOutcome::ResponseError {
-                    error_class: "downstream_closed".to_owned(),
-                })
+                .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                 .await
             {
                 tracing::error!(%audit_error, "failed to audit downstream close");

@@ -135,20 +135,15 @@ impl ResponseAccount {
         Ok(())
     }
 
-    /// Returns the response byte count.
+    /// Consumes the account into its response byte count and digest.
     #[must_use]
-    pub(crate) const fn byte_count(&self) -> u64 {
-        self.bytes
-    }
-
-    /// Finalizes the response digest.
-    #[must_use]
-    pub(crate) fn finalize_digest(&self) -> Option<BodyDigest> {
-        if self.bytes == 0 {
+    pub(crate) fn into_digest_parts(self) -> (u64, Option<BodyDigest>) {
+        let digest = if self.bytes == 0 {
             None
         } else {
             Some(BodyDigest::from_hasher(&self.hasher))
-        }
+        };
+        (self.bytes, digest)
     }
 
     /// Creates a response account.
@@ -295,7 +290,9 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Ok(()));
-        assert_eq!(account.byte_count(), 5);
+        let (byte_count, digest) = account.into_digest_parts();
+        assert_eq!(byte_count, 5);
+        assert!(digest.is_some());
     }
 
     #[test]
@@ -305,7 +302,7 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        assert_eq!(account.byte_count(), 0);
+        assert_eq!(account.into_digest_parts(), (0, None));
     }
 
     #[test]
@@ -318,14 +315,16 @@ mod tests {
         let result = account.add_chunk(b"oo");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        assert_eq!(account.byte_count(), 4);
+        let (byte_count, digest) = account.into_digest_parts();
+        assert_eq!(byte_count, 4);
+        assert!(digest.is_some());
     }
 
     #[test]
     fn finalize_digest_is_none_for_empty_responses() {
         let account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
 
-        assert_eq!(account.finalize_digest(), None);
+        assert_eq!(account.into_digest_parts(), (0, None));
     }
 
     #[test]
@@ -338,9 +337,7 @@ mod tests {
             .add_chunk(b"lo")
             .expect("second chunk should fit within the limit");
 
-        assert_eq!(
-            digest_hex(account.finalize_digest()).as_deref(),
-            Some(HELLO_DIGEST)
-        );
+        let (_byte_count, digest) = account.into_digest_parts();
+        assert_eq!(digest_hex(digest).as_deref(), Some(HELLO_DIGEST));
     }
 }

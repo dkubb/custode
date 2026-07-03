@@ -288,17 +288,14 @@ impl AuditBodySummary {
 impl ObservedBodySummary {
     /// Creates an observed body summary from a response body account.
     #[must_use]
-    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
-        let summary =
-            response_account
-                .finalize_digest()
-                .map_or_else(AuditBodySummary::empty, |digest| {
-                    AuditBodySummary::non_empty(
-                        digest,
-                        NonZeroU64::new(response_account.byte_count())
-                            .expect("response body digest requires non-zero bytes"),
-                    )
-                });
+    pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
+        let (byte_count, response_digest) = response_account.into_digest_parts();
+        let summary = response_digest.map_or_else(AuditBodySummary::empty, |digest| {
+            AuditBodySummary::non_empty(
+                digest,
+                NonZeroU64::new(byte_count).expect("response body digest requires non-zero bytes"),
+            )
+        });
         Self { summary }
     }
 
