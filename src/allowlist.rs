@@ -75,12 +75,6 @@ impl AllowedTarget {
 /// Reason a request is rejected before upstream forwarding.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RejectionReason {
-    /// The request target included a scheme or authority.
-    AbsoluteFormUnsupported,
-
-    /// `CONNECT` is never accepted.
-    ConnectUnsupported,
-
     /// The path contained a literal or percent-encoded `.` or `..` segment.
     DotSegment,
 
@@ -123,22 +117,6 @@ impl DotSegmentState {
     /// Returns true when the state is a forbidden dot segment.
     const fn is_rejected(self) -> bool {
         matches!(self, Self::OneDot | Self::TwoDots)
-    }
-}
-
-impl RejectionReason {
-    /// Returns a stable audit error class.
-    #[must_use]
-    pub(crate) const fn error_class(self) -> &'static str {
-        match self {
-            Self::AbsoluteFormUnsupported => "absolute_form_unsupported",
-            Self::ConnectUnsupported => "connect_unsupported",
-            Self::DotSegment => "dot_segment",
-            Self::InvalidPercentEncoding => "invalid_percent_encoding",
-            Self::MethodDenied => "method_denied",
-            Self::NonOriginForm => "non_origin_form",
-            Self::PathDenied => "path_denied",
-        }
     }
 }
 
@@ -335,29 +313,6 @@ mod tests {
             AcceptedTarget::new("/v1/responses/%2E/models", None),
             Err(RejectionReason::DotSegment),
         );
-    }
-
-    #[test]
-    fn error_class_is_stable_for_every_reason() {
-        let expected = [
-            (
-                RejectionReason::AbsoluteFormUnsupported,
-                "absolute_form_unsupported",
-            ),
-            (RejectionReason::ConnectUnsupported, "connect_unsupported"),
-            (RejectionReason::DotSegment, "dot_segment"),
-            (
-                RejectionReason::InvalidPercentEncoding,
-                "invalid_percent_encoding",
-            ),
-            (RejectionReason::MethodDenied, "method_denied"),
-            (RejectionReason::NonOriginForm, "non_origin_form"),
-            (RejectionReason::PathDenied, "path_denied"),
-        ];
-
-        for (reason, class) in expected {
-            assert_eq!(reason.error_class(), class);
-        }
     }
 
     #[test]

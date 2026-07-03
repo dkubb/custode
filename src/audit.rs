@@ -32,6 +32,46 @@ pub(crate) enum AuditDecision {
     UpstreamError,
 }
 
+/// Closed reason for a denied request audit event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AuditDenialReason {
+    /// Request target included a scheme or authority.
+    AbsoluteFormUnsupported,
+
+    /// `CONNECT` is never accepted.
+    ConnectUnsupported,
+
+    /// Path contained a literal or percent-encoded dot segment.
+    DotSegment,
+
+    /// Path contained invalid percent-encoding.
+    InvalidPercentEncoding,
+
+    /// Request had an invalid `Connection` header.
+    InvalidRequestConnectionHeader,
+
+    /// Method was not in the allowlist.
+    MethodDenied,
+
+    /// Target was not an origin-form path.
+    NonOriginForm,
+
+    /// Path was not in the allowlist.
+    PathDenied,
+
+    /// Request body could not be read.
+    RequestBodyReadFailed,
+
+    /// Request body exceeded the configured limit.
+    RequestBodyTooLarge,
+
+    /// Request headers exceeded the configured limit.
+    RequestHeadersTooLarge,
+
+    /// Gateway request concurrency was exhausted.
+    TooManyRequests,
+}
+
 /// Audit log error.
 #[derive(Debug, Error)]
 pub(crate) enum AuditError {
@@ -304,6 +344,45 @@ impl ObservedBodySummary {
     #[must_use]
     const fn into_summary(self) -> AuditBodySummary {
         self.summary
+    }
+}
+
+impl AuditDenialReason {
+    /// Returns the stable audit error class.
+    #[must_use]
+    pub(crate) const fn error_class(self) -> &'static str {
+        match self {
+            Self::AbsoluteFormUnsupported => "absolute_form_unsupported",
+            Self::ConnectUnsupported => "connect_unsupported",
+            Self::DotSegment => "dot_segment",
+            Self::InvalidPercentEncoding => "invalid_percent_encoding",
+            Self::InvalidRequestConnectionHeader => "invalid_request_connection_header",
+            Self::MethodDenied => "method_denied",
+            Self::NonOriginForm => "non_origin_form",
+            Self::PathDenied => "path_denied",
+            Self::RequestBodyReadFailed => "request_body_read_failed",
+            Self::RequestBodyTooLarge => "request_body_too_large",
+            Self::RequestHeadersTooLarge => "request_headers_too_large",
+            Self::TooManyRequests => "too_many_requests",
+        }
+    }
+
+    /// Returns the response status for this denial.
+    #[must_use]
+    pub(crate) const fn status(self) -> StatusCode {
+        match self {
+            Self::AbsoluteFormUnsupported
+            | Self::DotSegment
+            | Self::InvalidPercentEncoding
+            | Self::InvalidRequestConnectionHeader
+            | Self::NonOriginForm
+            | Self::RequestBodyReadFailed => StatusCode::BAD_REQUEST,
+            Self::ConnectUnsupported => StatusCode::METHOD_NOT_ALLOWED,
+            Self::MethodDenied | Self::PathDenied => StatusCode::FORBIDDEN,
+            Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestHeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            Self::TooManyRequests => StatusCode::TOO_MANY_REQUESTS,
+        }
     }
 }
 
@@ -1201,13 +1280,14 @@ mod proptests {
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
             upstream_path in "/[A-Za-z0-9/_-]{0,20}",
             upstream_query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
-            status in 100_u16..600,
+            status_code_value in 100_u16..600,
             request_body_bytes in non_empty_body(),
             response_body_bytes in non_empty_body(),
             error_class in "[a-z_]{1,20}",
             run_token in "[0-9a-f]{1,16}",
             sequence in any::<u64>(),
         ) {
+            let status = status_code(status_code_value);
             let request_body = body_summary(&request_body_bytes);
             let request_bytes = body_len(&request_body_bytes);
             let request_digest = BodyDigest::from_bytes(&request_body_bytes).to_hex_string();
@@ -1218,14 +1298,14 @@ mod proptests {
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
             let (outcome, decision, expected_error, expected_response_body, expected_upstream) = match outcome_kind {
                 0 => (
-                    AuditOutcome::allowed(observed_response_body, status_code(status), upstream),
+                    AuditOutcome::allowed(observed_response_body, status, upstream),
                     "allowed",
                     None,
                     body_value(response_bytes, &response_digest),
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 1 => (
-                    AuditOutcome::denied(error_class.clone(), status),
+                    AuditOutcome::denied(error_class.clone(), status.as_u16()),
                     "denied",
                     Some(error_class.as_str()),
                     not_observed_body_value(),
@@ -1235,7 +1315,7 @@ mod proptests {
                     AuditOutcome::response_error(
                         error_class.clone(),
                         observed_response_body,
-                        status_code(status),
+                        status,
                         upstream,
                     ),
                     "response_error",
@@ -1244,7 +1324,7 @@ mod proptests {
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 _ => (
-                    AuditOutcome::upstream_error(error_class.clone(), status_code(status), upstream),
+                    AuditOutcome::upstream_error(error_class.clone(), status, upstream),
                     "upstream_error",
                     Some(error_class.as_str()),
                     not_observed_body_value(),
@@ -1276,7 +1356,7 @@ mod proptests {
                 prop_assert!(object["upstream_query"].is_null());
             }
             prop_assert_eq!(object["query"].is_null(), query.is_none());
-            prop_assert_eq!(object["status"].as_u64(), Some(u64::from(status)));
+            prop_assert_eq!(object["status"].as_u64(), Some(u64::from(status.as_u16())));
             prop_assert_eq!(
                 &object["request_body"],
                 &body_value(request_bytes, &request_digest)

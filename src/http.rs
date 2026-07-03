@@ -4,7 +4,7 @@ use crate::adapters::{
     ReqwestUpstreamClient, SequentialRequestIds, SystemClock, UpstreamClientBuildError,
 };
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
-use crate::audit::{AuditTarget, AuditWriter, RequestId};
+use crate::audit::{AuditDenialReason, AuditTarget, AuditWriter, RequestId};
 use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
@@ -166,6 +166,7 @@ async fn accept_allowed_target(
     request_body: &AccountedBody,
 ) -> Result<Result<AllowedTarget, Response<Body>>, GatewayError> {
     if method == Method::CONNECT {
+        let denial = AuditDenialReason::ConnectUnsupported;
         let target = synthetic_target(uri);
         gateway
             .audit_denial(
@@ -173,14 +174,15 @@ async fn accept_allowed_target(
                 method,
                 target,
                 Some(request_body),
-                RejectionReason::ConnectUnsupported.error_class(),
-                StatusCode::METHOD_NOT_ALLOWED.as_u16(),
+                denial.error_class(),
+                denial.status().as_u16(),
             )
             .await?;
-        return Ok(Err(status_response(StatusCode::METHOD_NOT_ALLOWED)));
+        return Ok(Err(status_response(denial.status())));
     }
 
     if uri.authority().is_some() {
+        let denial = AuditDenialReason::AbsoluteFormUnsupported;
         let target = synthetic_target(uri);
         gateway
             .audit_denial(
@@ -188,16 +190,17 @@ async fn accept_allowed_target(
                 method,
                 target,
                 Some(request_body),
-                RejectionReason::AbsoluteFormUnsupported.error_class(),
-                StatusCode::BAD_REQUEST.as_u16(),
+                denial.error_class(),
+                denial.status().as_u16(),
             )
             .await?;
-        return Ok(Err(status_response(StatusCode::BAD_REQUEST)));
+        return Ok(Err(status_response(denial.status())));
     }
 
     let target = match AcceptedTarget::new(uri.path(), uri.query()) {
         Ok(target) => target,
         Err(reason) => {
+            let denial = denial_reason_from_rejection(reason);
             let target = synthetic_target(uri);
             gateway
                 .audit_denial(
@@ -205,28 +208,29 @@ async fn accept_allowed_target(
                     method,
                     target,
                     Some(request_body),
-                    reason.error_class(),
-                    StatusCode::BAD_REQUEST.as_u16(),
+                    denial.error_class(),
+                    denial.status().as_u16(),
                 )
                 .await?;
-            return Ok(Err(status_response(StatusCode::BAD_REQUEST)));
+            return Ok(Err(status_response(denial.status())));
         }
     };
 
     match allow_target(gateway.config(), method, target.clone()) {
         Ok(allowed_target) => Ok(Ok(allowed_target)),
         Err(reason) => {
+            let denial = denial_reason_from_rejection(reason);
             gateway
                 .audit_denial(
                     request_id.clone(),
                     method,
                     target.into(),
                     Some(request_body),
-                    reason.error_class(),
-                    StatusCode::FORBIDDEN.as_u16(),
+                    denial.error_class(),
+                    denial.status().as_u16(),
                 )
                 .await?;
-            Ok(Err(status_response(StatusCode::FORBIDDEN)))
+            Ok(Err(status_response(denial.status())))
         }
     }
 }
@@ -239,6 +243,7 @@ async fn proxy(
     let _permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
+            let denial = AuditDenialReason::TooManyRequests;
             let request_id = state.gateway.next_request_id();
             let method = request.method().clone();
             let target = synthetic_target(request.uri());
@@ -249,15 +254,15 @@ async fn proxy(
                     &method,
                     target,
                     None,
-                    "too_many_requests",
-                    StatusCode::TOO_MANY_REQUESTS.as_u16(),
+                    denial.error_class(),
+                    denial.status().as_u16(),
                 )
                 .await
                 .is_err()
             {
                 return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             }
-            return Ok(StatusCode::TOO_MANY_REQUESTS.into_response());
+            return Ok(denial.status().into_response());
         }
     };
 
@@ -289,18 +294,18 @@ async fn handle_request(
         match AccountedBody::read_request(body, gateway.config().max_request_bytes()).await {
             Ok(request_body) => request_body,
             Err(error) => {
-                let status = request_body_error_status(&error);
+                let reason = denial_reason_from_request_body(&error);
                 gateway
                     .audit_denial(
                         request_id,
                         &method,
                         synthetic_target(&uri),
                         None,
-                        error.error_class(),
-                        status.as_u16(),
+                        reason.error_class(),
+                        reason.status().as_u16(),
                     )
                     .await?;
-                return Ok(status_response(status));
+                return Ok(status_response(reason.status()));
             }
         };
 
@@ -314,18 +319,18 @@ async fn handle_request(
         match forward_request_headers(&headers, gateway.config().max_request_header_bytes()) {
             Ok(request_headers) => request_headers,
             Err(error) => {
-                let status = request_header_error_status(error);
+                let reason = denial_reason_from_request_header(error);
                 gateway
                     .audit_denial(
                         request_id,
                         &method,
                         target.target().clone().into(),
                         Some(&request_body),
-                        request_header_error_class(error),
-                        status.as_u16(),
+                        reason.error_class(),
+                        reason.status().as_u16(),
                     )
                     .await?;
-                return Ok(status_response(status));
+                return Ok(status_response(reason.status()));
             }
         };
 
@@ -614,28 +619,31 @@ fn status_response(status: StatusCode) -> Response<Body> {
     status.into_response()
 }
 
-/// Maps request body errors to response statuses.
-const fn request_body_error_status(error: &RequestBodyError) -> StatusCode {
+/// Maps request body errors to closed denial reasons.
+const fn denial_reason_from_request_body(error: &RequestBodyError) -> AuditDenialReason {
     if matches!(error, RequestBodyError::Read { .. }) {
-        StatusCode::BAD_REQUEST
+        AuditDenialReason::RequestBodyReadFailed
     } else {
-        StatusCode::PAYLOAD_TOO_LARGE
+        AuditDenialReason::RequestBodyTooLarge
     }
 }
 
-/// Maps request header errors to audit classes.
-const fn request_header_error_class(error: HeaderError) -> &'static str {
+/// Maps request header errors to closed denial reasons.
+const fn denial_reason_from_request_header(error: HeaderError) -> AuditDenialReason {
     match error {
-        HeaderError::InvalidConnectionHeader => "invalid_request_connection_header",
-        HeaderError::TooLarge => "request_headers_too_large",
+        HeaderError::InvalidConnectionHeader => AuditDenialReason::InvalidRequestConnectionHeader,
+        HeaderError::TooLarge => AuditDenialReason::RequestHeadersTooLarge,
     }
 }
 
-/// Maps request header errors to response statuses.
-const fn request_header_error_status(error: HeaderError) -> StatusCode {
-    match error {
-        HeaderError::InvalidConnectionHeader => StatusCode::BAD_REQUEST,
-        HeaderError::TooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+/// Maps accepted-target rejection reasons to closed denial reasons.
+const fn denial_reason_from_rejection(reason: RejectionReason) -> AuditDenialReason {
+    match reason {
+        RejectionReason::DotSegment => AuditDenialReason::DotSegment,
+        RejectionReason::InvalidPercentEncoding => AuditDenialReason::InvalidPercentEncoding,
+        RejectionReason::MethodDenied => AuditDenialReason::MethodDenied,
+        RejectionReason::NonOriginForm => AuditDenialReason::NonOriginForm,
+        RejectionReason::PathDenied => AuditDenialReason::PathDenied,
     }
 }
 
@@ -1178,15 +1186,15 @@ mod tests {
     }
 
     use super::{
-        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError, production_gateway,
-        proxy, report_fatal_error, request_body_error_status, request_header_error_class,
-        request_header_error_status, response_header_error_class, response_stream,
+        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError,
+        denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
+        proxy, report_fatal_error, response_header_error_class, response_stream,
         run_until_server_stops, send_stream_error, serve, synthetic_target, upstream_error_class,
         upstream_error_status,
     };
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::AcceptedTarget;
-    use crate::audit::{AuditError, RequestId};
+    use crate::audit::{AuditDenialReason, AuditError, RequestId};
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
@@ -2362,39 +2370,30 @@ mod tests {
     }
 
     #[test]
-    fn request_body_error_status_maps_read_failures_to_bad_request() {
+    fn request_body_errors_map_to_denial_reasons() {
         let error = RequestBodyError::Read {
             source: axum::Error::new(io::Error::other("read failed")),
         };
 
-        assert_eq!(request_body_error_status(&error), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn request_body_error_status_maps_oversize_to_payload_too_large() {
         assert_eq!(
-            request_body_error_status(&RequestBodyError::TooLarge),
-            StatusCode::PAYLOAD_TOO_LARGE
+            denial_reason_from_request_body(&error),
+            AuditDenialReason::RequestBodyReadFailed
+        );
+        assert_eq!(
+            denial_reason_from_request_body(&RequestBodyError::TooLarge),
+            AuditDenialReason::RequestBodyTooLarge
         );
     }
 
     #[test]
-    fn request_header_error_mappings_cover_every_variant() {
+    fn request_header_errors_map_to_denial_reasons() {
         assert_eq!(
-            request_header_error_class(HeaderError::InvalidConnectionHeader),
-            "invalid_request_connection_header"
+            denial_reason_from_request_header(HeaderError::InvalidConnectionHeader),
+            AuditDenialReason::InvalidRequestConnectionHeader
         );
         assert_eq!(
-            request_header_error_class(HeaderError::TooLarge),
-            "request_headers_too_large"
-        );
-        assert_eq!(
-            request_header_error_status(HeaderError::InvalidConnectionHeader),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            request_header_error_status(HeaderError::TooLarge),
-            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+            denial_reason_from_request_header(HeaderError::TooLarge),
+            AuditDenialReason::RequestHeadersTooLarge
         );
     }
 

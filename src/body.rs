@@ -172,18 +172,6 @@ pub(crate) enum RequestBodyError {
     TooLarge,
 }
 
-impl RequestBodyError {
-    /// Returns a stable audit error class.
-    #[must_use]
-    pub(crate) const fn error_class(&self) -> &'static str {
-        if matches!(self, Self::Read { .. }) {
-            "request_body_read_failed"
-        } else {
-            "request_body_too_large"
-        }
-    }
-}
-
 /// Body handling error.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub(crate) enum BodyError {
@@ -264,23 +252,6 @@ mod tests {
         let result = AccountedBody::read_request(body, roomy_limit()).await;
 
         assert!(matches!(result, Err(RequestBodyError::Read { .. })));
-    }
-
-    #[test]
-    fn error_class_is_stable_for_read_failures() {
-        let error = RequestBodyError::Read {
-            source: axum::Error::new(io::Error::other("connection reset")),
-        };
-
-        assert_eq!(error.error_class(), "request_body_read_failed");
-    }
-
-    #[test]
-    fn error_class_is_stable_for_oversized_bodies() {
-        assert_eq!(
-            RequestBodyError::TooLarge.error_class(),
-            "request_body_too_large"
-        );
     }
 
     #[test]
