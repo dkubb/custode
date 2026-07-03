@@ -1671,6 +1671,7 @@ mod proptests {
     use ::http::Method;
     use core::iter;
     use core::net::SocketAddr;
+    use core::num::NonZeroUsize;
     use core::time::Duration;
     use proptest::prelude::*;
     use proptest::{collection, option};
@@ -2168,6 +2169,32 @@ mod proptests {
                         && value == usize_to_u128(max_audit_event_bytes)
             );
             prop_assert!(is_too_small);
+        }
+
+        #[test]
+        fn bound_overrides_preserve_non_zero_values(
+            max_audit_event_bytes in bound_usize(MAX_AUDIT_EVENT_BYTES),
+            max_response_header_bytes in bound_usize(MAX_RESPONSE_HEADER_BYTES),
+            origin in origin_valid(),
+        ) {
+            let config = GatewayConfig::for_runtime_test(
+                PathBuf::from("/var/log/custode/proxy.ndjson"),
+                &origin,
+            )
+            .with_max_audit_event_bytes(
+                NonZeroUsize::new(max_audit_event_bytes)
+                    .expect("generated value should be non-zero"),
+            )
+            .with_max_response_header_bytes(
+                NonZeroUsize::new(max_response_header_bytes)
+                    .expect("generated value should be non-zero"),
+            );
+
+            prop_assert_eq!(config.max_audit_event_bytes().get(), max_audit_event_bytes);
+            prop_assert_eq!(
+                config.max_response_header_bytes().get(),
+                max_response_header_bytes,
+            );
         }
 
         #[test]

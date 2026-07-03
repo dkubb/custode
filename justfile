@@ -33,10 +33,12 @@ docker-test:
     scripts/container-test.sh
 
 coverage:
+    mkdir -p target/coverage
     cargo coverage
     scripts/check-coverage-summary.sh target/coverage/unit.json
 
 coverage-proptests:
+    mkdir -p target/coverage
     PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
         PROPTEST_RNG_SEED=00000000000000000000000000000014 \
         cargo coverage-proptests
