@@ -8,9 +8,12 @@ use crate::ports::{
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
-use std::process;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::File;
+use std::io::Read as _;
 use thiserror::Error;
+
+/// Number of OS-random bytes embedded in a production run token.
+const RUN_TOKEN_RANDOM_BYTES: usize = 16;
 
 /// Production audit timestamp source.
 #[derive(Clone, Copy, Debug)]
@@ -21,7 +24,7 @@ pub(crate) struct SystemClock;
 pub(crate) struct SequentialRequestIds {
     /// Last allocated request sequence, or zero before the first request.
     last_allocated: AtomicU64,
-    /// Per-process run token embedded in request identities.
+    /// Per-run random token embedded in request identities.
     run_token: RunToken,
 }
 
@@ -113,14 +116,11 @@ impl SequentialRequestIds {
     /// Creates a production request identity source.
     #[must_use]
     pub(crate) fn production() -> Self {
-        let run_nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should not be before the Unix epoch")
-            .as_nanos();
-        // The process id disambiguates runs whose wall clocks collide, such
-        // as restored snapshots or stepped clocks.
-        let run_token = format!("{:x}-{run_nanos:x}", process::id());
-        Self::new(RunToken::new(run_token).expect("production run token should be valid"))
+        let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
+        File::open("/dev/urandom")
+            .and_then(|mut random| random.read_exact(&mut entropy))
+            .expect("/dev/urandom should produce a run token");
+        Self::new(run_token_from_entropy(entropy))
     }
 }
 
@@ -168,6 +168,33 @@ impl ReqwestErrorView for reqwest::Error {
     }
 }
 
+/// Builds a run token from 128 bits of entropy.
+fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunToken {
+    let [
+        a0,
+        a1,
+        a2,
+        a3,
+        a4,
+        a5,
+        a6,
+        a7,
+        b0,
+        b1,
+        b2,
+        b3,
+        b4,
+        b5,
+        b6,
+        b7,
+    ] = entropy;
+    let run_token = format!(
+        "{a0:02x}{a1:02x}{a2:02x}{a3:02x}{a4:02x}{a5:02x}{a6:02x}{a7:02x}-\
+         {b0:02x}{b1:02x}{b2:02x}{b3:02x}{b4:02x}{b5:02x}{b6:02x}{b7:02x}"
+    );
+    RunToken::new(run_token).expect("entropy-formatted run token should be valid")
+}
+
 /// Creates an upstream body error from reqwest.
 fn upstream_body_error_from_reqwest(error: &reqwest::Error) -> UpstreamBodyError {
     UpstreamBodyError::new(error.to_string())
@@ -201,9 +228,48 @@ fn upstream_error_kind_from_reqwest(error: &impl ReqwestErrorView) -> UpstreamEr
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    #[expect(
+        clippy::inline_modules,
+        reason = "inline proptests keep file-local coverage ownership explicit"
+    )]
+    mod proptests {
+        use super::super::{RUN_TOKEN_RANDOM_BYTES, run_token_from_entropy};
+        use core::str;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn run_token_from_entropy_round_trips_bytes(
+                entropy in any::<[u8; RUN_TOKEN_RANDOM_BYTES]>()
+            ) {
+                let token = run_token_from_entropy(entropy);
+                let token_text = token.to_string();
+                let (first, second) = token_text
+                    .split_once('-')
+                    .expect("run token should contain the separator");
+                let chunks = first
+                    .as_bytes()
+                    .chunks_exact(2)
+                    .chain(second.as_bytes().chunks_exact(2));
+
+                prop_assert_eq!(first.len(), 16);
+                prop_assert_eq!(second.len(), 16);
+                for (actual, expected) in chunks.zip(entropy) {
+                    let text = str::from_utf8(actual)
+                        .expect("hex chunk should be valid UTF-8");
+                    let byte = u8::from_str_radix(text, 16)
+                        .expect("hex chunk should parse as a byte");
+
+                    prop_assert_eq!(byte, expected);
+                }
+            }
+        }
+    }
+
     use super::{
         ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
-        upstream_error_kind_from_reqwest,
+        run_token_from_entropy, upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
@@ -346,6 +412,34 @@ mod tests {
 
         humantime::parse_rfc3339(timestamp.as_str())
             .expect("system clock timestamp should parse as RFC 3339");
+    }
+
+    #[test]
+    fn run_token_from_entropy_formats_lower_hex_halves() {
+        let token = run_token_from_entropy([
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ]);
+
+        assert_eq!(token.to_string(), "0001020304050607-08090a0b0c0d0e0f");
+    }
+
+    #[test]
+    fn distinct_run_token_entropy_produces_distinct_request_ids() {
+        let first = run_token_from_entropy([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ]);
+        let second = run_token_from_entropy([
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x01,
+        ]);
+        let sequence = NonZeroU64::new(1).expect("literal should be non-zero");
+
+        assert_ne!(
+            RequestId::from_parts(&first, sequence),
+            RequestId::from_parts(&second, sequence)
+        );
     }
 
     #[test]

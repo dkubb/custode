@@ -377,7 +377,7 @@ pub(crate) struct RequestId {
 /// Bounded per-run token used in request identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RunToken {
-    /// Bounded lower-hex `pid-nanos` run token text.
+    /// Bounded lower-hex two-part run token text.
     value: NonEmptyString,
 }
 
@@ -1088,7 +1088,7 @@ impl RunToken {
         Self::new(value).expect("test run token should be valid")
     }
 
-    /// Creates a bounded lower-hex `pid-nanos` run token.
+    /// Creates a bounded lower-hex two-part run token.
     pub(crate) fn new(value: impl Into<String>) -> Result<Self, RunTokenError> {
         let text = value.into();
         validate_run_token(&text)?;
@@ -1782,10 +1782,9 @@ mod proptests {
         collection::vec(any::<u8>(), 1..33)
     }
 
-    /// Generates valid run tokens matching the production `pid-nanos` shape.
+    /// Generates valid run tokens matching the production two-part shape.
     fn run_token_valid() -> impl Strategy<Value = String> {
-        ("[0-9a-f]{1,8}", "[0-9a-f]{1,16}")
-            .prop_map(|(process_id, run_nanos)| format!("{process_id}-{run_nanos}"))
+        ("[0-9a-f]{1,8}", "[0-9a-f]{1,16}").prop_map(|(first, second)| format!("{first}-{second}"))
     }
 
     /// Returns a parsed method from generated method text.
