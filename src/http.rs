@@ -235,7 +235,7 @@ async fn proxy(
     let _permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
-            let request_id = match state.gateway.next_request_id() {
+            let request_id = match allocate_request_id(&state.gateway, &state.fatal_errors) {
                 Ok(request_id) => request_id,
                 Err(error) => {
                     tracing::error!(%error, "request failed");
@@ -280,7 +280,7 @@ async fn handle_request(
     client: Arc<dyn UpstreamClient>,
     request: Request<Body>,
 ) -> Result<Response<Body>, GatewayError> {
-    let request_id = gateway.next_request_id()?;
+    let request_id = allocate_request_id(&gateway, &fatal_errors)?;
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let uri = parts.uri;
@@ -350,6 +350,20 @@ async fn handle_request(
         request_body,
     )
     .await
+}
+
+/// Allocates a request identity or reports an unauditable fatal failure.
+fn allocate_request_id(
+    gateway: &Gateway,
+    fatal_errors: &mpsc::UnboundedSender<GatewayError>,
+) -> Result<RequestId, GatewayError> {
+    match gateway.next_request_id() {
+        Ok(request_id) => Ok(request_id),
+        Err(error) => {
+            report_fatal_error(fatal_errors, GatewayError::from(error));
+            Err(GatewayError::from(error))
+        }
+    }
 }
 
 /// Forwards an accepted request to the configured upstream.
@@ -680,7 +694,7 @@ mod tests {
         reason = "inline proptests keep scenario runner ownership explicit"
     )]
     mod proptests {
-        use super::{ScenarioBody, ScenarioRun, run_scenario};
+        use super::{ScenarioBody, ScenarioRun, run_request_id_exhaustion_scenario, run_scenario};
         use crate::sim::{
             Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
             ScenarioDownstream, ScenarioRequest, ScenarioUpstream, scenario_any,
@@ -1132,6 +1146,16 @@ mod tests {
                 .block_on(run_scenario(scenario))
         }
 
+        /// Runs a request-id exhaustion scenario on a paused runtime.
+        fn run_exhaustion_scenario(permits: usize) -> ScenarioRun {
+            Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("paused scenario runtime should build")
+                .block_on(run_request_id_exhaustion_scenario(permits))
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 32,
@@ -1175,6 +1199,22 @@ mod tests {
                 assert!(
                     result.is_ok(),
                     "fault class {class:?} should satisfy invariants: {result:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn exhausted_request_ids_fail_closed_for_every_admission_state() {
+            for permits in [0, 1] {
+                let run = run_exhaustion_scenario(permits);
+
+                assert_eq!(run.status, StatusCode::INTERNAL_SERVER_ERROR);
+                assert_eq!(run.response_body, ScenarioBody::Complete(Bytes::new()));
+                assert!(run.audit_events.is_empty());
+                assert!(run.upstream_requests.is_empty());
+                assert_eq!(
+                    run.fatal_error.as_deref(),
+                    Some("request id sequence exhausted")
                 );
             }
         }
@@ -1616,6 +1656,57 @@ mod tests {
         let status = response.status();
         let response_body =
             consume_scenario_response(response.into_body(), scenario.downstream()).await;
+        let captured_upstream_requests = upstream_recorder
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        let captured_audit_events = audit_recorder
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        yield_now().await;
+        let fatal_error = fatal_receiver
+            .try_recv()
+            .ok()
+            .map(|error| error.to_string());
+
+        ScenarioRun {
+            audit_events: captured_audit_events,
+            deadline,
+            fatal_error,
+            response_body,
+            status,
+            upstream_requests: captured_upstream_requests,
+        }
+    }
+
+    /// Runs a deterministic request-id exhaustion scenario.
+    async fn run_request_id_exhaustion_scenario(permits: usize) -> ScenarioRun {
+        let (audit, audit_recorder) = MemoryAuditSink::new();
+        let (client, upstream_recorder) = ScriptedUpstreamClient::new();
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
+        let gateway = Gateway::from_ports(config, audit, FixedClock, ExhaustedRequestIds);
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(permits)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+        let request = build_request(Method::GET, "/v1/models");
+
+        let response = router
+            .oneshot(request)
+            .await
+            .expect("scenario proxy should respond");
+
+        let status = response.status();
+        let response_body = complete_scenario_response(response.into_body()).await;
         let captured_upstream_requests = upstream_recorder
             .lock()
             .expect("scripted upstream should not be poisoned")
@@ -2594,7 +2685,7 @@ mod tests {
         let (audit, audit_recorder) = MemoryAuditSink::new();
         let audit_observer = audit.clone();
         let (client, _upstream_recorder) = ScriptedUpstreamClient::new();
-        let (fatal_errors, _fatal_receiver) = mpsc::unbounded_channel();
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let gateway = Gateway::from_ports(config, audit, FixedClock, ExhaustedRequestIds);
         let state = AppState {
             client: Arc::new(client),
@@ -2616,6 +2707,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(audit_observer.event_count(), 0);
         assert!(audit_events_empty, "request id failure should not audit");
+        let fatal = fatal_receiver
+            .try_recv()
+            .expect("request id exhaustion should be fatal");
+        assert!(matches!(
+            fatal,
+            GatewayError::RequestId(RequestIdError::SequenceExhausted)
+        ));
     }
 
     #[tokio::test]
@@ -2627,7 +2725,7 @@ mod tests {
         let (audit, audit_recorder) = MemoryAuditSink::new();
         let audit_observer = audit.clone();
         let (client, _upstream_recorder) = ScriptedUpstreamClient::new();
-        let (fatal_errors, _fatal_receiver) = mpsc::unbounded_channel();
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let gateway = Gateway::from_ports(config, audit, FixedClock, ExhaustedRequestIds);
         let state = AppState {
             client: Arc::new(client),
@@ -2649,6 +2747,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(audit_observer.event_count(), 0);
         assert!(audit_events_empty, "request id failure should not audit");
+        let fatal = fatal_receiver
+            .try_recv()
+            .expect("request id exhaustion should be fatal");
+        assert!(matches!(
+            fatal,
+            GatewayError::RequestId(RequestIdError::SequenceExhausted)
+        ));
     }
 
     #[tokio::test]

@@ -417,6 +417,11 @@ scheme-without-authority request targets, are rejected with an HTTP 400
 before the handler runs and produce no audit event. Every request that
 reaches the gateway's decision path is audited.
 
+If request identity allocation fails, the gateway returns HTTP 500 to that
+request and reports a fatal gateway error so the serving process stops. This
+path cannot emit a request audit event because the required `request_id`
+field is the failed allocation.
+
 If a bound is exceeded before response streaming starts, the gateway writes a
 denied or failure audit event and returns a typed HTTP error. If a bound is
 exceeded after response streaming starts, the gateway terminates the stream,

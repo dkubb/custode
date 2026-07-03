@@ -321,10 +321,8 @@ impl Gateway {
     ///
     /// The identity embeds a per-process run token so identities from
     /// different gateway runs appended to the same audit log do not collide.
-    pub(crate) fn next_request_id(&self) -> Result<RequestId, GatewayError> {
-        self.request_ids
-            .next_request_id()
-            .map_err(GatewayError::from)
+    pub(crate) fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
+        self.request_ids.next_request_id()
     }
 }
 

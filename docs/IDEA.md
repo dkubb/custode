@@ -275,6 +275,10 @@ request are outside the runtime decision path; they MUST be refused without
 forwarding, and MAY be surfaced through connection-level diagnostics rather
 than request audit events.
 
+If the gateway cannot allocate a request identity, it MUST fail closed by
+terminating the gateway. No request audit event is possible on that path
+because the audit schema requires the missing request identity.
+
 Each audit event MUST include:
 
 - schema version;
