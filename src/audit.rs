@@ -1023,12 +1023,13 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        RequestId,
+        ObservedBodySummary, RequestId, ResponseBodyPrefix,
     };
     use crate::allowlist::AcceptedTarget;
+    use crate::body::{BodyDigest, ResponseAccount};
     use crate::config::{GatewayConfig, UpstreamOrigin};
     use ::http::Method;
-    use core::num::NonZeroUsize;
+    use core::num::{NonZeroU64, NonZeroUsize};
     use core::time::Duration;
     use pretty_assertions::assert_eq;
     use serde_json::{Map, Value};
@@ -1092,6 +1093,27 @@ mod tests {
     /// A roomy audit event limit for tests that should not hit the bound.
     fn roomy_event_limit() -> NonZeroUsize {
         NonZeroUsize::new(0x4000).expect("limit should be non-zero")
+    }
+
+    #[test]
+    fn response_body_prefix_records_accepted_bytes() {
+        let mut account =
+            ResponseAccount::new(NonZeroU64::new(16).expect("limit should be non-zero"));
+        account
+            .add_chunk(b"accepted")
+            .expect("chunk should fit under the limit");
+
+        let prefix = ResponseBodyPrefix::from_response_account(account);
+
+        assert_eq!(
+            prefix,
+            ResponseBodyPrefix::Accepted(ObservedBodySummary {
+                summary: AuditBodySummary::non_empty(
+                    BodyDigest::from_bytes(b"accepted"),
+                    NonZeroU64::new(8).expect("accepted body should be non-empty"),
+                ),
+            }),
+        );
     }
 
     #[test]
