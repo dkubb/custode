@@ -5,7 +5,7 @@ use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{GatewayConfig, UpstreamOrigin};
 use ::http::{Method, StatusCode};
 use core::num::{NonZeroU64, NonZeroUsize};
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -186,7 +186,7 @@ pub(crate) struct AuditEvent {
     /// Response body summary.
     response_body: AuditBodySummary,
     /// Response status returned to the harness.
-    status: u16,
+    status: AuditStatus,
     /// RFC 3339 UTC timestamp.
     timestamp: AuditTimestamp,
     /// Configured upstream origin.
@@ -205,6 +205,13 @@ pub(crate) struct AuditEvent {
 struct AuditBodySummary {
     /// Closed body-summary state.
     kind: AuditBodySummaryKind,
+}
+
+/// HTTP status recorded in audit events.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuditStatus {
+    /// Valid HTTP status code.
+    code: StatusCode,
 }
 
 /// Closed body accounting summary recorded in audit events.
@@ -388,6 +395,30 @@ impl AuditBodySummary {
         Self {
             kind: AuditBodySummaryKind::NotObserved,
         }
+    }
+}
+
+impl AuditStatus {
+    /// Returns the underlying HTTP status code.
+    #[cfg(test)]
+    #[must_use]
+    const fn as_status_code(self) -> StatusCode {
+        self.code
+    }
+
+    /// Creates an audit status from an HTTP status code.
+    #[must_use]
+    const fn from_status_code(code: StatusCode) -> Self {
+        Self { code }
+    }
+}
+
+impl Serialize for AuditStatus {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u16(self.code.as_u16())
     }
 }
 
@@ -869,14 +900,14 @@ impl AuditEvent {
                 AuditDecision::Allowed,
                 None,
                 response_body.into_summary(),
-                status.as_u16(),
+                status,
                 Some(upstream),
             ),
             AuditOutcomeKind::Denied { reason } => (
                 AuditDecision::Denied,
                 Some(reason.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                reason.status().as_u16(),
+                reason.status(),
                 None,
             ),
             AuditOutcomeKind::ResponseError { error, upstream } => {
@@ -885,7 +916,7 @@ impl AuditEvent {
                     AuditDecision::ResponseError,
                     Some(error_class.to_owned()),
                     response_body,
-                    status.as_u16(),
+                    status,
                     Some(upstream),
                 )
             }
@@ -893,7 +924,7 @@ impl AuditEvent {
                 AuditDecision::UpstreamError,
                 Some(error.error_class().to_owned()),
                 AuditBodySummary::not_observed(),
-                error.status().as_u16(),
+                error.status(),
                 Some(upstream),
             ),
         };
@@ -910,7 +941,7 @@ impl AuditEvent {
             request_body,
             request_id,
             response_body,
-            status,
+            status: AuditStatus::from_status_code(status),
             timestamp,
             upstream_origin: upstream_origin.as_str().to_owned(),
             upstream_path,
@@ -1050,7 +1081,7 @@ mod tests {
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
     use crate::config::{GatewayConfig, UpstreamOrigin};
-    use ::http::Method;
+    use ::http::{Method, StatusCode};
     use core::num::{NonZeroU64, NonZeroUsize};
     use core::pin::Pin;
     use core::task::{Context, Poll};
@@ -1209,9 +1240,9 @@ mod tests {
         );
 
         let event = AuditEvent::new(input);
-        let expected = 405;
+        let expected = StatusCode::METHOD_NOT_ALLOWED;
 
-        assert_eq!(event.status, expected);
+        assert_eq!(event.status.as_status_code(), expected);
     }
 
     #[test]
