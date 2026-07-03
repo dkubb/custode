@@ -1,7 +1,5 @@
 set shell := ["bash", "--noprofile", "--norc", "-o", "errexit", "-o", "errtrace", "-o", "nounset", "-o", "pipefail", "-c"]
 
-export PATH := env_var('HOME') + '/.cargo/bin:' + env_var('PATH')
-
 default:
     just --list
 
