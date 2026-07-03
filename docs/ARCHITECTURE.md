@@ -715,17 +715,23 @@ real Axum handler on a paused current-thread Tokio runtime, with the
 production adapters replaced by deterministic ports from `src/sim.rs`:
 `FixedClock`, `MemoryAuditSink`, `ScriptedUpstreamClient`, and generated
 `Scenario` values. The current request grammar covers allowed `GET`
-`/v1/models` requests with bounded bodies and representative harness headers.
-The current fault grammar covers saturated admission permits, audit write
-failure on the terminal event, provider success, virtual-time upstream stalls
-past the carried deadline, upstream response stream failure after a body
-chunk, and response byte bounds smaller than the scripted response. The oracle
-asserts invariants over each scenario class: response status and stream
-outcome, fatal-channel behavior after response start, upstream request
-presence, forwarded-header safety, response byte bounds, and the 16-field
-audit event schema and closed decision set when auditing succeeds. Simulation
-tests do not replace the real hyper parse-boundary tests, real Reqwest
-socket-classification tests, or container network-isolation tests.
+`/v1/models` requests with bounded generated bodies, generated query strings,
+and generated header sets over both forwarded and stripped header names. The
+current fault grammar covers saturated admission permits, audit write failure
+on the terminal event, provider success, virtual-time upstream stalls past the
+carried deadline, upstream response stream failure after a body chunk, and
+response byte bounds smaller than the scripted response. A deterministic class
+sweep covers the full 24-element product of admission, audit, response-bound,
+and upstream-outcome classes every run; the property test then randomizes
+request dimensions inside those classes. The oracle asserts invariants over
+each scenario class: response status and stream outcome, fatal-channel
+behavior after response start, upstream request presence, forwarded-header
+safety, response byte bounds, and the 16-field audit event schema and closed
+decision set when auditing succeeds. Simulation tests use Tokio's paused
+virtual clock and MUST NOT use wall-clock sleeps; real-time sleeps are confined
+to real-socket tests that exercise Hyper, Reqwest, and integration timing.
+Simulation tests do not replace the real hyper parse-boundary tests, real
+Reqwest socket-classification tests, or container network-isolation tests.
 
 Integration tests in `tests/gateway.rs` run the compiled `custode-proxy`
 binary against a local recording upstream and cover:

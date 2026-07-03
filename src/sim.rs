@@ -17,6 +17,7 @@ use core::time::Duration;
 use futures_util::{StreamExt as _, stream};
 use http::{Method, StatusCode};
 use proptest::prelude::{Just, Strategy, any};
+use proptest::sample::select;
 use proptest::{collection, prop_oneof};
 use serde_json::Value;
 use std::io;
@@ -64,6 +65,19 @@ pub(super) struct Scenario {
     bounds: ScenarioBounds,
     /// Harness request shape.
     request: ScenarioRequest,
+    /// Scripted upstream behavior.
+    upstream: ScenarioUpstream,
+}
+
+/// Product of deterministic scenario fault-class axes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ScenarioClass {
+    /// Gateway admission state.
+    admission: ScenarioAdmission,
+    /// Audit sink behavior.
+    audit: ScenarioAudit,
+    /// Scenario byte bounds.
+    bounds: ScenarioBounds,
     /// Scripted upstream behavior.
     upstream: ScenarioUpstream,
 }
@@ -325,22 +339,43 @@ impl Scenario {
         self.upstream
     }
 
-    /// Builds a deterministic gateway scenario from all generated parts.
+    /// Builds a deterministic gateway scenario from a generated class.
     #[must_use]
-    pub(super) const fn with_parts(
-        admission: ScenarioAdmission,
-        audit: ScenarioAudit,
-        bounds: ScenarioBounds,
-        request: ScenarioRequest,
-        upstream: ScenarioUpstream,
-    ) -> Self {
+    pub(super) const fn with_class(class: ScenarioClass, request: ScenarioRequest) -> Self {
         Self {
-            admission,
-            audit,
-            bounds,
+            admission: class.admission,
+            audit: class.audit,
+            bounds: class.bounds,
             request,
-            upstream,
+            upstream: class.upstream,
         }
+    }
+}
+
+impl ScenarioClass {
+    /// Returns every scenario fault-class combination.
+    #[must_use]
+    pub(super) fn all() -> Vec<Self> {
+        let mut classes = Vec::with_capacity(24);
+        for admission in [ScenarioAdmission::Open, ScenarioAdmission::Saturated] {
+            for audit in [ScenarioAudit::FailFirst, ScenarioAudit::Record] {
+                for bounds in [ScenarioBounds::Roomy, ScenarioBounds::TinyResponse] {
+                    for upstream in [
+                        ScenarioUpstream::Respond,
+                        ScenarioUpstream::StreamError,
+                        ScenarioUpstream::Timeout,
+                    ] {
+                        classes.push(Self {
+                            admission,
+                            audit,
+                            bounds,
+                            upstream,
+                        });
+                    }
+                }
+            }
+        }
+        classes
     }
 }
 
@@ -506,39 +541,20 @@ fn scripted_stream_error_response() -> UpstreamResponse {
 
 /// Generates deterministic gateway scenarios.
 pub(super) fn scenario_any() -> impl Strategy<Value = Scenario> {
-    (
-        scenario_admission_any(),
-        scenario_audit_any(),
-        scenario_body_any(),
-        scenario_bounds_any(),
-        scenario_headers_any(),
-        scenario_target_any(),
-        scenario_upstream_any(),
-    )
-        .prop_map(
-            |(admission, audit, body, bounds, headers, target, upstream)| {
-                Scenario::with_parts(
-                    admission,
-                    audit,
-                    bounds,
-                    ScenarioRequest::new(body, headers, Method::GET, target),
-                    upstream,
-                )
-            },
+    scenario_class_any().prop_flat_map(|selected_class| {
+        (
+            Just(selected_class),
+            scenario_body_any(),
+            scenario_headers_any(),
+            scenario_target_any(),
         )
-}
-
-/// Generates gateway admission states.
-fn scenario_admission_any() -> impl Strategy<Value = ScenarioAdmission> {
-    prop_oneof![
-        Just(ScenarioAdmission::Open),
-        Just(ScenarioAdmission::Saturated),
-    ]
-}
-
-/// Generates audit sink behavior.
-fn scenario_audit_any() -> impl Strategy<Value = ScenarioAudit> {
-    prop_oneof![Just(ScenarioAudit::Record), Just(ScenarioAudit::FailFirst),]
+            .prop_map(|(generated_class, body, headers, target)| {
+                Scenario::with_class(
+                    generated_class,
+                    ScenarioRequest::new(body, headers, Method::GET, target),
+                )
+            })
+    })
 }
 
 /// Generates bounded request bodies.
@@ -546,53 +562,103 @@ fn scenario_body_any() -> impl Strategy<Value = Vec<u8>> {
     collection::vec(any::<u8>(), 0..9)
 }
 
-/// Generates response byte bounds.
-fn scenario_bounds_any() -> impl Strategy<Value = ScenarioBounds> {
+/// Generates deterministic scenario fault classes.
+fn scenario_class_any() -> impl Strategy<Value = ScenarioClass> {
+    select(ScenarioClass::all())
+}
+
+/// Generates one bounded request header.
+fn scenario_header_any() -> impl Strategy<Value = (String, String)> {
     prop_oneof![
-        Just(ScenarioBounds::Roomy),
-        Just(ScenarioBounds::TinyResponse),
+        (
+            Just("authorization".to_owned()),
+            scenario_header_value_any(),
+        ),
+        (
+            Just("connection".to_owned()),
+            scenario_connection_value_any(),
+        ),
+        (Just("cookie".to_owned()), scenario_header_value_any(),),
+        (Just("host".to_owned()), scenario_header_value_any(),),
+        (Just("keep-alive".to_owned()), scenario_header_value_any(),),
+        (
+            Just("proxy-authorization".to_owned()),
+            scenario_header_value_any(),
+        ),
+        (Just("te".to_owned()), scenario_header_value_any(),),
+        (Just("upgrade".to_owned()), scenario_header_value_any(),),
+        (Just("x-drop".to_owned()), scenario_header_value_any(),),
+        (Just("x-request-id".to_owned()), scenario_header_value_any(),),
+        (Just("x-visible".to_owned()), scenario_header_value_any(),),
+    ]
+}
+
+/// Generates safe header values.
+fn scenario_header_value_any() -> impl Strategy<Value = String> {
+    collection::vec(scenario_header_value_char_any(), 0..17)
+        .prop_map(|chars| chars.into_iter().collect())
+}
+
+/// Generates one safe header value character.
+fn scenario_header_value_char_any() -> impl Strategy<Value = char> {
+    prop_oneof![
+        Just('-'),
+        Just('.'),
+        Just('/'),
+        Just('0'),
+        Just('1'),
+        Just('9'),
+        Just(':'),
+        Just('='),
+        Just('A'),
+        Just('Z'),
+        Just('_'),
+        Just('a'),
+        Just('z'),
     ]
 }
 
 /// Generates bounded request header sets.
 fn scenario_headers_any() -> impl Strategy<Value = Vec<(String, String)>> {
+    collection::vec(scenario_header_any(), 0..7)
+}
+
+/// Generates valid `Connection` header values.
+fn scenario_connection_value_any() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just(Vec::new()),
-        Just(vec![
-            ("authorization".to_owned(), "Bearer harness".to_owned()),
-            ("x-request-id".to_owned(), "trace-1".to_owned()),
-        ]),
-        Just(vec![
-            ("authorization".to_owned(), "Bearer harness".to_owned()),
-            ("connection".to_owned(), "x-drop".to_owned()),
-            ("host".to_owned(), "proxy:8080".to_owned()),
-            ("proxy-authorization".to_owned(), "Basic leak".to_owned()),
-            ("x-drop".to_owned(), "secret".to_owned()),
-            ("x-request-id".to_owned(), "trace-1".to_owned()),
-        ]),
-        Just(vec![
-            ("connection".to_owned(), "te, x-drop".to_owned()),
-            ("cookie".to_owned(), "session=visible".to_owned()),
-            ("te".to_owned(), "trailers".to_owned()),
-            ("x-drop".to_owned(), "secret".to_owned()),
-            ("x-visible".to_owned(), "ok".to_owned()),
-        ]),
+        Just("te".to_owned()),
+        Just("upgrade".to_owned()),
+        Just("x-drop".to_owned()),
+        Just("x-visible, x-drop".to_owned()),
+    ]
+}
+
+/// Generates one allowed query character.
+fn scenario_query_char_any() -> impl Strategy<Value = char> {
+    prop_oneof![
+        Just('&'),
+        Just('-'),
+        Just('.'),
+        Just('0'),
+        Just('1'),
+        Just('9'),
+        Just('='),
+        Just('_'),
+        Just('a'),
+        Just('z'),
     ]
 }
 
 /// Generates allowed request targets.
 fn scenario_target_any() -> impl Strategy<Value = String> {
     prop_oneof![
-        Just("/v1/models".to_owned()),
-        Just("/v1/models?limit=1".to_owned()),
+        Just(None),
+        collection::vec(scenario_query_char_any(), 1..17).prop_map(Some),
     ]
-}
-
-/// Generates deterministic upstream outcomes.
-fn scenario_upstream_any() -> impl Strategy<Value = ScenarioUpstream> {
-    prop_oneof![
-        Just(ScenarioUpstream::Respond),
-        Just(ScenarioUpstream::StreamError),
-        Just(ScenarioUpstream::Timeout),
-    ]
+    .prop_map(|query| {
+        query.map_or_else(
+            || "/v1/models".to_owned(),
+            |chars| format!("/v1/models?{}", chars.into_iter().collect::<String>()),
+        )
+    })
 }

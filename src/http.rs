@@ -649,11 +649,11 @@ mod tests {
     mod proptests {
         use super::{ScenarioBody, ScenarioRun, run_scenario};
         use crate::sim::{
-            Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioUpstream,
-            scenario_any,
+            Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
+            ScenarioRequest, ScenarioUpstream, scenario_any,
         };
         use axum::body::Bytes;
-        use http::StatusCode;
+        use http::{Method, StatusCode};
         use proptest::prelude::*;
         use serde_json::Value;
         use tokio::runtime::Builder;
@@ -1030,6 +1030,39 @@ mod tests {
                 let run = run_generated_scenario(scenario.clone());
 
                 prop_assert_scenario(&scenario, &run)?;
+            }
+        }
+
+        #[test]
+        fn generated_fault_classes_cover_every_combination() {
+            let classes = ScenarioClass::all();
+
+            assert_eq!(classes.len(), 24);
+            for class in classes {
+                let scenario = Scenario::with_class(
+                    class,
+                    ScenarioRequest::new(
+                        b"class".to_vec(),
+                        vec![
+                            ("authorization".to_owned(), "Bearer harness".to_owned()),
+                            ("connection".to_owned(), "te, x-drop".to_owned()),
+                            ("host".to_owned(), "proxy:8080".to_owned()),
+                            ("te".to_owned(), "trailers".to_owned()),
+                            ("x-drop".to_owned(), "secret".to_owned()),
+                            ("x-request-id".to_owned(), "trace-1".to_owned()),
+                            ("x-visible".to_owned(), "ok".to_owned()),
+                        ],
+                        Method::GET,
+                        "/v1/models?limit=1",
+                    ),
+                );
+                let run = run_generated_scenario(scenario.clone());
+                let result = prop_assert_scenario(&scenario, &run);
+
+                assert!(
+                    result.is_ok(),
+                    "fault class {class:?} should satisfy invariants: {result:?}"
+                );
             }
         }
     }
