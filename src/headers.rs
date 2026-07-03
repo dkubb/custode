@@ -3,6 +3,7 @@
 use ::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
 use ::http::{HeaderMap, HeaderName};
 use core::num::NonZeroUsize;
+use std::collections::HashSet;
 use thiserror::Error;
 
 /// Header handling error.
@@ -62,8 +63,8 @@ impl ForwardedResponseHeaders {
 }
 
 /// Returns the dynamic header names listed by `Connection`.
-fn connection_header_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, HeaderError> {
-    let mut names = Vec::new();
+fn connection_header_names(headers: &HeaderMap) -> Result<HashSet<HeaderName>, HeaderError> {
+    let mut names = HashSet::new();
     for raw_value in headers.get_all(CONNECTION) {
         let value_text = raw_value
             .to_str()
@@ -75,7 +76,7 @@ fn connection_header_names(headers: &HeaderMap) -> Result<Vec<HeaderName>, Heade
             }
             let name = HeaderName::from_bytes(token_text.as_bytes())
                 .map_err(|_error| HeaderError::InvalidConnectionHeader)?;
-            names.push(name);
+            names.insert(name);
         }
     }
     Ok(names)
@@ -162,8 +163,8 @@ pub(crate) fn forward_response_headers(
 }
 
 /// Returns true when the header is hop-by-hop or named by `Connection`.
-fn is_hop_by_hop(name: &HeaderName, connection_headers: &[HeaderName]) -> bool {
-    is_standard_hop_by_hop(name) || connection_headers.iter().any(|dynamic| dynamic == name)
+fn is_hop_by_hop(name: &HeaderName, connection_headers: &HashSet<HeaderName>) -> bool {
+    is_standard_hop_by_hop(name) || connection_headers.contains(name)
 }
 
 /// Returns true when the header is an HTTP standard hop-by-hop header.
@@ -182,12 +183,18 @@ fn is_standard_hop_by_hop(name: &HeaderName) -> bool {
 }
 
 /// Returns true when a request header is safe to forward upstream.
-fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderName]) -> bool {
+fn request_header_is_forwarded(
+    name: &HeaderName,
+    connection_headers: &HashSet<HeaderName>,
+) -> bool {
     !is_hop_by_hop(name, connection_headers) && *name != HOST
 }
 
 /// Returns true when a response header is safe to forward downstream.
-fn response_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderName]) -> bool {
+fn response_header_is_forwarded(
+    name: &HeaderName,
+    connection_headers: &HashSet<HeaderName>,
+) -> bool {
     !is_hop_by_hop(name, connection_headers) && *name != CONTENT_LENGTH
 }
 
@@ -217,6 +224,21 @@ mod tests {
             NonZeroUsize::new(1024).expect("literal should be non-zero"),
         )
         .expect("headers should fit");
+
+        assert_eq!(forwarded.as_header_map().get("x-trace"), None);
+    }
+
+    #[test]
+    fn request_headers_treat_duplicate_connection_tokens_as_one_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONNECTION, HeaderValue::from_static("X-Trace, x-trace"));
+        headers.insert("x-trace", HeaderValue::from_static("secret"));
+
+        let forwarded = forward_request_headers(
+            &headers,
+            NonZeroUsize::new(1024).expect("literal should be non-zero"),
+        )
+        .expect("duplicate tokens should be accepted");
 
         assert_eq!(forwarded.as_header_map().get("x-trace"), None);
     }
