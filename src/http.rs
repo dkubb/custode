@@ -514,6 +514,7 @@ fn response_stream(
             return;
         }
 
+        let fatal_errors = context.fatal_errors.clone();
         let audit_result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
@@ -522,8 +523,13 @@ fn response_stream(
             return;
         }
 
-        if let Some(final_chunk) = pending {
-            drop(sender.send(Ok(final_chunk)).await);
+        if let Some(final_chunk) = pending
+            && sender.send(Ok(final_chunk)).await.is_err()
+        {
+            report_fatal_error(
+                &fatal_errors,
+                GatewayError::ResponseBodyClosedAfterAllowedAudit,
+            );
         }
     });
 
@@ -1233,16 +1239,16 @@ mod tests {
     use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
     use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
     use crate::audit::{
-        AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
-        RunToken,
+        AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError, AuditUpstreamError,
+        RequestId, RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
     use crate::ports::{
-        RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline, UpstreamError,
-        UpstreamErrorKind, UpstreamResponse,
+        AuditSink, BoxFuture, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline,
+        UpstreamError, UpstreamErrorKind, UpstreamResponse,
     };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
@@ -1270,11 +1276,11 @@ mod tests {
     use serde_json::{Map, Value};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
     use tokio::net::TcpListener;
-    use tokio::sync::{Semaphore, mpsc};
+    use tokio::sync::{Semaphore, mpsc, oneshot};
     use tokio::task::yield_now;
     use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
@@ -1324,6 +1330,87 @@ mod tests {
     impl RequestIdSource for ExhaustedRequestIds {
         fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
             Err(RequestIdError::SequenceExhausted)
+        }
+    }
+
+    /// Audit sink that pauses one successful audit write until the test releases it.
+    #[derive(Debug)]
+    struct PausingAuditSink {
+        /// Captured serialized audit events.
+        events: Arc<Mutex<Vec<Value>>>,
+        /// Signal sent after the audit event is recorded.
+        recorded: Mutex<Option<oneshot::Sender<()>>>,
+        /// Signal awaited before the audit write returns.
+        release: Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    /// Control handles for one pausing audit sink.
+    #[derive(Debug)]
+    struct PausingAuditControls {
+        /// Captured serialized audit events.
+        events: Arc<Mutex<Vec<Value>>>,
+        /// Completes after the audit event has been recorded.
+        recorded: oneshot::Receiver<()>,
+        /// Releases the paused audit write.
+        release: oneshot::Sender<()>,
+    }
+
+    impl AuditSink for PausingAuditSink {
+        fn append_event<'future>(
+            &'future self,
+            event: &'future AuditEvent,
+        ) -> BoxFuture<'future, Result<(), AuditError>> {
+            let value = serde_json::to_value(event)
+                .expect("audit events contain only infallible JSON values");
+            self.events
+                .lock()
+                .expect("pausing audit sink should not be poisoned")
+                .push(value);
+            let recorded_signal = {
+                self.recorded
+                    .lock()
+                    .expect("pausing audit signal should not be poisoned")
+                    .take()
+            };
+            if let Some(recorded) = recorded_signal {
+                let _send_result = recorded.send(());
+            }
+            let release_signal = {
+                self.release
+                    .lock()
+                    .expect("pausing audit release should not be poisoned")
+                    .take()
+            };
+
+            Box::pin(async move {
+                if let Some(release_receiver) = release_signal {
+                    release_receiver
+                        .await
+                        .expect("test should release the paused audit write");
+                }
+                Ok(())
+            })
+        }
+    }
+
+    impl PausingAuditSink {
+        /// Builds a pausing sink and its control channels.
+        fn new() -> (Self, PausingAuditControls) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let (recorded_sender, recorded_receiver) = oneshot::channel();
+            let (release_sender, release_receiver) = oneshot::channel();
+            (
+                Self {
+                    events: Arc::clone(&events),
+                    recorded: Mutex::new(Some(recorded_sender)),
+                    release: Mutex::new(Some(release_receiver)),
+                },
+                PausingAuditControls {
+                    events,
+                    recorded: recorded_receiver,
+                    release: release_sender,
+                },
+            )
         }
     }
 
@@ -1418,7 +1505,7 @@ mod tests {
 
     /// Builds response audit state for direct stream tests.
     async fn response_audit_context(
-        audit: MemoryAuditSink,
+        audit: impl AuditSink + 'static,
         max_response_bytes: ResponseBodyBytes,
     ) -> (ResponseAuditContext, mpsc::UnboundedReceiver<GatewayError>) {
         let config = GatewayConfig::for_runtime_test(
@@ -3399,6 +3486,46 @@ mod tests {
             .await
             .expect("audit failure should be reported");
         assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_stream_reports_fatal_when_final_chunk_send_fails_after_allowed_audit() {
+        let (audit, controls) = PausingAuditSink::new();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body =
+            stream::once(async { Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")) });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response);
+
+        controls
+            .recorded
+            .await
+            .expect("allowed audit should be recorded");
+        drop(response_body);
+        controls
+            .release
+            .send(())
+            .expect("paused audit write should be released");
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("final send failure should be reported");
+
+        assert!(matches!(
+            fatal,
+            GatewayError::ResponseBodyClosedAfterAllowedAudit
+        ));
+        let events = controls
+            .events
+            .lock()
+            .expect("pausing audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("allowed event should be recorded");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["response_body"], non_empty_body_value(b"final"));
     }
 
     #[test]
