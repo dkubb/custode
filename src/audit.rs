@@ -46,6 +46,9 @@ pub(crate) enum AuditDenialReason {
     /// Path contained a literal or percent-encoded dot segment.
     DotSegment,
 
+    /// Path contained a percent-encoded path separator.
+    EncodedSeparator,
+
     /// Path contained invalid percent-encoding.
     InvalidPercentEncoding,
 
@@ -490,6 +493,7 @@ impl AuditDenialReason {
             Self::AbsoluteFormUnsupported => "absolute_form_unsupported",
             Self::ConnectUnsupported => "connect_unsupported",
             Self::DotSegment => "dot_segment",
+            Self::EncodedSeparator => "encoded_path_separator",
             Self::InvalidPercentEncoding => "invalid_percent_encoding",
             Self::InvalidRequestConnectionHeader => "invalid_request_connection_header",
             Self::MethodDenied => "method_denied",
@@ -509,6 +513,7 @@ impl AuditDenialReason {
         match self {
             Self::AbsoluteFormUnsupported
             | Self::DotSegment
+            | Self::EncodedSeparator
             | Self::InvalidPercentEncoding
             | Self::InvalidRequestConnectionHeader
             | Self::NonOriginForm
@@ -1631,15 +1636,16 @@ mod proptests {
             0 => AuditDenialReason::AbsoluteFormUnsupported,
             1 => AuditDenialReason::ConnectUnsupported,
             2 => AuditDenialReason::DotSegment,
-            3 => AuditDenialReason::InvalidPercentEncoding,
-            4 => AuditDenialReason::InvalidRequestConnectionHeader,
-            5 => AuditDenialReason::MethodDenied,
-            6 => AuditDenialReason::NonOriginForm,
-            7 => AuditDenialReason::PathDenied,
-            8 => AuditDenialReason::RequestBodyReadFailed,
-            9 => AuditDenialReason::RequestBodyTimeout,
-            10 => AuditDenialReason::RequestBodyTooLarge,
-            11 => AuditDenialReason::RequestHeadersTooLarge,
+            3 => AuditDenialReason::EncodedSeparator,
+            4 => AuditDenialReason::InvalidPercentEncoding,
+            5 => AuditDenialReason::InvalidRequestConnectionHeader,
+            6 => AuditDenialReason::MethodDenied,
+            7 => AuditDenialReason::NonOriginForm,
+            8 => AuditDenialReason::PathDenied,
+            9 => AuditDenialReason::RequestBodyReadFailed,
+            10 => AuditDenialReason::RequestBodyTimeout,
+            11 => AuditDenialReason::RequestBodyTooLarge,
+            12 => AuditDenialReason::RequestHeadersTooLarge,
             _ => AuditDenialReason::TooManyRequests,
         }
     }
@@ -1692,7 +1698,7 @@ mod proptests {
         #[test]
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
-            denial_kind in 0_u8..13,
+            denial_kind in 0_u8..14,
             response_error_kind in 0_u8..5,
             upstream_error_kind in 0_u8..3,
             method in "[A-Z]{3,8}",

@@ -83,7 +83,7 @@ pub(crate) enum ConfigError {
 
     /// Path was not a supported origin-form path.
     #[error(
-        "allowed path {path:?} must be origin-form without dot segments or invalid percent-encoding"
+        "allowed path {path:?} must be origin-form without dot segments, encoded separators, or invalid percent-encoding"
     )]
     InvalidAllowedPath {
         /// Invalid path.
@@ -718,8 +718,8 @@ mod tests {
     }
 
     #[test]
-    fn allowed_path_rejects_dot_segments_and_invalid_percent_encoding() {
-        for path in ["/v1/../models", "/v1/%zz"] {
+    fn allowed_path_rejects_dot_segments_encoded_separators_and_invalid_percent_encoding() {
+        for path in ["/v1/../models", "/v1/%2fmodels", "/v1/%zz"] {
             assert!(
                 matches!(
                     AllowedPath::exact(path),
@@ -1182,6 +1182,7 @@ mod proptests {
         prop_oneof![
             "[A-Za-z0-9_.-][A-Za-z0-9/_.-]{0,12}",
             allowed_path_valid().prop_map(|path| format!("{path}/..")),
+            allowed_path_valid().prop_map(|path| format!("{path}%2fchild")),
             allowed_path_valid().prop_map(|path| format!("{path}%zz")),
         ]
     }

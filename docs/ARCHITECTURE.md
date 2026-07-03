@@ -308,8 +308,10 @@ The gateway MUST reject:
   like `evil.example:443`;
 - paths that do not start with `/`;
 - paths containing invalid percent-encoding;
+- paths containing percent-encoded path separators;
 - paths containing literal or percent-encoded `.` or `..` segments, so the
-  allowlist decision and the upstream URL are computed from the same path;
+  allowlist decision and the upstream URL are computed from the same path
+  segment structure;
 - method-path pairs absent from the configured operation allowlist, where each
   allowed operation binds exactly one method to exactly one exact path or
   segment-bounded path prefix.
@@ -375,8 +377,9 @@ For each request, the gateway performs these steps in order:
    identity. A refused request is audited as a `denied` decision with error
    class `too_many_requests` and answered with HTTP 429.
 1. Allocate a request identity.
-1. Parse and validate the method and origin-form target, rejecting literal or
-   percent-encoded dot segments.
+1. Parse and validate the method and origin-form target, rejecting
+   percent-encoded path separators and literal or percent-encoded dot
+   segments.
 1. Check the method-path operation allowlist.
 1. Copy end-to-end headers, excluding hop-by-hop headers, the `Host` header,
    and HTTP proxy credential headers such as `Proxy-Authorization`.
@@ -718,9 +721,9 @@ module and cover the parsers, constructors, and serializers with paired
 accept-every-valid and reject-every-invalid grammars: allowed operation
 parsing, upstream origin parsing, segment-bounded prefix matching, upstream
 URL joining, accepted-target validation (dot segments, percent encoding,
-origin form), header filtering (hop-by-hop stripping, byte limits,
-connection tokens), upstream request construction from allowed targets
-(`UpstreamRequest::from_target`), audit event serialization option
+encoded separators, origin form), header filtering (hop-by-hop stripping,
+byte limits, connection tokens), upstream request construction from allowed
+targets (`UpstreamRequest::from_target`), audit event serialization option
 semantics, request identity formatting, and timestamp round-tripping.
 Generated gateway scenario property tests live inside `http`'s inline
 `tests::proptests` module because their oracle intentionally reuses the

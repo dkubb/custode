@@ -88,6 +88,9 @@ pub(crate) enum RejectionReason {
     /// The path contained a literal or percent-encoded `.` or `..` segment.
     DotSegment,
 
+    /// The path contained a percent-encoded separator.
+    EncodedSeparator,
+
     /// The path contained invalid percent-encoding.
     InvalidPercentEncoding,
 
@@ -128,6 +131,7 @@ fn rejection_for(config: &GatewayConfig, method: &Method) -> RejectionReason {
 const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReason {
     match error {
         OriginFormPathError::DotSegment => RejectionReason::DotSegment,
+        OriginFormPathError::EncodedSeparator => RejectionReason::EncodedSeparator,
         OriginFormPathError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
         OriginFormPathError::NonOriginForm => RejectionReason::NonOriginForm,
     }
@@ -224,6 +228,18 @@ mod tests {
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%2E/models", None),
             Err(RejectionReason::DotSegment),
+        );
+    }
+
+    #[test]
+    fn target_rejects_percent_encoded_separators() {
+        assert_eq!(
+            AcceptedTarget::new("/v1/responses/%2e%2e%2fmodels", None),
+            Err(RejectionReason::EncodedSeparator),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/responses/%5cmodels", None),
+            Err(RejectionReason::EncodedSeparator),
         );
     }
 
@@ -325,13 +341,12 @@ mod proptests {
         )
     }
 
-    /// Percent escapes of non-dot bytes, spanning the full hex alphabet in
-    /// both cases.
-    fn escape_non_dot() -> impl Strategy<Value = String> {
+    /// Percent escapes that cannot change path segment structure.
+    fn path_escape_valid() -> impl Strategy<Value = String> {
         (any::<u8>(), any::<bool>()).prop_filter_map(
-            "dot escapes decode to dot segments",
+            "path escapes cannot decode to dots or separators",
             |(byte, uppercase)| {
-                (byte != b'.').then(|| {
+                (!matches!(byte, b'.' | b'/' | b'\\')).then(|| {
                     if uppercase {
                         format!("%{byte:02X}")
                     } else {
@@ -367,7 +382,7 @@ mod proptests {
                 Just("%2ea".to_owned()),
                 Just("a%2e".to_owned()),
             ],
-            1 => escape_non_dot(),
+            1 => path_escape_valid(),
         ]
     }
 
@@ -420,6 +435,16 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
+    /// Paths containing one encoded path separator.
+    fn path_with_encoded_separator() -> impl Strategy<Value = String> {
+        (
+            path_valid(),
+            prop_oneof![Just("%2f"), Just("%2F"), Just("%5c"), Just("%5C"),],
+            "[A-Za-z0-9_-]{1,8}",
+        )
+            .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
+    }
+
     /// Paths missing the leading slash (first invalid origin-form).
     fn path_non_origin_form() -> impl Strategy<Value = String> {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
@@ -451,6 +476,14 @@ mod proptests {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
                 Err(RejectionReason::InvalidPercentEncoding)
+            );
+        }
+
+        #[test]
+        fn new_rejects_every_encoded_separator(path in path_with_encoded_separator()) {
+            prop_assert_eq!(
+                AcceptedTarget::new(&path, None),
+                Err(RejectionReason::EncodedSeparator)
             );
         }
 

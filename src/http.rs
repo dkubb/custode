@@ -639,6 +639,7 @@ const fn denial_reason_from_request_header(error: HeaderError) -> AuditDenialRea
 const fn denial_reason_from_rejection(reason: RejectionReason) -> AuditDenialReason {
     match reason {
         RejectionReason::DotSegment => AuditDenialReason::DotSegment,
+        RejectionReason::EncodedSeparator => AuditDenialReason::EncodedSeparator,
         RejectionReason::InvalidPercentEncoding => AuditDenialReason::InvalidPercentEncoding,
         RejectionReason::MethodDenied => AuditDenialReason::MethodDenied,
         RejectionReason::NonOriginForm => AuditDenialReason::NonOriginForm,
@@ -2098,6 +2099,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_denies_encoded_path_separator_targets() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (audit_log, audit_text) = audit_paths(directory.path());
+        let config = config_from_args(&[
+            "--upstream-origin",
+            "https://api.openai.com",
+            "--allowed-operations",
+            "GET:prefix:/v1/responses",
+            "--audit-log",
+            &audit_text,
+            "--bind",
+            "127.0.0.1:0",
+        ]);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let response = router
+            .oneshot(build_request(Method::GET, "/v1/responses/%2e%2e%2fmodels"))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["error_class"], "encoded_path_separator");
+        assert_eq!(event["path"], "/v1/responses/%2e%2e%2fmodels");
+    }
+
+    #[tokio::test]
     async fn proxy_denies_operations_outside_the_allowlist() {
         let directory = tempdir().expect("temporary directory should be created");
         let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
@@ -2743,6 +2772,10 @@ mod tests {
     fn target_rejections_map_to_denial_reasons() {
         let cases = [
             (RejectionReason::DotSegment, AuditDenialReason::DotSegment),
+            (
+                RejectionReason::EncodedSeparator,
+                AuditDenialReason::EncodedSeparator,
+            ),
             (
                 RejectionReason::InvalidPercentEncoding,
                 AuditDenialReason::InvalidPercentEncoding,

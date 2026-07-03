@@ -13,6 +13,9 @@ pub(crate) enum OriginFormPathError {
     /// Path contained a literal or percent-encoded dot segment.
     DotSegment,
 
+    /// Path contained a percent-encoded path separator.
+    EncodedSeparator,
+
     /// Path contained invalid percent-encoding.
     InvalidPercentEncoding,
 
@@ -75,13 +78,17 @@ impl OriginFormPath {
     /// # Errors
     ///
     /// Returns an error when the path is not origin-form, contains invalid
-    /// percent-encoding, or contains a literal or percent-encoded dot segment.
+    /// percent-encoding, contains a percent-encoded path separator, or contains
+    /// a literal or percent-encoded dot segment.
     pub(crate) fn parse(path: &str) -> Result<Self, OriginFormPathError> {
         if !path.starts_with('/') {
             return Err(OriginFormPathError::NonOriginForm);
         }
         if !has_valid_percent_encoding(path) {
             return Err(OriginFormPathError::InvalidPercentEncoding);
+        }
+        if has_encoded_separator(path) {
+            return Err(OriginFormPathError::EncodedSeparator);
         }
         if has_dot_segment(path) {
             return Err(OriginFormPathError::DotSegment);
@@ -138,6 +145,28 @@ pub(crate) fn has_valid_percent_encoding(value: &str) -> bool {
 /// Returns true when any path segment decodes exactly to `.` or `..`.
 fn has_dot_segment(path: &str) -> bool {
     path.split('/').any(segment_is_dot_segment)
+}
+
+/// Returns true when a percent escape decodes to a path separator byte.
+fn has_encoded_separator(path: &str) -> bool {
+    let mut bytes = path.as_bytes().iter().copied();
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let Some(first) = bytes.next() else {
+                return false;
+            };
+            let Some(second) = bytes.next() else {
+                return false;
+            };
+            let Some(decoded) = decode_hex_pair(first, second) else {
+                return false;
+            };
+            if matches!(decoded, b'/' | b'\\') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Returns true when a path segment is a literal or percent-encoded dot segment.
@@ -312,6 +341,23 @@ mod tests {
     }
 
     #[test]
+    fn path_rejects_percent_encoded_separators() {
+        for path in [
+            "/v1/responses/%2fmodels",
+            "/v1/responses/%2Fmodels",
+            "/v1/responses/%5cmodels",
+            "/v1/responses/%5Cmodels",
+            "/v1/responses/%2e%2e%2fmodels",
+        ] {
+            assert_eq!(
+                OriginFormPath::parse(path),
+                Err(OriginFormPathError::EncodedSeparator),
+                "path {path}"
+            );
+        }
+    }
+
+    #[test]
     fn path_rejects_truncated_percent_escapes() {
         assert_eq!(
             OriginFormPath::parse("/v1/%"),
@@ -372,6 +418,9 @@ mod tests {
         // Truncated and non-hex escapes are rejected by percent-encoding
         // validation before segment checks; the early returns here keep the
         // function total over arbitrary segment inputs.
+        assert!(!super::has_encoded_separator("%"));
+        assert!(!super::has_encoded_separator("%2"));
+        assert!(!super::has_encoded_separator("%zz"));
         assert!(!super::segment_is_dot_segment("%"));
         assert!(!super::segment_is_dot_segment("%2"));
         assert!(!super::segment_is_dot_segment("%zz"));
@@ -406,6 +455,22 @@ mod proptests {
         )
     }
 
+    /// Percent escapes that cannot change path segment structure.
+    fn path_escape_valid() -> impl Strategy<Value = String> {
+        (any::<u8>(), any::<bool>()).prop_filter_map(
+            "path escapes cannot decode to dots or separators",
+            |(byte, uppercase)| {
+                (!matches!(byte, b'.' | b'/' | b'\\')).then(|| {
+                    if uppercase {
+                        format!("%{byte:02X}")
+                    } else {
+                        format!("%{byte:02x}")
+                    }
+                })
+            },
+        )
+    }
+
     /// Path segments that decode to something other than `.` or `..`.
     fn segment_valid() -> impl Strategy<Value = String> {
         prop_oneof![
@@ -418,7 +483,7 @@ mod proptests {
                 Just("%2ea".to_owned()),
                 Just("a%2e".to_owned()),
             ],
-            1 => escape_non_dot(),
+            1 => path_escape_valid(),
         ]
     }
 
@@ -479,6 +544,16 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
+    /// Paths containing one encoded path separator.
+    fn path_with_encoded_separator() -> impl Strategy<Value = String> {
+        (
+            path_valid(),
+            prop_oneof![Just("%2f"), Just("%2F"), Just("%5c"), Just("%5C"),],
+            "[A-Za-z0-9_-]{1,8}",
+        )
+            .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
+    }
+
     /// Paths missing the leading slash.
     fn path_non_origin_form() -> impl Strategy<Value = String> {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
@@ -529,6 +604,14 @@ mod proptests {
             prop_assert_eq!(
                 OriginFormPath::parse(&path),
                 Err(OriginFormPathError::InvalidPercentEncoding)
+            );
+        }
+
+        #[test]
+        fn parse_rejects_every_encoded_separator(path in path_with_encoded_separator()) {
+            prop_assert_eq!(
+                OriginFormPath::parse(&path),
+                Err(OriginFormPathError::EncodedSeparator)
             );
         }
 
