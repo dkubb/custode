@@ -317,10 +317,10 @@ impl Gateway {
         }
     }
 
-    /// Allocates a request identity unique within the audit log.
+    /// Allocates a request identity unique within this gateway run.
     ///
-    /// The identity embeds a per-run random token so identities from
-    /// different gateway runs appended to the same audit log do not collide.
+    /// The sequence is unique within a run; the per-run random token makes
+    /// cross-run collisions negligible under the OS RNG assumption.
     pub(crate) fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
         self.request_ids.next_request_id()
     }

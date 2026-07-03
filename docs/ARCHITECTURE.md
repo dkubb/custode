@@ -488,8 +488,10 @@ so no configuration decision ever appears in the request audit stream.
 The example's field order is illustrative; events serialize a fixed field
 set without a guaranteed key order. `timestamp` is RFC 3339 UTC with
 nanosecond precision. `request_id` embeds a 128-bit OS-random per-run token
-and a monotonic sequence, so identities from different gateway runs appended
-to the same audit log do not collide.
+and a monotonic sequence. The sequence makes identities unique within one
+gateway run. The random token makes identities from different gateway runs
+collision-resistant under the operating system random source assumption; the
+gateway does not persist a registry of prior run tokens.
 
 `path` is the accepted request path. For denied non-origin-form requests it
 records the full raw request target, including the requested authority, such

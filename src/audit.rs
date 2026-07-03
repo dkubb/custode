@@ -1064,8 +1064,8 @@ impl AuditWriter {
 impl RequestId {
     /// Creates a request identity from a run token and sequence number.
     ///
-    /// The run token keeps identities unique across gateway runs that append
-    /// to the same audit log.
+    /// The sequence is unique within a run; the random run token makes
+    /// cross-run collisions negligible under the OS RNG assumption.
     #[must_use]
     pub(crate) fn from_parts(run_token: &RunToken, sequence: NonZeroU64) -> Self {
         Self {
