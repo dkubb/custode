@@ -4,7 +4,9 @@ use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{GatewayConfig, UpstreamOrigin};
 use ::http::{Method, StatusCode};
+use core::fmt;
 use core::num::{NonZeroU64, NonZeroUsize};
+use non_empty_string::NonEmptyString;
 use serde::{Serialize, Serializer};
 use std::io;
 use std::path::PathBuf;
@@ -354,6 +356,17 @@ pub(crate) struct AuditWriter {
 /// Request identity used in audit events.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct RequestId(String);
+
+/// Non-empty per-run token used in request identities.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RunToken {
+    /// Non-empty run token text.
+    value: NonEmptyString,
+}
+
+/// Empty run token rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EmptyRunToken;
 
 /// RFC 3339 UTC audit timestamp.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1003,8 +1016,37 @@ impl RequestId {
     /// The run token keeps identities unique across gateway runs that append
     /// to the same audit log.
     #[must_use]
-    pub(crate) fn from_parts(run_token: &str, sequence: u64) -> Self {
+    pub(crate) fn from_parts(run_token: &RunToken, sequence: u64) -> Self {
         Self(format!("req-{run_token}-{sequence:016x}"))
+    }
+}
+
+impl RunToken {
+    /// Returns the run token as a string slice.
+    #[must_use]
+    fn as_str(&self) -> &str {
+        self.value.as_str()
+    }
+
+    /// Creates a non-empty run token for tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(value: &str) -> Self {
+        Self::new(value).expect("test run token should be non-empty")
+    }
+
+    /// Creates a non-empty run token.
+    pub(crate) fn new(value: impl Into<String>) -> Result<Self, EmptyRunToken> {
+        let text = value.into();
+        NonEmptyString::new(text)
+            .map(|non_empty| Self { value: non_empty })
+            .map_err(|_empty| EmptyRunToken)
+    }
+}
+
+impl fmt::Display for RunToken {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1076,7 +1118,8 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditTarget, AuditTimestamp, AuditWriter,
-        ObservedBodySummary, RequestId, ResponseBodyPrefix, write_serialized_event,
+        EmptyRunToken, ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken,
+        write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1162,7 +1205,7 @@ mod tests {
         AuditRequestInput::new(
             Method::from_bytes(method.as_bytes()).expect("test method should parse"),
             target,
-            RequestId::from_parts("run", 1),
+            RequestId::from_parts(&RunToken::for_test("run"), 1),
             body,
             UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
         )
@@ -1254,6 +1297,11 @@ mod tests {
 
         assert_eq!(event.path, "/v1/responses/%2e%2e/models");
         assert_eq!(event.query.as_deref(), Some("limit=1"));
+    }
+
+    #[test]
+    fn run_token_rejects_empty_text() {
+        assert_eq!(RunToken::new(""), Err(EmptyRunToken));
     }
 
     #[test]
@@ -1518,7 +1566,7 @@ mod proptests {
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, ObservedBodySummary, RequestId,
-        ResponseBodyPrefix,
+        ResponseBodyPrefix, RunToken,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1742,10 +1790,12 @@ mod proptests {
                     )
                 }
             };
+            let request_run_token =
+                RunToken::new(run_token).expect("generated run token should be non-empty");
             let request = AuditRequestInput::new(
                 method_value(&method),
                 AuditTarget::from_uri_parts(&path, query.as_deref()),
-                RequestId::from_parts(&run_token, sequence),
+                RequestId::from_parts(&request_run_token, sequence),
                 request_body,
                 upstream_origin(),
             );
@@ -1795,7 +1845,9 @@ mod proptests {
             run_token in "[0-9a-f]{1,16}",
             sequence in any::<u64>(),
         ) {
-            let value = serde_json::to_value(RequestId::from_parts(&run_token, sequence))
+            let request_run_token =
+                RunToken::new(run_token.clone()).expect("generated run token should be non-empty");
+            let value = serde_json::to_value(RequestId::from_parts(&request_run_token, sequence))
                 .expect("request id should serialize");
 
             let expected = format!("req-{run_token}-{sequence:016x}");

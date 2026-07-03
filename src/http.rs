@@ -1181,6 +1181,7 @@ mod tests {
     use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
     use crate::audit::{
         AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
+        RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, ServeArgs};
@@ -1350,8 +1351,12 @@ mod tests {
             "https://api.openai.com",
         );
         let target = allowed_target(&config, "/v1/models");
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let request_body = AccountedBody::read_request(
             Body::empty(),
             NonZeroUsize::new(1).expect("limit should be non-zero"),
@@ -1364,7 +1369,7 @@ mod tests {
             fatal_errors,
             gateway,
             request_body,
-            request_id: RequestId::from_parts("test", 1),
+            request_id: RequestId::from_parts(&RunToken::for_test("test"), 1),
             response_account,
             status: StatusCode::OK,
             target,
@@ -1540,8 +1545,12 @@ mod tests {
                 .with_max_response_bytes(NonZeroU64::new(4).expect("literal should be non-zero"));
         }
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let permits = match scenario.admission() {
             ScenarioAdmission::Open => 1,
@@ -1746,8 +1755,12 @@ mod tests {
             "https://api.openai.com",
         );
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
             client: Arc::new(client),
@@ -1815,8 +1828,12 @@ mod tests {
             "https://api.openai.com",
         );
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
             client: Arc::new(client),
@@ -1878,8 +1895,12 @@ mod tests {
             "https://api.openai.com",
         );
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
             client: Arc::new(client),
@@ -1949,8 +1970,12 @@ mod tests {
             "https://api.openai.com",
         );
         let deadline = UpstreamDeadline::from_timeout(config.request_timeout());
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let state = AppState {
             client: Arc::new(client),
@@ -2765,8 +2790,12 @@ mod tests {
             "https://api.openai.com",
         );
         let target = allowed_target(&config, "/v1/models");
-        let gateway =
-            Gateway::from_ports(config, audit, FixedClock, SequentialRequestIds::new("test"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("test")),
+        );
         let request_body = AccountedBody::read_request(
             Body::empty(),
             NonZeroUsize::new(1).expect("limit should be non-zero"),
@@ -2780,7 +2809,7 @@ mod tests {
             fatal_errors,
             gateway,
             request_body,
-            request_id: RequestId::from_parts("test", 1),
+            request_id: RequestId::from_parts(&RunToken::for_test("test"), 1),
             response_account,
             status: StatusCode::OK,
             target,
@@ -3085,7 +3114,7 @@ mod tests {
             fatal_errors,
             gateway,
             request_body,
-            request_id: RequestId::from_parts("test", 1),
+            request_id: RequestId::from_parts(&RunToken::for_test("test"), 1),
             response_account,
             status: StatusCode::OK,
             target,

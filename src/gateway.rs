@@ -333,7 +333,9 @@ mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
     use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
-    use crate::audit::{AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId};
+    use crate::audit::{
+        AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId, RunToken,
+    };
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
     use ::http::{Method, StatusCode};
@@ -447,7 +449,7 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts("run", 1),
+                RequestId::from_parts(&RunToken::for_test("run"), 1),
                 &Method::CONNECT,
                 AuditTarget::from_uri_parts("/", None),
                 None,
@@ -473,7 +475,7 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts("run", 1),
+                RequestId::from_parts(&RunToken::for_test("run"), 1),
                 &Method::DELETE,
                 AuditTarget::from_uri_parts("/v1/models", None),
                 Some(&request_body),
@@ -494,7 +496,7 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts("run", 1),
+                RequestId::from_parts(&RunToken::for_test("run"), 1),
                 &Method::POST,
                 AuditTarget::from_uri_parts("/v1/other", None),
                 Some(&request_body),
@@ -517,7 +519,7 @@ mod tests {
             allowed_target(&gateway, "/v1/models", None),
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            RequestId::from_parts("run", 1),
+            RequestId::from_parts(&RunToken::for_test("run"), 1),
         );
 
         gateway
@@ -544,7 +546,7 @@ mod tests {
             allowed_target(&gateway, "/v1/models", Some("limit=1")),
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            RequestId::from_parts("run", 1),
+            RequestId::from_parts(&RunToken::for_test("run"), 1),
         );
 
         gateway

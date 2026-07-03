@@ -1,6 +1,6 @@
 //! Production runtime adapters.
 
-use crate::audit::{AuditError, AuditEvent, AuditTimestamp, AuditWriter, RequestId};
+use crate::audit::{AuditError, AuditEvent, AuditTimestamp, AuditWriter, RequestId, RunToken};
 use crate::ports::{
     AuditSink, BoxFuture, Clock, RequestIdSource, UpstreamBodyError, UpstreamClient, UpstreamError,
     UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
@@ -8,7 +8,6 @@ use crate::ports::{
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
 use std::process;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
@@ -22,7 +21,7 @@ pub(crate) struct SequentialRequestIds {
     /// Next request sequence.
     next: AtomicU64,
     /// Per-process run token embedded in request identities.
-    run_token: Arc<str>,
+    run_token: RunToken,
 }
 
 /// Production reqwest-backed upstream client.
@@ -91,10 +90,10 @@ impl RequestIdSource for SequentialRequestIds {
 impl SequentialRequestIds {
     /// Creates a sequence source that starts at request 1 with a run token.
     #[must_use]
-    pub(crate) fn new(run_token: impl Into<Arc<str>>) -> Self {
+    pub(crate) const fn new(run_token: RunToken) -> Self {
         Self {
             next: AtomicU64::new(1),
-            run_token: run_token.into(),
+            run_token,
         }
     }
 
@@ -108,7 +107,7 @@ impl SequentialRequestIds {
         // The process id disambiguates runs whose wall clocks collide, such
         // as restored snapshots or stepped clocks.
         let run_token = format!("{:x}-{run_nanos:x}", process::id());
-        Self::new(run_token)
+        Self::new(RunToken::new(run_token).expect("production run token should be non-empty"))
     }
 }
 
