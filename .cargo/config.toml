@@ -1,6 +1,10 @@
 [alias]
 clippy-all = ["clippy", "--all-features", "--all-targets", "--tests", "--workspace"]
+deny-check = ["deny", "check"]
 fmt-all = ["fmt", "--all"]
+fmt-check-all = ["fmt", "--all", "--check"]
+mutants-all = ["mutants"]
+test-workspace = ["test", "--workspace", "--all-features"]
 test-all = [
   "nextest",
   "run",

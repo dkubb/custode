@@ -6,22 +6,22 @@ default:
     just --list
 
 fmt:
-    cargo fmt --all
+    cargo fmt-all
 
 fmt-check:
-    cargo fmt --all --check
+    cargo fmt-check-all
 
 lint:
-    cargo clippy --workspace --all-targets --all-features --quiet
+    cargo clippy-all --quiet
 
 test:
-    cargo test --workspace --all-features
+    cargo test-workspace
 
 docs:
     mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
 
 deny:
-    cargo deny check --config .cargo/deny.toml
+    cargo deny-check
 
 dockerfile-check:
     docker buildx build --check .
@@ -36,7 +36,7 @@ coverage:
     cargo llvm-cov --workspace --all-features --summary-only
 
 mutants:
-    cargo mutants
+    cargo mutants-all
 
 check: fmt-check lint test dockerfile-check
 
