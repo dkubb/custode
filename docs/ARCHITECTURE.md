@@ -796,8 +796,8 @@ binary against a local recording upstream and cover:
   authority-bearing target;
 - harness-supplied authorization reaches the local test upstream for allowed
   requests;
-- every allowed and denied request produces an audit event with a unique
-  request identity;
+- every allowed and denied request produces an audit event with a request
+  identity distinct within the gateway run;
 - an unopenable audit log fails closed at startup;
 - a missing allowlist fails closed at startup;
 - a wildcard upstream origin fails closed at startup.

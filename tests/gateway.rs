@@ -912,7 +912,10 @@ mod tests {
             .collect();
         let first = identities.first().expect("first identity should exist");
         let second = identities.get(1).expect("second identity should exist");
-        assert_ne!(first, second, "request identities must be unique");
+        assert_ne!(
+            first, second,
+            "request identities must be distinct within a run"
+        );
     }
 
     #[tokio::test]
