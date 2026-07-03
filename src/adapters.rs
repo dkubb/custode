@@ -72,6 +72,7 @@ impl ReqwestUpstreamClient {
     /// Returns an error when reqwest client construction fails.
     pub(crate) fn new() -> Result<Self, UpstreamClientBuildError> {
         let client = reqwest::Client::builder()
+            .no_proxy()
             .build()
             .map_err(upstream_client_build_error)?;
         Ok(Self { client })

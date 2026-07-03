@@ -65,6 +65,9 @@ struct RecordedRequest {
 /// Shared recording of upstream requests.
 type Recorder = Arc<Mutex<Vec<RecordedRequest>>>;
 
+/// Shared recording of fake proxy requests.
+type ProxyRecorder = Arc<Mutex<Vec<Vec<u8>>>>;
+
 /// A gateway child process that is killed on drop.
 #[derive(Debug)]
 struct GatewayProcess {
@@ -127,6 +130,36 @@ impl GatewayProcess {
         }
     }
 
+    /// Spawns a gateway with an inherited HTTP proxy environment.
+    async fn spawn_with_http_proxy(
+        upstream_origin: &str,
+        allowed_operations: &str,
+        proxy_url: &str,
+    ) -> Self {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let mut started = None;
+        for _spawn_attempt in 0_u32..5 {
+            started = Self::try_start_with_http_proxy(
+                upstream_origin,
+                allowed_operations,
+                &audit_log,
+                proxy_url,
+            )
+            .await;
+            if started.is_some() {
+                break;
+            }
+        }
+        let (addr, child) = started.expect("gateway should start listening within five attempts");
+        Self {
+            _directory: directory,
+            addr,
+            audit_log,
+            child,
+        }
+    }
+
     /// Starts one gateway process, returning None when it loses the bind race.
     async fn try_start(
         upstream_origin: &str,
@@ -135,6 +168,35 @@ impl GatewayProcess {
     ) -> Option<(SocketAddr, Child)> {
         let addr = free_local_addr();
         let mut child = spawn_gateway_command(addr, upstream_origin, allowed_operations, audit_log);
+        for _poll in 0_u32..100 {
+            if child
+                .try_wait()
+                .expect("child status should be observable")
+                .is_some()
+            {
+                return None;
+            }
+            if TcpStream::connect(addr).await.is_ok() {
+                return Some((addr, child));
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        let _kill_result = child.kill();
+        let _wait_result = child.wait();
+        None
+    }
+
+    /// Starts one gateway process with an inherited HTTP proxy environment.
+    async fn try_start_with_http_proxy(
+        upstream_origin: &str,
+        allowed_operations: &str,
+        audit_log: &Path,
+        proxy_url: &str,
+    ) -> Option<(SocketAddr, Child)> {
+        let addr = free_local_addr();
+        let mut command = gateway_command(addr, upstream_origin, allowed_operations, audit_log);
+        command.env("HTTP_PROXY", proxy_url);
+        let mut child = spawn_configured_gateway(command);
         for _poll in 0_u32..100 {
             if child
                 .try_wait()
@@ -251,12 +313,99 @@ async fn start_upstream() -> (SocketAddr, Recorder) {
     (addr, recorder)
 }
 
+/// Starts a fake HTTP proxy that records incoming request bytes.
+async fn start_fake_proxy() -> (SocketAddr, ProxyRecorder) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake proxy listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("fake proxy listener should report its address");
+    let recorder = Arc::new(Mutex::new(Vec::new()));
+    let recorder_task = Arc::clone(&recorder);
+    drop(tokio::spawn(async move {
+        loop {
+            let (mut socket, _peer) = listener
+                .accept()
+                .await
+                .expect("fake proxy should accept connections");
+            let proxy_hits = Arc::clone(&recorder_task);
+            drop(tokio::spawn(async move {
+                let mut buffer = [0_u8; 1_024];
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("fake proxy request should be readable");
+                proxy_hits
+                    .lock()
+                    .expect("fake proxy recorder should not be poisoned")
+                    .push(
+                        buffer
+                            .get(..read)
+                            .expect("read bytes should fit the buffer")
+                            .to_vec(),
+                    );
+                let _write_result = socket
+                    .write_all(
+                        b"HTTP/1.1 502 Bad Gateway\r\n\
+                          content-length: 0\r\n\
+                          connection: close\r\n\r\n",
+                    )
+                    .await;
+            }));
+        }
+    }));
+    (addr, recorder)
+}
+
 /// Reserves a local address for the gateway to bind.
 fn free_local_addr() -> SocketAddr {
     let listener = StdTcpListener::bind("127.0.0.1:0").expect("probe listener should bind");
     listener
         .local_addr()
         .expect("probe listener should report its address")
+}
+
+/// Returns a gateway command with explicit serve configuration.
+fn gateway_command(
+    bind: SocketAddr,
+    upstream_origin: &str,
+    allowed_operations: &str,
+    audit_log: &Path,
+) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_custode-proxy"));
+    clear_proxy_environment(&mut command);
+    command
+        .arg("serve")
+        .env("CUSTODE_BIND", bind.to_string())
+        .env("CUSTODE_UPSTREAM_ORIGIN", upstream_origin)
+        .env("CUSTODE_ALLOWED_OPERATIONS", allowed_operations)
+        .env("CUSTODE_AUDIT_LOG", audit_log)
+        .env("CUSTODE_REQUEST_TIMEOUT_SECS", "5")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// Removes ambient proxy variables from a child process command.
+fn clear_proxy_environment(command: &mut Command) {
+    for key in [
+        "ALL_PROXY",
+        "HTTPS_PROXY",
+        "HTTP_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "https_proxy",
+        "http_proxy",
+        "no_proxy",
+    ] {
+        command.env_remove(key);
+    }
+}
+
+/// Spawns a configured gateway command.
+fn spawn_configured_gateway(mut command: Command) -> Child {
+    command.spawn().expect("gateway binary should spawn")
 }
 
 /// Spawns the gateway binary with explicit serve configuration.
@@ -266,17 +415,12 @@ fn spawn_gateway_command(
     allowed_operations: &str,
     audit_log: &Path,
 ) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_custode-proxy"))
-        .arg("serve")
-        .env("CUSTODE_BIND", bind.to_string())
-        .env("CUSTODE_UPSTREAM_ORIGIN", upstream_origin)
-        .env("CUSTODE_ALLOWED_OPERATIONS", allowed_operations)
-        .env("CUSTODE_AUDIT_LOG", audit_log)
-        .env("CUSTODE_REQUEST_TIMEOUT_SECS", "5")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("gateway binary should spawn")
+    spawn_configured_gateway(gateway_command(
+        bind,
+        upstream_origin,
+        allowed_operations,
+        audit_log,
+    ))
 }
 
 /// Writes a raw HTTP/1.1 request and returns the response status line.
@@ -327,8 +471,9 @@ fn wait_for_failure(mut child: Child) -> bool {
 )]
 mod tests {
     use super::{
-        Command, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio, free_local_addr,
-        raw_response_status_line, spawn_gateway_command, start_upstream, tempdir, wait_for_failure,
+        Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio,
+        free_local_addr, raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy,
+        start_upstream, tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
 
@@ -439,6 +584,45 @@ mod tests {
             recorded_hits(&decoy_recorder).len(),
             0,
             "host header must not select the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn ambient_http_proxy_cannot_select_upstream() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let (fake_proxy, proxy_recorder) = start_fake_proxy().await;
+        let gateway = GatewayProcess::spawn_with_http_proxy(
+            &format!("http://{upstream}"),
+            "GET:exact:/v1/models",
+            &format!("http://{fake_proxy}"),
+        )
+        .await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client should build");
+        let response = client
+            .get(format!("{}/v1/models", gateway.base_url()))
+            .send()
+            .await
+            .expect("gateway request should complete");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            1,
+            "configured upstream should be reached"
+        );
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            proxy_recorder
+                .lock()
+                .expect("fake proxy recorder should not be poisoned")
+                .len(),
+            0,
+            "ambient proxy must not select the upstream"
         );
     }
 
