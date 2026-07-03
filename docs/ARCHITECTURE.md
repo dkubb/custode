@@ -149,7 +149,11 @@ The local gate vocabulary is:
 - `just dockerfile-check` runs the BuildKit Dockerfile check.
 - `just docker-build` builds both images; `just docker-test` runs the
   container tests in `scripts/container-test.sh`.
-- `just coverage` reports `cargo llvm-cov` coverage.
+- `just coverage` reports `cargo llvm-cov` unit coverage and fails unless
+  missed regions, functions, lines, and branches are all zero.
+- `just coverage-proptests` reports `cargo llvm-cov` proptest-only coverage
+  and fails when missed regions, functions, lines, or branches exceed the
+  documented ratchet.
 - `just mutants` runs `cargo-mutants` mutation testing.
 - `just check` runs formatting, linting, tests, and the Dockerfile check.
 - `just ci` runs `check` plus `deny`.
