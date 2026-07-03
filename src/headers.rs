@@ -1,6 +1,6 @@
 //! Header filtering and redaction.
 
-use ::http::header::{CONNECTION, HOST};
+use ::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
 use ::http::{HeaderMap, HeaderName};
 use core::num::NonZeroUsize;
 use thiserror::Error;
@@ -115,7 +115,7 @@ pub(crate) fn forward_response_headers(
 
     let mut outgoing = HeaderMap::new();
     for (name, value) in incoming {
-        if !is_hop_by_hop(name, &connection_headers) {
+        if response_header_is_forwarded(name, &connection_headers) {
             outgoing.append(name, value.clone());
         }
     }
@@ -147,6 +147,11 @@ fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderNa
     !is_hop_by_hop(name, connection_headers) && *name != HOST
 }
 
+/// Returns true when a response header is safe to forward downstream.
+fn response_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderName]) -> bool {
+    !is_hop_by_hop(name, connection_headers) && *name != CONTENT_LENGTH
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -155,7 +160,9 @@ fn request_header_is_forwarded(name: &HeaderName, connection_headers: &[HeaderNa
 )]
 mod tests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
-    use ::http::header::{AUTHORIZATION, CONNECTION, COOKIE, HOST, PROXY_AUTHORIZATION};
+    use ::http::header::{
+        AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, PROXY_AUTHORIZATION,
+    };
     use ::http::{HeaderMap, HeaderValue};
     use core::num::NonZeroUsize;
     use pretty_assertions::assert_eq;
@@ -300,6 +307,25 @@ mod tests {
         assert_eq!(forwarded.get("x-trace"), None);
         assert_eq!(forwarded.get("x-visible"), expected);
     }
+
+    #[test]
+    fn response_headers_strip_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        headers.insert("x-visible", HeaderValue::from_static("ok"));
+
+        let forwarded = forward_response_headers(
+            &headers,
+            NonZeroUsize::new(1024).expect("literal should be non-zero"),
+        )
+        .expect("headers should fit");
+
+        assert_eq!(forwarded.get(CONTENT_LENGTH), None);
+        assert_eq!(
+            forwarded.get("x-visible"),
+            Some(&HeaderValue::from_static("ok"))
+        );
+    }
 }
 
 #[cfg(test)]
@@ -310,7 +336,7 @@ mod tests {
 )]
 mod proptests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
-    use ::http::header::{CONNECTION, HOST};
+    use ::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
     use ::http::{HeaderMap, HeaderName, HeaderValue};
     use core::num::NonZeroUsize;
     use proptest::prelude::*;
@@ -447,12 +473,14 @@ mod proptests {
 
             prop_assert_eq!(forwarded.get(HOST), incoming.get(HOST));
             prop_assert!(forwarded.get(CONNECTION).is_none());
+            prop_assert!(forwarded.get(CONTENT_LENGTH).is_none());
             for name in hop_by_hop.iter().map(|entry| entry.0.as_str()) {
                 let message = format!("hop-by-hop {name} should be stripped");
                 prop_assert!(!forwarded.contains_key(name), "{}", message);
             }
             for name in end_to_end.iter().map(|entry| entry.0.as_str()) {
-                let stripped = connection_named.iter().any(|token| token == name);
+                let stripped =
+                    connection_named.iter().any(|token| token == name) || name == "content-length";
                 let expected: Vec<&HeaderValue> = if stripped {
                     Vec::new()
                 } else {
