@@ -5,6 +5,7 @@ use crate::ports::{
     AuditSink, BoxFuture, Clock, RequestIdSource, UpstreamBodyError, UpstreamClient, UpstreamError,
     UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
+use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
 use std::process;
@@ -82,7 +83,8 @@ impl ReqwestUpstreamClient {
 
 impl RequestIdSource for SequentialRequestIds {
     fn next_request_id(&self) -> RequestId {
-        let sequence = self.next.fetch_add(1, Ordering::Relaxed);
+        let sequence = NonZeroU64::new(self.next.fetch_add(1, Ordering::Relaxed))
+            .expect("request sequence should be non-zero");
         RequestId::from_parts(&self.run_token, sequence)
     }
 }

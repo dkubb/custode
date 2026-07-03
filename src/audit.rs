@@ -1016,8 +1016,9 @@ impl RequestId {
     /// The run token keeps identities unique across gateway runs that append
     /// to the same audit log.
     #[must_use]
-    pub(crate) fn from_parts(run_token: &RunToken, sequence: u64) -> Self {
-        Self(format!("req-{run_token}-{sequence:016x}"))
+    pub(crate) fn from_parts(run_token: &RunToken, sequence: NonZeroU64) -> Self {
+        let sequence_value = sequence.get();
+        Self(format!("req-{run_token}-{sequence_value:016x}"))
     }
 }
 
@@ -1196,6 +1197,11 @@ mod tests {
         }
     }
 
+    /// Builds a non-zero request sequence for tests.
+    fn request_sequence(value: u64) -> NonZeroU64 {
+        NonZeroU64::new(value).expect("test request sequence should be non-zero")
+    }
+
     /// Builds common request audit input for tests.
     fn request_input(
         method: &str,
@@ -1205,7 +1211,7 @@ mod tests {
         AuditRequestInput::new(
             Method::from_bytes(method.as_bytes()).expect("test method should parse"),
             target,
-            RequestId::from_parts(&RunToken::for_test("run"), 1),
+            RequestId::from_parts(&RunToken::for_test("run"), request_sequence(1)),
             body,
             UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
         )
@@ -1698,8 +1704,10 @@ mod proptests {
             request_body_bytes in non_empty_body(),
             response_body_bytes in non_empty_body(),
             run_token in "[0-9a-f]{1,16}",
-            sequence in any::<u64>(),
+            sequence_value in 1_u64..=u64::MAX,
         ) {
+            let sequence =
+                NonZeroU64::new(sequence_value).expect("generated sequence should be non-zero");
             let status = status_code(status_code_value);
             let request_body = body_summary(&request_body_bytes);
             let request_bytes = body_len(&request_body_bytes);
@@ -1843,14 +1851,16 @@ mod proptests {
         #[test]
         fn request_id_embeds_run_token_and_padded_sequence(
             run_token in "[0-9a-f]{1,16}",
-            sequence in any::<u64>(),
+            sequence_value in 1_u64..=u64::MAX,
         ) {
+            let sequence =
+                NonZeroU64::new(sequence_value).expect("generated sequence should be non-zero");
             let request_run_token =
                 RunToken::new(run_token.clone()).expect("generated run token should be non-empty");
             let value = serde_json::to_value(RequestId::from_parts(&request_run_token, sequence))
                 .expect("request id should serialize");
 
-            let expected = format!("req-{run_token}-{sequence:016x}");
+            let expected = format!("req-{run_token}-{sequence_value:016x}");
             prop_assert_eq!(value.as_str(), Some(expected.as_str()));
         }
 

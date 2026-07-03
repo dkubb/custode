@@ -340,7 +340,7 @@ mod tests {
     use crate::config::GatewayConfig;
     use ::http::{Method, StatusCode};
     use axum::body::Body;
-    use core::num::NonZeroUsize;
+    use core::num::{NonZeroU64, NonZeroUsize};
     use pretty_assertions::{assert_eq, assert_ne};
     use serde_json::{Map, Value};
     use std::path::Path;
@@ -449,7 +449,10 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts(&RunToken::for_test("run"), 1),
+                RequestId::from_parts(
+                    &RunToken::for_test("run"),
+                    NonZeroU64::new(1).expect("sequence should be non-zero"),
+                ),
                 &Method::CONNECT,
                 AuditTarget::from_uri_parts("/", None),
                 None,
@@ -475,7 +478,10 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts(&RunToken::for_test("run"), 1),
+                RequestId::from_parts(
+                    &RunToken::for_test("run"),
+                    NonZeroU64::new(1).expect("sequence should be non-zero"),
+                ),
                 &Method::DELETE,
                 AuditTarget::from_uri_parts("/v1/models", None),
                 Some(&request_body),
@@ -496,7 +502,10 @@ mod tests {
 
         gateway
             .audit_denial(
-                RequestId::from_parts(&RunToken::for_test("run"), 1),
+                RequestId::from_parts(
+                    &RunToken::for_test("run"),
+                    NonZeroU64::new(1).expect("sequence should be non-zero"),
+                ),
                 &Method::POST,
                 AuditTarget::from_uri_parts("/v1/other", None),
                 Some(&request_body),
@@ -519,7 +528,10 @@ mod tests {
             allowed_target(&gateway, "/v1/models", None),
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            RequestId::from_parts(&RunToken::for_test("run"), 1),
+            RequestId::from_parts(
+                &RunToken::for_test("run"),
+                NonZeroU64::new(1).expect("sequence should be non-zero"),
+            ),
         );
 
         gateway
@@ -546,7 +558,10 @@ mod tests {
             allowed_target(&gateway, "/v1/models", Some("limit=1")),
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
-            RequestId::from_parts(&RunToken::for_test("run"), 1),
+            RequestId::from_parts(
+                &RunToken::for_test("run"),
+                NonZeroU64::new(1).expect("sequence should be non-zero"),
+            ),
         );
 
         gateway
