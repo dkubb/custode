@@ -8,13 +8,11 @@ use http_body_util::LengthLimitError;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
 
-/// Body bytes plus accounting metadata.
+/// Accounted request body bytes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AccountedBody {
     /// Raw body bytes.
     bytes: Vec<u8>,
-    /// BLAKE3 digest for non-empty bodies.
-    digest: Option<BodyDigest>,
 }
 
 /// BLAKE3 digest for observed non-empty body bytes.
@@ -36,19 +34,18 @@ impl AccountedBody {
 
     /// Returns the BLAKE3 digest when the body is non-empty.
     #[must_use]
-    pub(crate) const fn digest(&self) -> Option<BodyDigest> {
-        self.digest
+    pub(crate) fn digest(&self) -> Option<BodyDigest> {
+        if self.bytes.is_empty() {
+            None
+        } else {
+            Some(BodyDigest::from_bytes(&self.bytes))
+        }
     }
 
     /// Creates body accounting from bytes.
     #[must_use]
-    fn from_bytes(bytes: Vec<u8>) -> Self {
-        let digest = if bytes.is_empty() {
-            None
-        } else {
-            Some(BodyDigest::from_bytes(&bytes))
-        };
-        Self { bytes, digest }
+    const fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self { bytes }
     }
 
     /// Reads and accounts for a request body.
