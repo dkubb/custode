@@ -3,8 +3,8 @@
 use crate::allowlist::AcceptedTarget;
 use crate::audit::{
     AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
-    AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
-    ObservedAuditRequestInput, ObservedBodySummary, RequestId,
+    AuditResponseError, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
+    AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary, RequestId,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -242,41 +242,29 @@ impl Gateway {
             ResponseAuditOutcomeKind::DownstreamClosed {
                 response_body,
                 status,
-            } => AuditEventInput::response_error(
-                request,
-                "downstream_closed",
-                response_body,
-                status,
-                upstream,
-            ),
+            } => {
+                let error = AuditResponseError::downstream_closed(response_body, status);
+                AuditEventInput::response_error(request, error, upstream)
+            }
             ResponseAuditOutcomeKind::ResponseBodyTooLarge {
                 response_body,
                 status,
-            } => AuditEventInput::response_error(
-                request,
-                "response_body_too_large",
-                response_body,
-                status,
-                upstream,
-            ),
+            } => {
+                let error = AuditResponseError::response_body_too_large(response_body, status);
+                AuditEventInput::response_error(request, error, upstream)
+            }
             ResponseAuditOutcomeKind::ResponseHeaderError { error } => {
-                AuditEventInput::response_error_without_body(
-                    request,
-                    error.error_class(),
-                    error.status(),
-                    upstream,
-                )
+                let response_error = AuditResponseError::response_header(error);
+                AuditEventInput::response_error(request, response_error, upstream)
             }
             ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
                 response_body,
                 status,
-            } => AuditEventInput::response_error(
-                request,
-                "upstream_response_stream_failed",
-                response_body,
-                status,
-                upstream,
-            ),
+            } => {
+                let error =
+                    AuditResponseError::upstream_response_stream_failed(response_body, status);
+                AuditEventInput::response_error(request, error, upstream)
+            }
             ResponseAuditOutcomeKind::UpstreamError { error } => {
                 AuditEventInput::upstream_error(request, error, upstream)
             }

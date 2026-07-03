@@ -72,6 +72,47 @@ pub(crate) enum AuditDenialReason {
     TooManyRequests,
 }
 
+/// Closed response-error audit event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuditResponseError {
+    /// Closed response-error kind.
+    kind: AuditResponseErrorKind,
+}
+
+/// Closed response-error audit event variants.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AuditResponseErrorKind {
+    /// Downstream closed before the response completed.
+    DownstreamClosed {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
+
+    /// Response body exceeded the configured byte limit.
+    ResponseBodyTooLarge {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
+
+    /// Response headers failed before response body bytes were observed.
+    ResponseHeader {
+        /// Header failure class.
+        error: AuditResponseHeaderError,
+    },
+
+    /// Upstream response stream failed after upstream I/O started.
+    UpstreamResponseStreamFailed {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
+}
+
 /// Closed response-header audit error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AuditResponseHeaderError {
@@ -230,12 +271,8 @@ enum AuditOutcomeKind {
 
     /// Response handling failed.
     ResponseError {
-        /// Stable error class.
-        error_class: String,
-        /// Response body summary.
-        response_body: AuditBodySummary,
-        /// Response status returned to the harness.
-        status: StatusCode,
+        /// Response error.
+        error: AuditResponseError,
         /// Upstream target.
         upstream: AuditUpstreamTarget,
     },
@@ -405,10 +442,94 @@ impl AuditDenialReason {
     }
 }
 
+impl AuditResponseError {
+    /// Creates a downstream-closed response error.
+    #[must_use]
+    pub(crate) const fn downstream_closed(
+        response_body: ObservedBodySummary,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::DownstreamClosed {
+                response_body,
+                status,
+            },
+        }
+    }
+
+    /// Consumes the response error into serialized audit parts.
+    #[must_use]
+    const fn into_parts(self) -> (&'static str, AuditBodySummary, StatusCode) {
+        match self.kind {
+            AuditResponseErrorKind::DownstreamClosed {
+                response_body,
+                status,
+            } => ("downstream_closed", response_body.into_summary(), status),
+            AuditResponseErrorKind::ResponseBodyTooLarge {
+                response_body,
+                status,
+            } => (
+                "response_body_too_large",
+                response_body.into_summary(),
+                status,
+            ),
+            AuditResponseErrorKind::ResponseHeader { error } => (
+                error.error_class(),
+                AuditBodySummary::not_observed(),
+                error.status(),
+            ),
+            AuditResponseErrorKind::UpstreamResponseStreamFailed {
+                response_body,
+                status,
+            } => (
+                "upstream_response_stream_failed",
+                response_body.into_summary(),
+                status,
+            ),
+        }
+    }
+
+    /// Creates a response-body-too-large response error.
+    #[must_use]
+    pub(crate) const fn response_body_too_large(
+        response_body: ObservedBodySummary,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::ResponseBodyTooLarge {
+                response_body,
+                status,
+            },
+        }
+    }
+
+    /// Creates a response-header response error.
+    #[must_use]
+    pub(crate) const fn response_header(error: AuditResponseHeaderError) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::ResponseHeader { error },
+        }
+    }
+
+    /// Creates an upstream-response-stream-failed response error.
+    #[must_use]
+    pub(crate) const fn upstream_response_stream_failed(
+        response_body: ObservedBodySummary,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::UpstreamResponseStreamFailed {
+                response_body,
+                status,
+            },
+        }
+    }
+}
+
 impl AuditResponseHeaderError {
     /// Returns the stable audit error class.
     #[must_use]
-    pub(crate) const fn error_class(self) -> &'static str {
+    const fn error_class(self) -> &'static str {
         match self {
             Self::InvalidConnectionHeader => "invalid_response_connection_header",
             Self::TooLarge => "response_headers_too_large",
@@ -479,27 +600,10 @@ impl AuditEventInput {
     #[must_use]
     pub(crate) fn response_error(
         request: ObservedAuditRequestInput,
-        error_class: impl Into<String>,
-        response_body: ObservedBodySummary,
-        status: StatusCode,
+        error: AuditResponseError,
         upstream: AuditUpstreamTarget,
     ) -> Self {
-        let outcome = AuditOutcome::response_error(error_class, response_body, status, upstream);
-        Self {
-            outcome,
-            request: request.into_request(),
-        }
-    }
-
-    /// Creates a response-error audit event input without observed body bytes.
-    #[must_use]
-    pub(crate) fn response_error_without_body(
-        request: ObservedAuditRequestInput,
-        error_class: impl Into<String>,
-        status: StatusCode,
-        upstream: AuditUpstreamTarget,
-    ) -> Self {
-        let outcome = AuditOutcome::response_error_without_body(error_class, status, upstream);
+        let outcome = AuditOutcome::response_error(error, upstream);
         Self {
             outcome,
             request: request.into_request(),
@@ -554,36 +658,9 @@ impl AuditOutcome {
 
     /// Creates a response-error outcome.
     #[must_use]
-    fn response_error(
-        error_class: impl Into<String>,
-        response_body: ObservedBodySummary,
-        status: StatusCode,
-        upstream: AuditUpstreamTarget,
-    ) -> Self {
+    const fn response_error(error: AuditResponseError, upstream: AuditUpstreamTarget) -> Self {
         Self {
-            kind: AuditOutcomeKind::ResponseError {
-                error_class: error_class.into(),
-                response_body: response_body.into_summary(),
-                status,
-                upstream,
-            },
-        }
-    }
-
-    /// Creates a response-error outcome without observed response body bytes.
-    #[must_use]
-    fn response_error_without_body(
-        error_class: impl Into<String>,
-        status: StatusCode,
-        upstream: AuditUpstreamTarget,
-    ) -> Self {
-        Self {
-            kind: AuditOutcomeKind::ResponseError {
-                error_class: error_class.into(),
-                response_body: AuditBodySummary::not_observed(),
-                status,
-                upstream,
-            },
+            kind: AuditOutcomeKind::ResponseError { error, upstream },
         }
     }
 
@@ -756,18 +833,16 @@ impl AuditEvent {
                 Some(reason.status().as_u16()),
                 None,
             ),
-            AuditOutcomeKind::ResponseError {
-                error_class,
-                response_body,
-                status,
-                upstream,
-            } => (
-                AuditDecision::ResponseError,
-                Some(error_class),
-                response_body,
-                Some(status.as_u16()),
-                Some(upstream),
-            ),
+            AuditOutcomeKind::ResponseError { error, upstream } => {
+                let (error_class, response_body, status) = error.into_parts();
+                (
+                    AuditDecision::ResponseError,
+                    Some(error_class.to_owned()),
+                    response_body,
+                    Some(status.as_u16()),
+                    Some(upstream),
+                )
+            }
             AuditOutcomeKind::UpstreamError { error, upstream } => (
                 AuditDecision::UpstreamError,
                 Some(error.error_class().to_owned()),
@@ -1236,8 +1311,8 @@ mod tests {
 mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
-        AuditRequestInput, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
-        ObservedBodySummary, RequestId,
+        AuditRequestInput, AuditResponseError, AuditTarget, AuditUpstreamError,
+        AuditUpstreamTarget, ObservedBodySummary, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1346,7 +1421,6 @@ mod proptests {
             status_code_value in 100_u16..600,
             request_body_bytes in non_empty_body(),
             response_body_bytes in non_empty_body(),
-            error_class in "[a-z_]{1,20}",
             run_token in "[0-9a-f]{1,16}",
             sequence in any::<u64>(),
         ) {
@@ -1386,19 +1460,19 @@ mod proptests {
                         None,
                     )
                 }
-                2 => (
-                    AuditOutcome::response_error(
-                        error_class.clone(),
-                        observed_response_body,
-                        status,
-                        upstream,
-                    ),
-                    "response_error",
-                    Some(error_class.as_str()),
-                    body_value(response_bytes, &response_digest),
-                    status.as_u16(),
-                    Some((upstream_path.as_str(), upstream_query.as_deref())),
-                ),
+                2 => {
+                    let error =
+                        AuditResponseError::downstream_closed(observed_response_body, status);
+                    let (expected_error, _, expected_status) = error.into_parts();
+                    (
+                        AuditOutcome::response_error(error, upstream),
+                        "response_error",
+                        Some(expected_error),
+                        body_value(response_bytes, &response_digest),
+                        expected_status.as_u16(),
+                        Some((upstream_path.as_str(), upstream_query.as_deref())),
+                    )
+                }
                 _ => {
                     let error = upstream_error(upstream_error_kind);
                     (
