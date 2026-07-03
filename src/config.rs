@@ -43,27 +43,27 @@ pub(crate) struct AllowedOperation {
 
 /// Parsed maximum serialized audit event bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AuditEventBytes(NonZeroUsize);
+struct AuditEventBytes(NonZeroUsize);
 
 /// Parsed maximum concurrent gateway requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ConcurrentRequests(NonZeroUsize);
+struct ConcurrentRequests(NonZeroUsize);
 
 /// Parsed maximum incoming request body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RequestBodyBytes(NonZeroUsize);
+struct RequestBodyBytes(NonZeroUsize);
 
 /// Parsed maximum incoming request header bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct RequestHeaderBytes(NonZeroUsize);
+struct RequestHeaderBytes(NonZeroUsize);
 
 /// Parsed maximum upstream response body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResponseBodyBytes(NonZeroU64);
+struct ResponseBodyBytes(NonZeroU64);
 
 /// Parsed maximum upstream response header bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct ResponseHeaderBytes(NonZeroUsize);
+struct ResponseHeaderBytes(NonZeroUsize);
 
 /// A configured allowed path.
 #[derive(Clone, Debug, Eq, PartialEq)]
