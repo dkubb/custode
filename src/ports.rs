@@ -47,7 +47,15 @@ pub(crate) trait AuditSink: fmt::Debug + Send + Sync {
 /// Port that allocates request identities.
 pub(crate) trait RequestIdSource: fmt::Debug + Send + Sync {
     /// Allocates the next request identity.
-    fn next_request_id(&self) -> RequestId;
+    fn next_request_id(&self) -> Result<RequestId, RequestIdError>;
+}
+
+/// Request identity allocation error.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum RequestIdError {
+    /// All non-zero request sequence numbers have already been allocated.
+    #[error("request id sequence exhausted")]
+    SequenceExhausted,
 }
 
 /// Port that sends accepted requests to the configured provider.

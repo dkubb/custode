@@ -2,8 +2,8 @@
 
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp, AuditWriter, RequestId, RunToken};
 use crate::ports::{
-    AuditSink, BoxFuture, Clock, RequestIdSource, UpstreamBodyError, UpstreamClient, UpstreamError,
-    UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
+    AuditSink, BoxFuture, Clock, RequestIdError, RequestIdSource, UpstreamBodyError,
+    UpstreamClient, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -19,8 +19,8 @@ pub(crate) struct SystemClock;
 /// Production monotonic request identity source.
 #[derive(Debug)]
 pub(crate) struct SequentialRequestIds {
-    /// Next request sequence.
-    next: AtomicU64,
+    /// Last allocated request sequence, or zero before the first request.
+    last_allocated: AtomicU64,
     /// Per-process run token embedded in request identities.
     run_token: RunToken,
 }
@@ -82,10 +82,21 @@ impl ReqwestUpstreamClient {
 }
 
 impl RequestIdSource for SequentialRequestIds {
-    fn next_request_id(&self) -> RequestId {
-        let sequence = NonZeroU64::new(self.next.fetch_add(1, Ordering::Relaxed))
-            .expect("request sequence should be non-zero");
-        RequestId::from_parts(&self.run_token, sequence)
+    fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
+        let previous = self
+            .last_allocated
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_current| RequestIdError::SequenceExhausted)?;
+        let sequence = NonZeroU64::new(
+            previous
+                .checked_add(1)
+                .expect("checked transition should allocate a request sequence"),
+        )
+        .expect("allocated request sequence should be non-zero");
+
+        Ok(RequestId::from_parts(&self.run_token, sequence))
     }
 }
 
@@ -94,7 +105,7 @@ impl SequentialRequestIds {
     #[must_use]
     pub(crate) const fn new(run_token: RunToken) -> Self {
         Self {
-            next: AtomicU64::new(1),
+            last_allocated: AtomicU64::new(0),
             run_token,
         }
     }
@@ -191,19 +202,23 @@ fn upstream_error_kind_from_reqwest(error: &impl ReqwestErrorView) -> UpstreamEr
 )]
 mod tests {
     use super::{
-        ReqwestErrorView, ReqwestUpstreamClient, SystemClock, upstream_error_kind_from_reqwest,
+        ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
+        upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
+    use crate::audit::{RequestId, RunToken};
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, RequestTimeout, UpstreamOrigin};
     use crate::headers::forward_request_headers;
     use crate::ports::{
-        Clock as _, UpstreamClient as _, UpstreamDeadline, UpstreamErrorKind, UpstreamRequest,
+        Clock as _, RequestIdError, RequestIdSource as _, UpstreamClient as _, UpstreamDeadline,
+        UpstreamErrorKind, UpstreamRequest,
     };
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::error::Error as _;
-    use core::num::NonZeroUsize;
+    use core::num::{NonZeroU64, NonZeroUsize};
+    use core::sync::atomic::AtomicU64;
     use core::time::Duration;
     use futures_util::StreamExt as _;
     use pretty_assertions::assert_eq;
@@ -327,6 +342,31 @@ mod tests {
 
         humantime::parse_rfc3339(timestamp.as_str())
             .expect("system clock timestamp should parse as RFC 3339");
+    }
+
+    #[test]
+    fn sequential_request_ids_report_exhaustion_without_wrapping() {
+        let run_token = RunToken::for_test("run");
+        let request_ids = SequentialRequestIds {
+            last_allocated: AtomicU64::new(u64::MAX - 1),
+            run_token: run_token.clone(),
+        };
+
+        let final_id = request_ids
+            .next_request_id()
+            .expect("final request id should allocate");
+        let exhausted = request_ids
+            .next_request_id()
+            .expect_err("sequence should be exhausted");
+
+        assert_eq!(
+            final_id,
+            RequestId::from_parts(
+                &run_token,
+                NonZeroU64::new(u64::MAX).expect("max sequence should be non-zero"),
+            ),
+        );
+        assert_eq!(exhausted, RequestIdError::SequenceExhausted);
     }
 
     #[tokio::test]

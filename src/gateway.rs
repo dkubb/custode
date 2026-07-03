@@ -10,7 +10,7 @@ use crate::audit::{
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
-use crate::ports::{AuditSink, Clock, RequestIdSource};
+use crate::ports::{AuditSink, Clock, RequestIdError, RequestIdSource};
 use ::http::{Error as HttpError, Method, StatusCode};
 use std::sync::Arc;
 use thiserror::Error;
@@ -42,6 +42,10 @@ pub(crate) enum GatewayError {
     /// Header filtering failed.
     #[error("{0}")]
     Header(#[from] HeaderError),
+
+    /// Request identity allocation failed.
+    #[error("{0}")]
+    RequestId(#[from] RequestIdError),
 
     /// Gateway response could not be built.
     #[error("failed to build response: {0}")]
@@ -317,9 +321,10 @@ impl Gateway {
     ///
     /// The identity embeds a per-process run token so identities from
     /// different gateway runs appended to the same audit log do not collide.
-    #[must_use]
-    pub(crate) fn next_request_id(&self) -> RequestId {
-        self.request_ids.next_request_id()
+    pub(crate) fn next_request_id(&self) -> Result<RequestId, GatewayError> {
+        self.request_ids
+            .next_request_id()
+            .map_err(GatewayError::from)
     }
 }
 
@@ -436,8 +441,12 @@ mod tests {
         let directory = tempdir().expect("temporary directory should be created");
         let gateway = runtime_gateway(directory.path()).await;
 
-        let first = gateway.next_request_id();
-        let second = gateway.next_request_id();
+        let first = gateway
+            .next_request_id()
+            .expect("first request id should allocate");
+        let second = gateway
+            .next_request_id()
+            .expect("second request id should allocate");
 
         assert_ne!(first, second);
     }

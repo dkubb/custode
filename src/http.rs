@@ -235,7 +235,13 @@ async fn proxy(
     let _permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
-            let request_id = state.gateway.next_request_id();
+            let request_id = match state.gateway.next_request_id() {
+                Ok(request_id) => request_id,
+                Err(error) => {
+                    tracing::error!(%error, "request failed");
+                    return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
+            };
             let method = request.method().clone();
             let target = synthetic_target(request.uri());
             if state
@@ -274,7 +280,7 @@ async fn handle_request(
     client: Arc<dyn UpstreamClient>,
     request: Request<Body>,
 ) -> Result<Response<Body>, GatewayError> {
-    let request_id = gateway.next_request_id();
+    let request_id = gateway.next_request_id()?;
     let (parts, body) = request.into_parts();
     let method = parts.method;
     let uri = parts.uri;
