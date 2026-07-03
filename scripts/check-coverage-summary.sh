@@ -248,16 +248,26 @@ detailed_report_excluding_test_modules() {
     @tsv
   ' "${summary_path}" >"${events_path}"
 
-  awk -F '\t' '
-      FILENAME == ARGV[1] {
-        excluded_from[$1] = $2
+  awk -F '\t' -v exclusions_path="${exclusions_path}" '
+      FILENAME == exclusions_path {
+        span_count[$1] += 1
+        key = $1 SUBSEP span_count[$1]
+        excluded_start[key] = $2
+        excluded_end[key] = $3
         next
       }
       {
         metric = $1
         filename = $2
         line = $3
-        if ((filename in excluded_from) && (line >= excluded_from[filename])) {
+        excluded = 0
+        for (span_index = 1; span_index <= span_count[filename]; span_index += 1) {
+          key = filename SUBSEP span_index
+          if (line >= excluded_start[key] && line <= excluded_end[key]) {
+            excluded = 1
+          }
+        }
+        if (excluded == 1) {
           next
         }
         if (metric == "line") {
@@ -303,13 +313,37 @@ build_exclusion_table() {
       continue
     fi
     line=$(awk '
+      function brace_delta(text, opens, closes) {
+        opens = gsub(/\{/, "{", text)
+        closes = gsub(/\}/, "}", text)
+        return opens - closes
+      }
+      in_module == 1 {
+        depth += brace_delta($0)
+        if (depth <= 0) {
+          printf "%s\t%d\t%d\n", FILENAME, start_line, NR
+          in_module = 0
+        }
+        next
+      }
       /^[[:space:]]*mod[[:space:]]+(tests|proptests)[[:space:]]*\{/ {
-        print NR
-        exit
+        in_module = 1
+        start_line = NR
+        depth = brace_delta($0)
+        if (depth <= 0) {
+          printf "%s\t%d\t%d\n", FILENAME, start_line, NR
+          in_module = 0
+        }
+        next
+      }
+      END {
+        if (in_module == 1) {
+          exit 2
+        }
       }
     ' "${filename}")
     if [[ -n "${line}" ]]; then
-      printf '%s\t%s\n' "${filename}" "${line}"
+      printf '%s\n' "${line}"
     fi
   done <"${filenames_path}"
   rm -f "${filenames_path}"

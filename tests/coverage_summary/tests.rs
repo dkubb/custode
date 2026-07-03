@@ -45,6 +45,32 @@ fn run_coverage_summary(branches: &str, max_missed_branches: u32) -> Output {
         .expect("coverage script should run")
 }
 
+fn run_coverage_summary_for_source(
+    source_text: &str,
+    segments: &str,
+    max_missed_lines: u32,
+) -> Output {
+    let directory = tempdir().expect("temporary directory should be created");
+    let source = directory.path().join("fixture.rs");
+    let summary = directory.path().join("coverage.json");
+    fs::write(&source, source_text).expect("source fixture should be written");
+    let filename = serde_json::to_string(&source.to_string_lossy())
+        .expect("source path should serialize as JSON");
+    let fixture = format!(
+        r#"{{"data":[{{"functions":[],"files":[{{"filename":{filename},"segments":{segments},"branches":[]}}]}}]}}"#
+    );
+    fs::write(&summary, fixture).expect("coverage fixture should be written");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-coverage-summary.sh");
+    Command::new(script)
+        .arg("--exclude-test-mods")
+        .arg("--max-missed-lines")
+        .arg(max_missed_lines.to_string())
+        .arg(summary)
+        .output()
+        .expect("coverage script should run")
+}
+
 fn run_summary_fixture(fixture: &str) -> Output {
     let directory = tempdir().expect("temporary directory should be created");
     let summary = directory.path().join("coverage.json");
@@ -64,6 +90,18 @@ fn assert_branch_failure(output: Output, missed: u32, maximum: u32) {
     assert!(
         stderr.contains(&format!(
             "coverage metric branches has {missed} missed states; max is {maximum}"
+        )),
+        "{stderr}"
+    );
+}
+
+fn assert_line_failure(output: Output, missed: u32, maximum: u32) {
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(1_i32));
+    assert!(
+        stderr.contains(&format!(
+            "coverage metric lines has {missed} missed states; max is {maximum}"
         )),
         "{stderr}"
     );
@@ -112,8 +150,33 @@ fn exclude_test_modules_counts_both_uncovered_branch_arms() {
 }
 
 #[test]
+fn exclude_test_modules_counts_missed_lines_after_test_module() {
+    let output = run_coverage_summary_for_source(
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[[6,1,0,true,false]]",
+        0,
+    );
+
+    assert_line_failure(output, 1, 0);
+}
+
+#[test]
 fn exclude_test_modules_deduplicates_repeated_branch_rows() {
     let output = run_coverage_summary("[[1,0,1,10,0,0],[1,0,1,10,0,0]]", 1);
 
     assert_branch_failure(output, 2, 1);
+}
+
+#[test]
+fn exclude_test_modules_ignores_missed_lines_inside_test_module() {
+    let output = run_coverage_summary_for_source(
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[[4,5,0,true,false]]",
+        0,
+    );
+
+    assert!(
+        output.status.success(),
+        "test module line should be excluded"
+    );
 }
