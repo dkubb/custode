@@ -412,10 +412,11 @@ impl AllowedPath {
 }
 
 impl AuditEventBytes {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
+        Self::parse("CUSTODE_MAX_AUDIT_EVENT_BYTES", value.get())
+            .expect("test audit event byte limit should be valid")
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -430,10 +431,11 @@ impl AuditEventBytes {
 }
 
 impl ConcurrentRequests {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
+        Self::parse("CUSTODE_MAX_CONCURRENT_REQUESTS", value.get())
+            .expect("test concurrent request limit should be valid")
     }
 
     /// Returns the parsed non-zero request limit.
@@ -448,10 +450,11 @@ impl ConcurrentRequests {
 }
 
 impl RequestBodyBytes {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
+        Self::parse("CUSTODE_MAX_REQUEST_BYTES", value.get())
+            .expect("test request body byte limit should be valid")
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -466,10 +469,11 @@ impl RequestBodyBytes {
 }
 
 impl RequestHeaderBytes {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
+        Self::parse("CUSTODE_MAX_REQUEST_HEADER_BYTES", value.get())
+            .expect("test request header byte limit should be valid")
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -484,10 +488,11 @@ impl RequestHeaderBytes {
 }
 
 impl ResponseBodyBytes {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroU64) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroU64) -> Self {
+        Self::parse("CUSTODE_MAX_RESPONSE_BYTES", value.get())
+            .expect("test response body byte limit should be valid")
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -502,10 +507,11 @@ impl ResponseBodyBytes {
 }
 
 impl ResponseHeaderBytes {
-    /// Wraps a test limit that was already proven non-zero.
+    /// Parses a test limit through the production bounds.
     #[cfg(test)]
-    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
-        Self(value)
+    pub(crate) fn for_test(value: NonZeroUsize) -> Self {
+        Self::parse("CUSTODE_MAX_RESPONSE_HEADER_BYTES", value.get())
+            .expect("test response header byte limit should be valid")
     }
 
     /// Returns the parsed non-zero byte limit.
@@ -684,7 +690,7 @@ impl GatewayConfig {
     /// Returns this config with a replacement response body byte limit.
     #[cfg(test)]
     #[must_use]
-    pub(crate) const fn with_max_response_bytes(mut self, max_response_bytes: NonZeroU64) -> Self {
+    pub(crate) fn with_max_response_bytes(mut self, max_response_bytes: NonZeroU64) -> Self {
         self.max_response_bytes = ResponseBodyBytes::for_test(max_response_bytes);
         self
     }
