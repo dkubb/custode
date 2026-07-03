@@ -1,6 +1,9 @@
 //! Axum request and response wiring.
 
-use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds, SystemClock};
+use crate::adapters::{
+    RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
+    UpstreamClientBuildError,
+};
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
 use crate::audit::{
     AuditDenialReason, AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditWriter,
@@ -43,6 +46,10 @@ pub(crate) enum ServeError {
     #[error("{0}")]
     Gateway(#[from] GatewayError),
 
+    /// Production request id source could not be built.
+    #[error("{0}")]
+    RequestIds(#[from] RequestIdSourceBuildError),
+
     /// Gateway server failed.
     #[error("gateway server failed: {0}")]
     Server(io::Error),
@@ -50,6 +57,10 @@ pub(crate) enum ServeError {
     /// Gateway listener could not bind.
     #[error("failed to bind gateway listener: {0}")]
     ServerBind(io::Error),
+
+    /// Production upstream client could not be built.
+    #[error("{0}")]
+    UpstreamClient(#[from] UpstreamClientBuildError),
 }
 
 /// Shared Axum application state.
@@ -63,6 +74,36 @@ struct AppState {
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     /// Gateway state.
     gateway: Gateway,
+}
+
+/// Real production adapters created at startup.
+#[derive(Debug)]
+struct ProductionAdapters {
+    /// Upstream HTTP client.
+    client: ReqwestUpstreamClient,
+    /// Request identity source.
+    request_ids: SequentialRequestIds,
+}
+
+impl ProductionAdapters {
+    /// Builds production adapters from adapter construction results.
+    fn from_results(
+        client: Result<ReqwestUpstreamClient, UpstreamClientBuildError>,
+        request_ids: Result<SequentialRequestIds, RequestIdSourceBuildError>,
+    ) -> Result<Self, ServeError> {
+        Ok(Self {
+            client: client?,
+            request_ids: request_ids?,
+        })
+    }
+
+    /// Builds real production adapters.
+    fn new() -> Result<Self, ServeError> {
+        Self::from_results(
+            ReqwestUpstreamClient::new(),
+            SequentialRequestIds::production(),
+        )
+    }
 }
 
 /// Response audit state carried until the terminal stream decision.
@@ -565,15 +606,21 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
 ///
 /// Returns an error when the gateway cannot bind or serve.
 pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
+    serve_with_adapter_result(config, ProductionAdapters::new()).await
+}
+
+/// Starts the gateway HTTP server with an adapter construction result.
+async fn serve_with_adapter_result(
+    config: GatewayConfig,
+    adapter_result: Result<ProductionAdapters, ServeError>,
+) -> Result<(), ServeError> {
     let bind = config.bind();
     let max_concurrent_requests = config.max_concurrent_requests().get();
-    let client = ReqwestUpstreamClient::new();
-    let gateway = production_gateway(config)
-        .await
-        .map_err(ServeError::Gateway)?;
+    let adapters = adapter_result?;
+    let gateway = production_gateway(config, adapters.request_ids).await?;
     let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
     let state = AppState {
-        client: Arc::new(client),
+        client: Arc::new(adapters.client),
         concurrency: Arc::new(Semaphore::new(max_concurrent_requests)),
         fatal_errors,
         gateway,
@@ -592,14 +639,14 @@ pub(crate) async fn serve(config: GatewayConfig) -> Result<(), ServeError> {
 /// # Errors
 ///
 /// Returns an error when the audit log cannot be opened.
-async fn production_gateway(config: GatewayConfig) -> Result<Gateway, GatewayError> {
-    let audit = AuditWriter::open(&config).await?;
-    Ok(Gateway::from_ports(
-        config,
-        audit,
-        SystemClock,
-        SequentialRequestIds::production(),
-    ))
+async fn production_gateway(
+    config: GatewayConfig,
+    request_ids: SequentialRequestIds,
+) -> Result<Gateway, ServeError> {
+    let audit = AuditWriter::open(&config)
+        .await
+        .map_err(GatewayError::from)?;
+    Ok(Gateway::from_ports(config, audit, SystemClock, request_ids))
 }
 
 /// Runs a server until it stops or a fatal stream task error arrives.
@@ -1230,13 +1277,16 @@ mod tests {
     }
 
     use super::{
-        AppState, ResponseAuditContext, ResponseStreamOutcome, ServeError,
+        AppState, ProductionAdapters, ResponseAuditContext, ResponseStreamOutcome, ServeError,
         audit_response_header_error, audit_upstream_error, denial_reason_from_rejection,
         denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
         proxy, report_fatal_error, response_stream, run_until_server_stops, send_stream_error,
-        serve, synthetic_target,
+        serve, serve_with_adapter_result, synthetic_target,
     };
-    use crate::adapters::{ReqwestUpstreamClient, SequentialRequestIds};
+    use crate::adapters::{
+        RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
+        UpstreamClientBuildError,
+    };
     use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
     use crate::audit::{
         AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError, AuditUpstreamError,
@@ -1272,7 +1322,7 @@ mod tests {
     use futures_util::stream;
     use http_body_util::BodyExt as _;
     use pretty_assertions::assert_eq;
-    use reqwest::Client;
+    use reqwest::{Client, Proxy};
     use serde_json::{Map, Value};
     use std::io;
     use std::path::{Path, PathBuf};
@@ -1487,6 +1537,22 @@ mod tests {
             .expect("request should build")
     }
 
+    /// Builds a deterministic request id source for tests.
+    fn fixed_request_ids() -> SequentialRequestIds {
+        SequentialRequestIds::new(RunToken::for_test("0000000000007e57-000000000000c0de"))
+    }
+
+    /// Builds a request id source construction error for startup tests.
+    fn request_id_source_build_error() -> RequestIdSourceBuildError {
+        RequestIdSourceBuildError::for_test(io::Error::other("entropy failed"))
+    }
+
+    /// Builds an upstream client construction error for startup tests.
+    fn upstream_client_build_error() -> UpstreamClientBuildError {
+        let source = Proxy::all("not a proxy URL").expect_err("invalid proxy URL should fail");
+        UpstreamClientBuildError::for_test(source)
+    }
+
     /// Builds a request body byte limit for tests.
     fn request_body_limit(value: usize) -> RequestBodyBytes {
         RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
@@ -1680,8 +1746,8 @@ mod tests {
         config: GatewayConfig,
         permits: usize,
     ) -> (Router, mpsc::UnboundedReceiver<GatewayError>) {
-        let client = ReqwestUpstreamClient::new();
-        let gateway = production_gateway(config)
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let gateway = production_gateway(config, fixed_request_ids())
             .await
             .expect("gateway should initialize");
         let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
@@ -2894,6 +2960,52 @@ mod tests {
         );
     }
 
+    #[test]
+    fn production_adapters_report_request_id_source_build_errors() {
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+
+        let result =
+            ProductionAdapters::from_results(Ok(client), Err(request_id_source_build_error()));
+
+        assert!(
+            matches!(result, Err(ServeError::RequestIds(_))),
+            "request id source build failures should fail startup"
+        );
+    }
+
+    #[test]
+    fn production_adapters_report_upstream_client_build_errors() {
+        let result = ProductionAdapters::from_results(
+            Err(upstream_client_build_error()),
+            Ok(fixed_request_ids()),
+        );
+
+        assert!(
+            matches!(result, Err(ServeError::UpstreamClient(_))),
+            "upstream client build failures should fail startup"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_reports_adapter_construction_errors() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let config = GatewayConfig::for_runtime_test(
+            directory.path().join("audit.ndjson"),
+            "https://api.openai.com",
+        );
+
+        let result = serve_with_adapter_result(
+            config,
+            Err(ServeError::RequestIds(request_id_source_build_error())),
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(ServeError::RequestIds(_))),
+            "adapter construction failures should stop serving before binding"
+        );
+    }
+
     #[tokio::test]
     async fn serve_fails_when_the_bind_address_is_taken() {
         let directory = tempdir().expect("temporary directory should be created");
@@ -3520,7 +3632,7 @@ mod tests {
             NonZeroUsize::new(1).expect("limit should be non-zero"),
         );
         let target = allowed_target(&config, "/v1/models");
-        let gateway = production_gateway(config)
+        let gateway = production_gateway(config, fixed_request_ids())
             .await
             .expect("gateway should initialize");
         let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))

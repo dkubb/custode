@@ -13,7 +13,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
 use reqwest::redirect::Policy;
 use std::fs::File;
-use std::io::Read as _;
+use std::io::{self, Read as _};
+use std::path::Path;
 use thiserror::Error;
 
 /// Production audit timestamp source.
@@ -42,6 +43,30 @@ pub(crate) struct ReqwestUpstreamClient {
 pub(crate) struct UpstreamClientBuildError {
     /// Reqwest build source.
     source: reqwest::Error,
+}
+
+impl UpstreamClientBuildError {
+    /// Creates a build error for tests.
+    #[cfg(test)]
+    pub(crate) const fn for_test(source: reqwest::Error) -> Self {
+        Self { source }
+    }
+}
+
+/// Error building the production request id source.
+#[derive(Debug, Error)]
+#[error("failed to read request id run-token entropy: {source}")]
+pub(crate) struct RequestIdSourceBuildError {
+    /// Entropy read source.
+    source: io::Error,
+}
+
+impl RequestIdSourceBuildError {
+    /// Creates a build error for tests.
+    #[cfg(test)]
+    pub(crate) const fn for_test(source: io::Error) -> Self {
+        Self { source }
+    }
 }
 
 /// Minimal view of reqwest error classification.
@@ -78,13 +103,12 @@ impl ReqwestUpstreamClient {
     }
 
     /// Builds a reqwest-backed upstream client.
-    #[must_use]
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new() -> Result<Self, UpstreamClientBuildError> {
         let result = reqwest::Client::builder()
             .no_proxy()
             .redirect(Policy::none())
             .build();
-        Self::from_build_result(result).expect("no-proxy rustls reqwest client should build")
+        Self::from_build_result(result)
     }
 }
 
@@ -108,6 +132,14 @@ impl RequestIdSource for SequentialRequestIds {
 }
 
 impl SequentialRequestIds {
+    /// Creates a sequence source from an entropy read result.
+    fn from_entropy_result(
+        result: io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]>,
+    ) -> Result<Self, RequestIdSourceBuildError> {
+        let entropy = result.map_err(request_id_source_build_error)?;
+        Ok(Self::new(run_token_from_entropy(entropy)))
+    }
+
     /// Creates a sequence source that starts at request 1 with a run token.
     #[must_use]
     pub(crate) const fn new(run_token: RunToken) -> Self {
@@ -118,13 +150,8 @@ impl SequentialRequestIds {
     }
 
     /// Creates a production request identity source.
-    #[must_use]
-    pub(crate) fn production() -> Self {
-        let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
-        File::open("/dev/urandom")
-            .and_then(|mut random| random.read_exact(&mut entropy))
-            .expect("/dev/urandom should produce a run token");
-        Self::new(run_token_from_entropy(entropy))
+    pub(crate) fn production() -> Result<Self, RequestIdSourceBuildError> {
+        Self::from_entropy_result(read_run_token_entropy())
     }
 }
 
@@ -175,6 +202,23 @@ impl ReqwestErrorView for reqwest::Error {
 /// Builds a run token from 128 bits of entropy.
 const fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunToken {
     RunToken::from_entropy(entropy)
+}
+
+/// Reads run-token entropy from the operating system.
+fn read_run_token_entropy() -> io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]> {
+    read_run_token_entropy_from(Path::new("/dev/urandom"))
+}
+
+/// Reads run-token entropy from a path.
+fn read_run_token_entropy_from(path: &Path) -> io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]> {
+    let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
+    File::open(path).and_then(|mut random| random.read_exact(&mut entropy))?;
+    Ok(entropy)
+}
+
+/// Creates a request id source build error from an entropy read error.
+const fn request_id_source_build_error(source: io::Error) -> RequestIdSourceBuildError {
+    RequestIdSourceBuildError { source }
 }
 
 /// Creates an upstream body error from reqwest.
@@ -250,8 +294,9 @@ mod tests {
     }
 
     use super::{
-        ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
-        run_token_from_entropy, upstream_error_kind_from_reqwest,
+        RUN_TOKEN_RANDOM_BYTES, ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds,
+        SystemClock, read_run_token_entropy_from, run_token_from_entropy,
+        upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
@@ -272,6 +317,8 @@ mod tests {
     use core::time::Duration;
     use futures_util::StreamExt as _;
     use pretty_assertions::assert_eq;
+    use std::io::Error;
+    use std::path::Path;
     use std::path::PathBuf;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -350,6 +397,48 @@ mod tests {
             error.source().is_some(),
             "display error should expose the reqwest source"
         );
+    }
+
+    #[test]
+    fn request_id_source_build_error_display_includes_context() {
+        let error = SequentialRequestIds::from_entropy_result(Err(Error::other("boom")))
+            .expect_err("entropy read failures should be mapped");
+
+        assert_eq!(
+            error.to_string(),
+            "failed to read request id run-token entropy: boom"
+        );
+        assert!(
+            error.source().is_some(),
+            "display error should expose the I/O source"
+        );
+    }
+
+    #[test]
+    fn request_id_source_accepts_entropy_result() {
+        let entropy = [0x42; RUN_TOKEN_RANDOM_BYTES];
+        let request_ids = SequentialRequestIds::from_entropy_result(Ok(entropy))
+            .expect("entropy should build request ids");
+
+        let id = request_ids
+            .next_request_id()
+            .expect("request id should allocate");
+
+        assert_eq!(
+            id,
+            RequestId::from_parts(
+                &run_token_from_entropy(entropy),
+                NonZeroU64::new(1).expect("literal should be non-zero"),
+            ),
+        );
+    }
+
+    #[test]
+    fn run_token_entropy_reader_reports_short_reads() {
+        let error = read_run_token_entropy_from(Path::new("/dev/null"))
+            .expect_err("empty device should not produce enough entropy");
+
+        assert_eq!(error.to_string(), "failed to fill whole buffer");
     }
 
     #[test]
@@ -452,7 +541,7 @@ mod tests {
     #[tokio::test]
     async fn reqwest_upstream_client_classifies_connect_failures() {
         let origin = released_origin().await;
-        let client = ReqwestUpstreamClient::new();
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
         let request = empty_upstream_request(
             &origin,
             RequestTimeout::from_duration(Duration::from_secs(1)),
@@ -485,7 +574,7 @@ mod tests {
                 .await
                 .expect("garbage upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new();
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_secs(1)),
@@ -515,7 +604,7 @@ mod tests {
                 .expect("silent upstream should accept");
             sleep(Duration::from_secs(10)).await;
         }));
-        let client = ReqwestUpstreamClient::new();
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_millis(50)),
@@ -548,7 +637,7 @@ mod tests {
                 .await
                 .expect("chunked upstream should write");
         }));
-        let client = ReqwestUpstreamClient::new();
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
         let request = empty_upstream_request(
             &format!("http://{address}"),
             RequestTimeout::from_duration(Duration::from_secs(1)),

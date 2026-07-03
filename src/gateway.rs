@@ -372,7 +372,7 @@ mod tests {
             config,
             audit,
             SystemClock,
-            SequentialRequestIds::production(),
+            SequentialRequestIds::production().expect("request id source should initialize"),
         ))
     }
 
