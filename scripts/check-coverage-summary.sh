@@ -119,25 +119,34 @@ summary_report() {
         error("coverage summary missing numeric field: " + $metric + "." + $field)
       end;
 
+    def require_pair($metric):
+      (require_number($metric; "count")) as $count |
+      (require_number($metric; "covered")) as $covered |
+      if $covered <= $count then
+        [$count, $covered]
+      else
+        error("coverage summary has impossible covered count: " + $metric + ".covered > " + $metric + ".count")
+      end;
+
     [
       [
         "regions",
-        (require_number("regions"; "count") - require_number("regions"; "covered")),
+        (require_pair("regions") | .[0] - .[1]),
         $max_regions
       ],
       [
         "functions",
-        (require_number("functions"; "count") - require_number("functions"; "covered")),
+        (require_pair("functions") | .[0] - .[1]),
         $max_functions
       ],
       [
         "lines",
-        (require_number("lines"; "count") - require_number("lines"; "covered")),
+        (require_pair("lines") | .[0] - .[1]),
         $max_lines
       ],
       [
         "branches",
-        (require_number("branches"; "count") - require_number("branches"; "covered")),
+        (require_pair("branches") | .[0] - .[1]),
         $max_branches
       ]
     ] |

@@ -82,6 +82,22 @@ fn summary_requires_numeric_totals() {
 }
 
 #[test]
+fn summary_rejects_covered_totals_above_counts() {
+    let output = run_summary_fixture(
+        r#"{"data":[{"totals":{"regions":{"count":0,"covered":1},"functions":{"count":0,"covered":0},"lines":{"count":0,"covered":0},"branches":{"count":0,"covered":0}}}]}"#,
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_ne!(output.status.code(), Some(0_i32));
+    assert!(
+        stderr.contains(
+            "coverage summary has impossible covered count: regions.covered > regions.count"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn exclude_test_modules_counts_each_uncovered_branch_arm() {
     let output = run_coverage_summary("[[1,0,1,10,1,0]]", 0);
 
