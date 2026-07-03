@@ -3,6 +3,7 @@
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::GatewayConfig;
+use ::http::StatusCode;
 use core::num::NonZeroU64;
 use serde::Serialize;
 use std::io;
@@ -153,7 +154,7 @@ enum AuditOutcomeKind {
         /// Response body summary.
         response_body: ObservedBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
         /// Upstream target.
         upstream: AuditUpstreamTarget,
     },
@@ -173,7 +174,7 @@ enum AuditOutcomeKind {
         /// Response body summary.
         response_body: AuditBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
         /// Upstream target.
         upstream: AuditUpstreamTarget,
     },
@@ -183,7 +184,7 @@ enum AuditOutcomeKind {
         /// Stable error class.
         error_class: String,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
         /// Upstream target.
         upstream: AuditUpstreamTarget,
     },
@@ -312,7 +313,7 @@ impl AuditEventInput {
     pub(crate) fn allowed(
         request: ObservedAuditRequestInput,
         response_body: ObservedBodySummary,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         let outcome = AuditOutcome::allowed(response_body, status, upstream);
@@ -346,7 +347,7 @@ impl AuditEventInput {
         request: ObservedAuditRequestInput,
         error_class: impl Into<String>,
         response_body: ObservedBodySummary,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         let outcome = AuditOutcome::response_error(error_class, response_body, status, upstream);
@@ -361,7 +362,7 @@ impl AuditEventInput {
     pub(crate) fn response_error_without_body(
         request: ObservedAuditRequestInput,
         error_class: impl Into<String>,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         let outcome = AuditOutcome::response_error_without_body(error_class, status, upstream);
@@ -376,7 +377,7 @@ impl AuditEventInput {
     pub(crate) fn upstream_error(
         request: ObservedAuditRequestInput,
         error_class: impl Into<String>,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         let outcome = AuditOutcome::upstream_error(error_class, status, upstream);
@@ -392,7 +393,7 @@ impl AuditOutcome {
     #[must_use]
     const fn allowed(
         response_body: ObservedBodySummary,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         Self {
@@ -426,7 +427,7 @@ impl AuditOutcome {
     fn response_error(
         error_class: impl Into<String>,
         response_body: ObservedBodySummary,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         Self {
@@ -443,7 +444,7 @@ impl AuditOutcome {
     #[must_use]
     fn response_error_without_body(
         error_class: impl Into<String>,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         Self {
@@ -460,7 +461,7 @@ impl AuditOutcome {
     #[must_use]
     fn upstream_error(
         error_class: impl Into<String>,
-        status: u16,
+        status: StatusCode,
         upstream: AuditUpstreamTarget,
     ) -> Self {
         Self {
@@ -623,7 +624,7 @@ impl AuditEvent {
                 AuditDecision::Allowed,
                 None,
                 response_body.into_summary(),
-                Some(status),
+                Some(status.as_u16()),
                 Some(upstream),
             ),
             AuditOutcomeKind::Denied {
@@ -645,7 +646,7 @@ impl AuditEvent {
                 AuditDecision::ResponseError,
                 Some(error_class),
                 response_body,
-                Some(status),
+                Some(status.as_u16()),
                 Some(upstream),
             ),
             AuditOutcomeKind::UpstreamError {
@@ -656,7 +657,7 @@ impl AuditEvent {
                 AuditDecision::UpstreamError,
                 Some(error_class),
                 AuditBodySummary::not_observed(),
-                Some(status),
+                Some(status.as_u16()),
                 Some(upstream),
             ),
         };
@@ -1127,6 +1128,7 @@ mod proptests {
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
+    use ::http::StatusCode;
     use core::num::NonZeroU64;
     use core::time::Duration;
     use proptest::prelude::*;
@@ -1185,6 +1187,11 @@ mod proptests {
         ]
     }
 
+    /// Returns a valid HTTP status code from a generated code.
+    fn status_code(code: u16) -> StatusCode {
+        StatusCode::from_u16(code).expect("generated status code should be valid")
+    }
+
     proptest! {
         #[test]
         fn event_serialization_preserves_variant_semantics(
@@ -1194,7 +1201,7 @@ mod proptests {
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
             upstream_path in "/[A-Za-z0-9/_-]{0,20}",
             upstream_query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
-            status in any::<u16>(),
+            status in 100_u16..600,
             request_body_bytes in non_empty_body(),
             response_body_bytes in non_empty_body(),
             error_class in "[a-z_]{1,20}",
@@ -1211,7 +1218,7 @@ mod proptests {
                 AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
             let (outcome, decision, expected_error, expected_response_body, expected_upstream) = match outcome_kind {
                 0 => (
-                    AuditOutcome::allowed(observed_response_body, status, upstream),
+                    AuditOutcome::allowed(observed_response_body, status_code(status), upstream),
                     "allowed",
                     None,
                     body_value(response_bytes, &response_digest),
@@ -1228,7 +1235,7 @@ mod proptests {
                     AuditOutcome::response_error(
                         error_class.clone(),
                         observed_response_body,
-                        status,
+                        status_code(status),
                         upstream,
                     ),
                     "response_error",
@@ -1237,7 +1244,7 @@ mod proptests {
                     Some((upstream_path.as_str(), upstream_query.as_deref())),
                 ),
                 _ => (
-                    AuditOutcome::upstream_error(error_class.clone(), status, upstream),
+                    AuditOutcome::upstream_error(error_class.clone(), status_code(status), upstream),
                     "upstream_error",
                     Some(error_class.as_str()),
                     not_observed_body_value(),

@@ -9,7 +9,7 @@ use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdSource};
-use ::http::{Error as HttpError, Method};
+use ::http::{Error as HttpError, Method, StatusCode};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -76,7 +76,7 @@ enum ResponseAuditOutcomeKind {
         /// Response body summary.
         response_body: ObservedBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 
     /// Downstream closed before the response completed.
@@ -84,7 +84,7 @@ enum ResponseAuditOutcomeKind {
         /// Response body summary.
         response_body: ObservedBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 
     /// Response body exceeded the configured limit.
@@ -92,7 +92,7 @@ enum ResponseAuditOutcomeKind {
         /// Response body summary.
         response_body: ObservedBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 
     /// Response headers failed before response body bytes were observed.
@@ -100,7 +100,7 @@ enum ResponseAuditOutcomeKind {
         /// Stable error class.
         error_class: &'static str,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 
     /// Upstream request failed before a response completed.
@@ -108,7 +108,7 @@ enum ResponseAuditOutcomeKind {
         /// Stable error class.
         error_class: &'static str,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 
     /// Upstream response stream failed after upstream I/O started.
@@ -116,14 +116,14 @@ enum ResponseAuditOutcomeKind {
         /// Response body summary.
         response_body: ObservedBodySummary,
         /// Response status returned to the harness.
-        status: u16,
+        status: StatusCode,
     },
 }
 
 impl ResponseAuditOutcome {
     /// Creates an allowed response outcome.
     #[must_use]
-    pub(crate) fn allowed(response_account: ResponseAccount, status: u16) -> Self {
+    pub(crate) fn allowed(response_account: ResponseAccount, status: StatusCode) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::Allowed {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -134,7 +134,7 @@ impl ResponseAuditOutcome {
 
     /// Creates a downstream-closed response outcome.
     #[must_use]
-    pub(crate) fn downstream_closed(response_account: ResponseAccount, status: u16) -> Self {
+    pub(crate) fn downstream_closed(response_account: ResponseAccount, status: StatusCode) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::DownstreamClosed {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -151,7 +151,10 @@ impl ResponseAuditOutcome {
 
     /// Creates a response-body-too-large outcome.
     #[must_use]
-    pub(crate) fn response_body_too_large(response_account: ResponseAccount, status: u16) -> Self {
+    pub(crate) fn response_body_too_large(
+        response_account: ResponseAccount,
+        status: StatusCode,
+    ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseBodyTooLarge {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -162,7 +165,10 @@ impl ResponseAuditOutcome {
 
     /// Creates a response-header-error outcome.
     #[must_use]
-    pub(crate) const fn response_header_error(error_class: &'static str, status: u16) -> Self {
+    pub(crate) const fn response_header_error(
+        error_class: &'static str,
+        status: StatusCode,
+    ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseHeaderError {
                 error_class,
@@ -173,7 +179,7 @@ impl ResponseAuditOutcome {
 
     /// Creates an upstream-error outcome.
     #[must_use]
-    pub(crate) const fn upstream_error(error_class: &'static str, status: u16) -> Self {
+    pub(crate) const fn upstream_error(error_class: &'static str, status: StatusCode) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::UpstreamError {
                 error_class,
@@ -186,7 +192,7 @@ impl ResponseAuditOutcome {
     #[must_use]
     pub(crate) fn upstream_response_stream_failed(
         response_account: ResponseAccount,
-        status: u16,
+        status: StatusCode,
     ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
@@ -340,7 +346,7 @@ mod tests {
     use crate::audit::{AuditError, AuditTarget, AuditWriter, RequestId};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::GatewayConfig;
-    use ::http::Method;
+    use ::http::{Method, StatusCode};
     use axum::body::Body;
     use core::num::NonZeroUsize;
     use pretty_assertions::{assert_eq, assert_ne};
@@ -516,7 +522,7 @@ mod tests {
         let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
         let input = ResponseAuditInput {
             method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(response_account, 200),
+            outcome: ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
             request_id: RequestId::from_parts("run", 1),
             target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
@@ -544,7 +550,7 @@ mod tests {
             .expect("response chunk should be accounted");
         let input = ResponseAuditInput {
             method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(response_account, 200),
+            outcome: ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
             request_id: RequestId::from_parts("run", 1),
             target: AcceptedTarget::new("/v1/models", Some("limit=1"))

@@ -82,7 +82,7 @@ struct ResponseAuditContext {
     /// Accounted response body.
     response_account: ResponseAccount,
     /// Upstream response status.
-    status: u16,
+    status: StatusCode,
     /// Accepted target.
     target: AcceptedTarget,
 }
@@ -366,10 +366,7 @@ async fn forward_request(
             let status = upstream_error_status(&error);
             let input = ResponseAuditInput {
                 method: method.to_string(),
-                outcome: ResponseAuditOutcome::upstream_error(
-                    upstream_error_class(&error),
-                    status.as_u16(),
-                ),
+                outcome: ResponseAuditOutcome::upstream_error(upstream_error_class(&error), status),
                 request_body,
                 request_id,
                 target: accepted_target,
@@ -389,7 +386,7 @@ async fn forward_request(
                 method: method.to_string(),
                 outcome: ResponseAuditOutcome::response_header_error(
                     response_header_error_class(error),
-                    StatusCode::BAD_GATEWAY.as_u16(),
+                    StatusCode::BAD_GATEWAY,
                 ),
                 request_body,
                 request_id,
@@ -407,7 +404,7 @@ async fn forward_request(
         request_body,
         request_id,
         response_account,
-        status: status.as_u16(),
+        status,
         target: accepted_target,
     };
     let stream = response_stream(context, upstream_response);
@@ -2535,7 +2532,7 @@ mod tests {
             request_body,
             request_id: RequestId::from_parts("test", 1),
             response_account,
-            status: 200,
+            status: StatusCode::OK,
             target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
         };
         let upstream_body = stream::unfold(0_u8, |step| async move {
@@ -2630,7 +2627,7 @@ mod tests {
             request_body,
             request_id: RequestId::from_parts("test", 1),
             response_account,
-            status: 200,
+            status: StatusCode::OK,
             target: AcceptedTarget::new("/v1/models", None).expect("target should parse"),
         };
 
