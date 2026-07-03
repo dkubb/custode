@@ -1,25 +1,27 @@
 set shell := ["bash", "--noprofile", "--norc", "-o", "errexit", "-o", "errtrace", "-o", "nounset", "-o", "pipefail", "-c"]
 
+cargo := "scripts/pinned-cargo.sh"
+
 default:
     just --list
 
 fmt:
-    cargo fmt-all
+    {{cargo}} fmt-all
 
 fmt-check:
-    cargo fmt-check-all
+    {{cargo}} fmt-check-all
 
 lint:
-    cargo clippy-all
+    {{cargo}} clippy-all
 
 test:
-    cargo test-workspace
+    {{cargo}} test-workspace
 
 docs:
     mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
 
 deny:
-    cargo deny-check
+    {{cargo}} deny-check
 
 shell-check:
     shfmt -d -i 2 -ci scripts/*.sh
@@ -36,14 +38,14 @@ docker-test:
 
 coverage:
     mkdir -p target/coverage
-    cargo coverage
+    {{cargo}} coverage
     scripts/check-coverage-summary.sh target/coverage/unit.json
 
 coverage-proptests:
     mkdir -p target/coverage
     PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
         PROPTEST_RNG_SEED=00000000000000000000000000000014 \
-        cargo coverage-proptests
+        {{cargo}} coverage-proptests
     scripts/check-coverage-summary.sh \
         --exclude-test-mods \
         --max-missed-regions 602 \
@@ -53,7 +55,7 @@ coverage-proptests:
         target/coverage/proptests.json
 
 mutants:
-    cargo mutants-all
+    {{cargo}} mutants-all
 
 check: fmt-check lint shell-check test dockerfile-check
 
