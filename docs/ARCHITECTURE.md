@@ -307,6 +307,8 @@ The gateway MUST reject:
   `https://api.openai.com/v1/responses` and authority-form request lines
   like `evil.example:443`;
 - paths that do not start with `/`;
+- paths longer than 4,096 bytes;
+- queries longer than 8,192 bytes;
 - paths containing invalid percent-encoding;
 - paths containing percent-encoded path separators;
 - paths containing literal or percent-encoded `.` or `..` segments, so the
@@ -355,6 +357,8 @@ Configuration parsing is fail-closed:
   host, and optional port, MUST NOT include path, query, fragment, or
   userinfo credentials, and MUST NOT use a wildcard host.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at least one operation.
+- `CUSTODE_ALLOWED_OPERATIONS` MUST contain at most 256 operations, and each
+  operation string MUST be at most 4,160 bytes.
 - Each operation MUST have the form `METHOD:exact:/path` or
   `METHOD:prefix:/path`.
 - Every configured path or prefix MUST begin with `/`.
@@ -364,7 +368,9 @@ Configuration parsing is fail-closed:
   the implementation maxima: audit event bytes 1,048,576; concurrent requests
   Tokio `Semaphore::MAX_PERMITS`; request bytes 1,073,741,824; request header
   name/value bytes 1,048,576; response bytes 1,073,741,824; response header
-  name/value bytes 1,048,576; request timeout 3,600 seconds.
+  name/value bytes 1,048,576; incoming path bytes 4,096; incoming query bytes
+  8,192; allowed operation bytes 4,160; allowed operations 256; request
+  timeout 3,600 seconds.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.
@@ -377,9 +383,9 @@ For each request, the gateway performs these steps in order:
    identity. A refused request is audited as a `denied` decision with error
    class `too_many_requests` and answered with HTTP 429.
 1. Allocate a request identity.
-1. Parse and validate the method and origin-form target, rejecting
-   percent-encoded path separators and literal or percent-encoded dot
-   segments.
+1. Parse and validate the method and origin-form target, rejecting overlong
+   path or query components, percent-encoded path separators, and literal or
+   percent-encoded dot segments.
 1. Check the method-path operation allowlist.
 1. Copy end-to-end headers, excluding hop-by-hop headers, the `Host` header,
    and HTTP proxy credential headers such as `Proxy-Authorization`.
@@ -721,8 +727,9 @@ module and cover the parsers, constructors, and serializers with paired
 accept-every-valid and reject-every-invalid grammars: allowed operation
 parsing, upstream origin parsing, segment-bounded prefix matching, upstream
 URL joining, accepted-target validation (dot segments, percent encoding,
-encoded separators, origin form), header filtering (hop-by-hop stripping,
-byte limits, connection tokens), upstream request construction from allowed
+encoded separators, byte limits, origin form), header filtering
+(hop-by-hop stripping, byte limits, connection tokens), upstream request
+construction from allowed
 targets (`UpstreamRequest::from_target`), audit event serialization option
 semantics, request identity formatting, and timestamp round-tripping.
 Generated gateway scenario property tests live inside `http`'s inline

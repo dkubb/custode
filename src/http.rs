@@ -644,6 +644,8 @@ const fn denial_reason_from_rejection(reason: RejectionReason) -> AuditDenialRea
         RejectionReason::MethodDenied => AuditDenialReason::MethodDenied,
         RejectionReason::NonOriginForm => AuditDenialReason::NonOriginForm,
         RejectionReason::PathDenied => AuditDenialReason::PathDenied,
+        RejectionReason::PathTooLong => AuditDenialReason::PathTooLong,
+        RejectionReason::QueryTooLong => AuditDenialReason::QueryTooLong,
     }
 }
 
@@ -1203,6 +1205,7 @@ mod tests {
         ScenarioBounds, ScenarioDownstream, ScenarioRequest, ScenarioUpstream,
         ScriptedUpstreamClient,
     };
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
     use axum::http::{HeaderMap, Request, StatusCode};
@@ -2127,6 +2130,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_denies_paths_over_the_supported_maximum() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+
+        let response = router
+            .oneshot(build_request(Method::GET, &path))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "path_too_long");
+        assert_eq!(event["path"], path);
+    }
+
+    #[tokio::test]
+    async fn proxy_denies_queries_over_the_supported_maximum() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+        let query = "a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+        let target = format!("/v1/models?{query}");
+
+        let response = router
+            .oneshot(build_request(Method::GET, &target))
+            .await
+            .expect("proxy should respond");
+
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+        let events = audit_events(&audit_log).await;
+        let event = events.first().expect("denial should be audited");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "query_too_long");
+        assert_eq!(event["path"], "/v1/models");
+        assert_eq!(event["query"], query);
+    }
+
+    #[tokio::test]
     async fn proxy_denies_operations_outside_the_allowlist() {
         let directory = tempdir().expect("temporary directory should be created");
         let (config, audit_log) = runtime_config(directory.path(), "https://api.openai.com");
@@ -2789,6 +2834,11 @@ mod tests {
                 AuditDenialReason::NonOriginForm,
             ),
             (RejectionReason::PathDenied, AuditDenialReason::PathDenied),
+            (RejectionReason::PathTooLong, AuditDenialReason::PathTooLong),
+            (
+                RejectionReason::QueryTooLong,
+                AuditDenialReason::QueryTooLong,
+            ),
         ];
 
         for (rejection, denial) in cases {

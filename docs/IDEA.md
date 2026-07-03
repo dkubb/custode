@@ -367,6 +367,9 @@ hide which harness command is being run.
 
 The gateway MUST bound:
 
+- allowed operation count and operation text bytes;
+- incoming path bytes;
+- incoming query bytes;
 - request header bytes;
 - request body bytes;
 - response header bytes;

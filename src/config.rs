@@ -1,6 +1,6 @@
 //! Gateway configuration parsing.
 
-use crate::target::{OriginFormPath, OriginFormQuery};
+use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
 use ::http::Method;
 use clap::Args;
 use core::net::SocketAddr;
@@ -13,6 +13,10 @@ use url::Url;
 
 /// Maximum serialized audit event bytes.
 const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
+/// Maximum configured allowed operation bytes.
+const MAX_ALLOWED_OPERATION_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES + 64;
+/// Maximum configured allowed operations.
+const MAX_ALLOWED_OPERATIONS: usize = 256;
 /// Maximum concurrent gateway requests accepted by Tokio's semaphore.
 const MAX_CONCURRENT_REQUESTS: usize = Semaphore::MAX_PERMITS;
 /// Maximum incoming request body bytes.
@@ -57,6 +61,15 @@ enum AllowedPathKind {
 /// Configuration parsing error.
 #[derive(Debug, Error)]
 pub(crate) enum ConfigError {
+    /// Operation text exceeded the supported byte limit.
+    #[error("allowed operation must be at most {max} bytes, got {value}")]
+    AllowedOperationTooLong {
+        /// Maximum accepted bytes.
+        max: u128,
+        /// Supplied bytes.
+        value: u128,
+    },
+
     /// A numeric bound was above the supported maximum.
     #[error("{name} must be at most {max}, got {value}")]
     BoundTooLarge {
@@ -111,6 +124,15 @@ pub(crate) enum ConfigError {
         raw: String,
         /// URL parser source error.
         source: url::ParseError,
+    },
+
+    /// Too many operations were configured.
+    #[error("at most {max} allowed operations are supported, got {value}")]
+    TooManyAllowedOperations {
+        /// Maximum accepted operation count.
+        max: u128,
+        /// Supplied operation count.
+        value: u128,
     },
 
     /// Upstream origin used an unsupported scheme.
@@ -267,6 +289,13 @@ impl AllowedOperation {
     ///
     /// Returns an error when the method, match kind, or path is invalid.
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
+        if raw.len() > MAX_ALLOWED_OPERATION_BYTES {
+            return Err(ConfigError::AllowedOperationTooLong {
+                max: usize_to_u128(MAX_ALLOWED_OPERATION_BYTES),
+                value: usize_to_u128(raw.len()),
+            });
+        }
+
         let mut parts = raw.splitn(3, ':');
         let method_text = parts.next().unwrap_or_default();
         let kind = parts.next().unwrap_or_default();
@@ -646,6 +675,12 @@ fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperat
     if operations.iter().all(String::is_empty) {
         return Err(ConfigError::EmptyOperations);
     }
+    if operations.len() > MAX_ALLOWED_OPERATIONS {
+        return Err(ConfigError::TooManyAllowedOperations {
+            max: usize_to_u128(MAX_ALLOWED_OPERATIONS),
+            value: usize_to_u128(operations.len()),
+        });
+    }
 
     operations
         .into_iter()
@@ -668,12 +703,13 @@ fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
 )]
 mod tests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_AUDIT_EVENT_BYTES,
-        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
-        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
-        UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
+        MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
+        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
+        MAX_RESPONSE_HEADER_BYTES, ServeArgs, UpstreamOrigin, non_zero_usize,
+        parse_allowed_operations, usize_to_u128,
     };
-    use crate::target::{OriginFormPath, OriginFormQuery};
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
@@ -728,6 +764,47 @@ mod tests {
                 "path {path:?} should fail closed",
             );
         }
+    }
+
+    #[test]
+    fn allowed_path_rejects_paths_over_the_supported_maximum() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+
+        assert!(matches!(
+            AllowedPath::exact(&path),
+            Err(ConfigError::InvalidAllowedPath { .. }),
+        ));
+    }
+
+    #[test]
+    fn operation_accepts_text_at_the_supported_maximum() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES - 1));
+        let method_len = MAX_ALLOWED_OPERATION_BYTES
+            .checked_sub(":exact:".len())
+            .and_then(|budget| budget.checked_sub(path.len()))
+            .expect("operation limit should include the fixed prefix");
+        let method = "A".repeat(method_len);
+        let raw = format!("{method}:exact:{path}");
+
+        let operation = AllowedOperation::parse(&raw).expect("maximum operation should parse");
+        let parsed_method =
+            http::Method::from_bytes(method.as_bytes()).expect("test method should parse");
+        let parsed_path = origin_form_path(&path);
+
+        assert_eq!(raw.len(), MAX_ALLOWED_OPERATION_BYTES);
+        assert!(operation.matches(&parsed_method, &parsed_path));
+    }
+
+    #[test]
+    fn operation_rejects_text_over_the_supported_maximum() {
+        let raw = format!("GET:exact:/{}", "a".repeat(MAX_ALLOWED_OPERATION_BYTES));
+
+        assert!(matches!(
+            AllowedOperation::parse(&raw),
+            Err(ConfigError::AllowedOperationTooLong { max, value })
+                if max == usize_to_u128(MAX_ALLOWED_OPERATION_BYTES)
+                    && value == usize_to_u128(raw.len()),
+        ));
     }
 
     #[test]
@@ -823,6 +900,48 @@ mod tests {
         assert!(matches!(
             parse_allowed_operations(operations),
             Err(ConfigError::InvalidAllowedOperation { .. }),
+        ));
+    }
+
+    #[test]
+    fn operation_sets_accept_the_maximum_supported_count() {
+        let operations = vec!["GET:exact:/v1/models".to_owned(); MAX_ALLOWED_OPERATIONS];
+
+        let parsed =
+            parse_allowed_operations(operations).expect("maximum operation count should parse");
+
+        assert_eq!(parsed.len(), MAX_ALLOWED_OPERATIONS);
+    }
+
+    #[test]
+    fn operation_sets_reject_counts_over_the_supported_maximum() {
+        let operations = vec![
+            "GET:exact:/v1/models".to_owned();
+            MAX_ALLOWED_OPERATIONS
+                .checked_add(1)
+                .expect("test count should fit usize")
+        ];
+
+        assert!(matches!(
+            parse_allowed_operations(operations),
+            Err(ConfigError::TooManyAllowedOperations { max, value })
+                if max == usize_to_u128(MAX_ALLOWED_OPERATIONS)
+                    && value == usize_to_u128(MAX_ALLOWED_OPERATIONS + 1),
+        ));
+    }
+
+    #[test]
+    fn operation_sets_still_report_empty_allowlists_before_count_bounds() {
+        let operations = vec![
+            String::new();
+            MAX_ALLOWED_OPERATIONS
+                .checked_add(1)
+                .expect("test count should fit usize")
+        ];
+
+        assert!(matches!(
+            parse_allowed_operations(operations),
+            Err(ConfigError::EmptyOperations),
         ));
     }
 
@@ -1090,12 +1209,13 @@ mod tests {
 )]
 mod proptests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_AUDIT_EVENT_BYTES,
-        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
-        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES, ServeArgs,
-        UpstreamOrigin, parse_allowed_operations, tests::serve_args,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
+        MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
+        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
+        MAX_RESPONSE_HEADER_BYTES, ServeArgs, UpstreamOrigin, parse_allowed_operations,
+        tests::serve_args,
     };
-    use crate::target::{OriginFormPath, OriginFormQuery};
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use ::http::Method;
     use core::iter;
     use core::net::SocketAddr;
@@ -1184,7 +1304,15 @@ mod proptests {
             allowed_path_valid().prop_map(|path| format!("{path}/..")),
             allowed_path_valid().prop_map(|path| format!("{path}%2fchild")),
             allowed_path_valid().prop_map(|path| format!("{path}%zz")),
+            (MAX_ORIGIN_FORM_PATH_BYTES..=MAX_ORIGIN_FORM_PATH_BYTES + 64)
+                .prop_map(|tail_len| format!("/{}", "a".repeat(tail_len))),
         ]
+    }
+
+    /// Allowed operation strings longer than the supported byte limit.
+    fn operation_too_long() -> impl Strategy<Value = String> {
+        (MAX_ALLOWED_OPERATION_BYTES..=MAX_ALLOWED_OPERATION_BYTES + 64)
+            .prop_map(|tail_len| format!("GET:exact:/{}", "a".repeat(tail_len)))
     }
 
     /// Accepted request paths: no dot segments, mirroring what the request
@@ -1303,6 +1431,15 @@ mod proptests {
         }
 
         #[test]
+        fn parse_rejects_too_long_operations(raw in operation_too_long()) {
+            let is_too_long = matches!(
+                AllowedOperation::parse(&raw),
+                Err(ConfigError::AllowedOperationTooLong { .. }),
+            );
+            prop_assert!(is_too_long);
+        }
+
+        #[test]
         fn parse_rejects_operations_with_missing_parts(
             method in method_valid(),
             kind in kind_valid(),
@@ -1393,6 +1530,20 @@ mod proptests {
                 let parsed = result.expect("valid operations should parse");
                 prop_assert_eq!(parsed.len(), expected_count);
             }
+        }
+
+        #[test]
+        fn parse_allowed_operations_rejects_too_many_entries(extra in 1_usize..=16) {
+            let count = MAX_ALLOWED_OPERATIONS
+                .checked_add(extra)
+                .expect("test operation count should fit usize");
+            let raw = vec!["GET:exact:/v1/models".to_owned(); count];
+
+            let is_too_many = matches!(
+                parse_allowed_operations(raw),
+                Err(ConfigError::TooManyAllowedOperations { .. }),
+            );
+            prop_assert!(is_too_many);
         }
 
         #[test]

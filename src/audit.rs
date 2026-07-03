@@ -64,6 +64,12 @@ pub(crate) enum AuditDenialReason {
     /// Path was not in the allowlist.
     PathDenied,
 
+    /// Path exceeded the supported byte limit.
+    PathTooLong,
+
+    /// Query exceeded the supported byte limit.
+    QueryTooLong,
+
     /// Request body could not be read.
     RequestBodyReadFailed,
 
@@ -499,6 +505,8 @@ impl AuditDenialReason {
             Self::MethodDenied => "method_denied",
             Self::NonOriginForm => "non_origin_form",
             Self::PathDenied => "path_denied",
+            Self::PathTooLong => "path_too_long",
+            Self::QueryTooLong => "query_too_long",
             Self::RequestBodyReadFailed => "request_body_read_failed",
             Self::RequestBodyTimeout => "request_body_timeout",
             Self::RequestBodyTooLarge => "request_body_too_large",
@@ -520,6 +528,7 @@ impl AuditDenialReason {
             | Self::RequestBodyReadFailed => StatusCode::BAD_REQUEST,
             Self::ConnectUnsupported => StatusCode::METHOD_NOT_ALLOWED,
             Self::MethodDenied | Self::PathDenied => StatusCode::FORBIDDEN,
+            Self::PathTooLong | Self::QueryTooLong => StatusCode::URI_TOO_LONG,
             Self::RequestBodyTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RequestBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::RequestHeadersTooLarge => StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
@@ -1642,10 +1651,12 @@ mod proptests {
             6 => AuditDenialReason::MethodDenied,
             7 => AuditDenialReason::NonOriginForm,
             8 => AuditDenialReason::PathDenied,
-            9 => AuditDenialReason::RequestBodyReadFailed,
-            10 => AuditDenialReason::RequestBodyTimeout,
-            11 => AuditDenialReason::RequestBodyTooLarge,
-            12 => AuditDenialReason::RequestHeadersTooLarge,
+            9 => AuditDenialReason::PathTooLong,
+            10 => AuditDenialReason::QueryTooLong,
+            11 => AuditDenialReason::RequestBodyReadFailed,
+            12 => AuditDenialReason::RequestBodyTimeout,
+            13 => AuditDenialReason::RequestBodyTooLarge,
+            14 => AuditDenialReason::RequestHeadersTooLarge,
             _ => AuditDenialReason::TooManyRequests,
         }
     }
@@ -1698,7 +1709,7 @@ mod proptests {
         #[test]
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
-            denial_kind in 0_u8..14,
+            denial_kind in 0_u8..16,
             response_error_kind in 0_u8..5,
             upstream_error_kind in 0_u8..3,
             method in "[A-Z]{3,8}",

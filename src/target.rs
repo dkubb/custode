@@ -1,5 +1,10 @@
 //! Request target parsing.
 
+/// Maximum accepted origin-form request path bytes.
+pub(crate) const MAX_ORIGIN_FORM_PATH_BYTES: usize = 4_096;
+/// Maximum accepted origin-form request query bytes.
+pub(crate) const MAX_ORIGIN_FORM_QUERY_BYTES: usize = 8_192;
+
 /// Origin-form request path accepted by the gateway.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OriginFormPath {
@@ -21,6 +26,9 @@ pub(crate) enum OriginFormPathError {
 
     /// Path was not origin-form.
     NonOriginForm,
+
+    /// Path exceeded the supported byte limit.
+    TooLong,
 }
 
 /// Origin-form request query accepted by the gateway.
@@ -35,6 +43,9 @@ pub(crate) struct OriginFormQuery {
 pub(crate) enum OriginFormQueryError {
     /// Query contained invalid percent-encoding.
     InvalidPercentEncoding,
+
+    /// Query exceeded the supported byte limit.
+    TooLong,
 }
 
 /// Decoded dot-segment recognition state.
@@ -77,10 +88,14 @@ impl OriginFormPath {
     ///
     /// # Errors
     ///
-    /// Returns an error when the path is not origin-form, contains invalid
-    /// percent-encoding, contains a percent-encoded path separator, or contains
-    /// a literal or percent-encoded dot segment.
+    /// Returns an error when the path exceeds the byte limit, is not
+    /// origin-form, contains invalid percent-encoding, contains a
+    /// percent-encoded path separator, or contains a literal or
+    /// percent-encoded dot segment.
     pub(crate) fn parse(path: &str) -> Result<Self, OriginFormPathError> {
+        if path.len() > MAX_ORIGIN_FORM_PATH_BYTES {
+            return Err(OriginFormPathError::TooLong);
+        }
         if !path.starts_with('/') {
             return Err(OriginFormPathError::NonOriginForm);
         }
@@ -111,8 +126,12 @@ impl OriginFormQuery {
     ///
     /// # Errors
     ///
-    /// Returns an error when the query contains invalid percent-encoding.
+    /// Returns an error when the query exceeds the byte limit or contains
+    /// invalid percent-encoding.
     pub(crate) fn parse(query: &str) -> Result<Self, OriginFormQueryError> {
+        if query.len() > MAX_ORIGIN_FORM_QUERY_BYTES {
+            return Err(OriginFormQueryError::TooLong);
+        }
         if !has_valid_percent_encoding(query) {
             return Err(OriginFormQueryError::InvalidPercentEncoding);
         }
@@ -241,7 +260,8 @@ const fn hex_value(byte: u8) -> Option<u8> {
 )]
 mod tests {
     use super::{
-        DotSegmentState, OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError,
+        DotSegmentState, MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath,
+        OriginFormPathError, OriginFormQuery, OriginFormQueryError,
     };
     use pretty_assertions::assert_eq;
 
@@ -370,6 +390,24 @@ mod tests {
     }
 
     #[test]
+    fn path_accepts_the_maximum_supported_length() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES - 1));
+        let parsed = OriginFormPath::parse(&path).expect("maximum path should parse");
+
+        assert_eq!(parsed.as_str(), path);
+    }
+
+    #[test]
+    fn path_rejects_lengths_over_the_supported_maximum() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+
+        assert_eq!(
+            OriginFormPath::parse(&path),
+            Err(OriginFormPathError::TooLong),
+        );
+    }
+
+    #[test]
     fn query_accepts_empty_string() {
         let query = OriginFormQuery::parse("").expect("empty query should parse");
 
@@ -384,10 +422,28 @@ mod tests {
     }
 
     #[test]
+    fn query_accepts_the_maximum_supported_length() {
+        let query = "a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES);
+        let parsed = OriginFormQuery::parse(&query).expect("maximum query should parse");
+
+        assert_eq!(parsed.as_str(), query);
+    }
+
+    #[test]
     fn query_rejects_invalid_percent_encoding() {
         assert_eq!(
             OriginFormQuery::parse("bad=%zz"),
             Err(OriginFormQueryError::InvalidPercentEncoding),
+        );
+    }
+
+    #[test]
+    fn query_rejects_lengths_over_the_supported_maximum() {
+        let query = "a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+
+        assert_eq!(
+            OriginFormQuery::parse(&query),
+            Err(OriginFormQueryError::TooLong),
         );
     }
 
@@ -434,7 +490,10 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::{OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError};
+    use super::{
+        MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath,
+        OriginFormPathError, OriginFormQuery, OriginFormQueryError,
+    };
     use proptest::collection;
     use proptest::prelude::*;
 
@@ -559,6 +618,12 @@ mod proptests {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
     }
 
+    /// Origin-form paths longer than the supported byte limit.
+    fn path_too_long() -> impl Strategy<Value = String> {
+        (MAX_ORIGIN_FORM_PATH_BYTES..=MAX_ORIGIN_FORM_PATH_BYTES + 64)
+            .prop_map(|tail_len| format!("/{}", "a".repeat(tail_len)))
+    }
+
     /// Valid query strings accepted as origin-form query witnesses.
     fn query_valid() -> impl Strategy<Value = String> {
         prop_oneof![
@@ -580,6 +645,12 @@ mod proptests {
             ],
         )
             .prop_map(|(prefix, escape)| format!("{prefix}%{escape}"))
+    }
+
+    /// Queries longer than the supported byte limit.
+    fn query_too_long() -> impl Strategy<Value = String> {
+        (MAX_ORIGIN_FORM_QUERY_BYTES + 1..=MAX_ORIGIN_FORM_QUERY_BYTES + 64)
+            .prop_map(|len| "a".repeat(len))
     }
 
     proptest! {
@@ -624,6 +695,14 @@ mod proptests {
         }
 
         #[test]
+        fn parse_rejects_every_too_long_path(path in path_too_long()) {
+            prop_assert_eq!(
+                OriginFormPath::parse(&path),
+                Err(OriginFormPathError::TooLong)
+            );
+        }
+
+        #[test]
         fn query_parse_accepts_every_valid_query(query in query_valid()) {
             let parsed = OriginFormQuery::parse(&query)
                 .expect("valid query should be accepted");
@@ -638,6 +717,14 @@ mod proptests {
             prop_assert_eq!(
                 OriginFormQuery::parse(&query),
                 Err(OriginFormQueryError::InvalidPercentEncoding)
+            );
+        }
+
+        #[test]
+        fn query_parse_rejects_every_too_long_query(query in query_too_long()) {
+            prop_assert_eq!(
+                OriginFormQuery::parse(&query),
+                Err(OriginFormQueryError::TooLong)
             );
         }
 

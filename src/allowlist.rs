@@ -1,7 +1,7 @@
 //! Method and path allowlist decisions.
 
 use crate::config::GatewayConfig;
-use crate::target::{OriginFormPath, OriginFormPathError, OriginFormQuery};
+use crate::target::{OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError};
 use ::http::Method;
 
 /// Request target accepted by the gateway.
@@ -28,14 +28,15 @@ impl AcceptedTarget {
     /// # Errors
     ///
     /// Returns a rejection when the path is not origin-form, when the path or
-    /// query contains invalid percent-encoding, or when the path contains a
-    /// literal or percent-encoded dot segment.
+    /// query exceeds the byte limit, when the path or query contains invalid
+    /// percent-encoding, or when the path contains a literal or
+    /// percent-encoded dot segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
         let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
         let accepted_query = query
             .map(OriginFormQuery::parse)
             .transpose()
-            .map_err(|_error| RejectionReason::InvalidPercentEncoding)?;
+            .map_err(rejection_from_query_error)?;
 
         Ok(Self {
             path: accepted_path,
@@ -102,6 +103,12 @@ pub(crate) enum RejectionReason {
 
     /// The path was not in the allowlist.
     PathDenied,
+
+    /// The path exceeded the supported byte limit.
+    PathTooLong,
+
+    /// The query exceeded the supported byte limit.
+    QueryTooLong,
 }
 
 /// Checks whether a request is allowed by the configured method and path sets.
@@ -134,6 +141,15 @@ const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReaso
         OriginFormPathError::EncodedSeparator => RejectionReason::EncodedSeparator,
         OriginFormPathError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
         OriginFormPathError::NonOriginForm => RejectionReason::NonOriginForm,
+        OriginFormPathError::TooLong => RejectionReason::PathTooLong,
+    }
+}
+
+/// Maps origin-form query errors into request rejection reasons.
+const fn rejection_from_query_error(error: OriginFormQueryError) -> RejectionReason {
+    match error {
+        OriginFormQueryError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
+        OriginFormQueryError::TooLong => RejectionReason::QueryTooLong,
     }
 }
 
@@ -167,7 +183,9 @@ pub(crate) fn allow_target(
 mod tests {
     use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::{AllowedPath, GatewayConfig};
-    use crate::target::{OriginFormPath, OriginFormQuery};
+    use crate::target::{
+        MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
+    };
     use ::http::Method;
     use core::num::NonZeroUsize;
     use pretty_assertions::assert_eq;
@@ -277,6 +295,26 @@ mod tests {
     }
 
     #[test]
+    fn target_rejects_paths_over_the_supported_maximum() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+
+        assert_eq!(
+            AcceptedTarget::new(&path, None),
+            Err(RejectionReason::PathTooLong),
+        );
+    }
+
+    #[test]
+    fn target_rejects_queries_over_the_supported_maximum() {
+        let query = "a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+
+        assert_eq!(
+            AcceptedTarget::new("/v1/models", Some(&query)),
+            Err(RejectionReason::QueryTooLong),
+        );
+    }
+
+    #[test]
     fn target_accepts_segments_of_three_or_more_dots() {
         for path in ["/.../x", "/...."] {
             let target = AcceptedTarget::new(path, None)
@@ -327,6 +365,7 @@ mod tests {
 mod proptests {
     use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
     use crate::config::GatewayConfig;
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::Method;
     use core::num::NonZeroUsize;
     use proptest::prelude::*;
@@ -450,6 +489,18 @@ mod proptests {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
     }
 
+    /// Origin-form paths that exceed the supported byte limit.
+    fn path_too_long() -> impl Strategy<Value = String> {
+        (MAX_ORIGIN_FORM_PATH_BYTES..=MAX_ORIGIN_FORM_PATH_BYTES + 64)
+            .prop_map(|tail_len| format!("/{}", "a".repeat(tail_len)))
+    }
+
+    /// Queries that exceed the supported byte limit.
+    fn query_too_long() -> impl Strategy<Value = String> {
+        (MAX_ORIGIN_FORM_QUERY_BYTES + 1..=MAX_ORIGIN_FORM_QUERY_BYTES + 64)
+            .prop_map(|len| "a".repeat(len))
+    }
+
     proptest! {
         #[test]
         fn new_accepts_every_valid_path(
@@ -492,6 +543,22 @@ mod proptests {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
                 Err(RejectionReason::NonOriginForm)
+            );
+        }
+
+        #[test]
+        fn new_rejects_every_too_long_path(path in path_too_long()) {
+            prop_assert_eq!(
+                AcceptedTarget::new(&path, None),
+                Err(RejectionReason::PathTooLong)
+            );
+        }
+
+        #[test]
+        fn new_rejects_every_too_long_query(query in query_too_long()) {
+            prop_assert_eq!(
+                AcceptedTarget::new("/v1/models", Some(&query)),
+                Err(RejectionReason::QueryTooLong)
             );
         }
 
