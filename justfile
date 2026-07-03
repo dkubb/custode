@@ -45,7 +45,7 @@ coverage-proptests:
         --max-missed-regions 566 \
         --max-missed-functions 88 \
         --max-missed-lines 349 \
-        --max-missed-branches 23 \
+        --max-missed-branches 35 \
         target/coverage/proptests.json
 
 mutants:

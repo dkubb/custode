@@ -170,42 +170,70 @@ detailed_report_excluding_test_modules() {
       if type == "boolean" then . else . != 0 end;
 
     .data[0] as $data |
-    (
-      $data.files[] as $file |
-      ($file.filename) as $filename |
-      ($file.segments // [])[] |
-      . as $segment |
-      ($segment[0] // 0) as $line |
-      ($segment[2] // 0) as $count |
-      (($segment[3] // false) | as_bool) as $has_count |
-      (($segment[4] // false) | as_bool) as $is_region_entry |
-      select($line > 0 and $has_count and $count == 0) |
-      ["line", $filename, $line],
-      (select($is_region_entry) | ["region", $filename, $line])
-    ),
-    (
-      $data.files[] as $file |
-      ($file.filename) as $filename |
-      ($file.branches // [])[] |
-      . as $branch |
-      ($branch[0] // 0) as $line |
-      ($branch[4] // 0) as $count |
-      select($line > 0 and $count == 0) |
-      ["branch", $filename, $line]
-    ),
-    (
-      ($data.functions // [])[] |
-      select((.count // 0) == 0) |
-      (.filenames[0] // "") as $filename |
-      ((.regions[0][0]) // 0) as $line |
-      select($filename != "" and $line > 0) |
-      ["function", $filename, $line]
-    )
-    | @tsv
+    [
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        select($line > 0 and $has_count and $count == 0) |
+        ["line", $filename, $line]
+      ),
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        (($segment[4] // false) | as_bool) as $is_region_entry |
+        select($line > 0 and $has_count and $count == 0 and $is_region_entry) |
+        ["region", $filename, $line]
+      ),
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.branches // [])[] |
+        . as $branch |
+        ($branch[0] // 0) as $line |
+        ($branch[1] // 0) as $start_column |
+        ($branch[2] // 0) as $end_line |
+        ($branch[3] // 0) as $end_column |
+        [
+          [0, ($branch[4] // 0)],
+          [1, ($branch[5] // 0)]
+        ][] as $arm |
+        ($arm[0]) as $arm_index |
+        ($arm[1]) as $count |
+        select($line > 0 and $count == 0) |
+        [
+          "branch",
+          $filename,
+          $line,
+          $start_column,
+          $end_line,
+          $end_column,
+          $arm_index
+        ]
+      ),
+      (
+        ($data.functions // [])[] |
+        select((.count // 0) == 0) |
+        (.filenames[0] // "") as $filename |
+        ((.regions[0][0]) // 0) as $line |
+        select($filename != "" and $line > 0) |
+        ["function", $filename, $line]
+      )
+    ][] |
+    @tsv
   ' "${summary_path}" >"${events_path}"
 
 	awk -F '\t' '
-      NR == FNR {
+      FILENAME == ARGV[1] {
         excluded_from[$1] = $2
         next
       }
@@ -218,6 +246,8 @@ detailed_report_excluding_test_modules() {
         }
         if (metric == "line") {
           missed_lines[filename ":" line] = 1
+        } else if (metric == "branch") {
+          missed_branches[filename ":" line ":" $4 ":" $5 ":" $6 ":" $7] = 1
         } else {
           missed[metric] += 1
         }
@@ -225,6 +255,9 @@ detailed_report_excluding_test_modules() {
       END {
         for (line_key in missed_lines) {
           missed["line"] += 1
+        }
+        for (branch_key in missed_branches) {
+          missed["branch"] += 1
         }
         printf "regions\t%d\t%s\n", missed["region"], max_regions
         printf "functions\t%d\t%s\n", missed["function"], max_functions
