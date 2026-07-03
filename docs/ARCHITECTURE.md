@@ -355,7 +355,8 @@ Configuration parsing is fail-closed:
 - `CUSTODE_BIND` MUST parse as a socket address.
 - `CUSTODE_UPSTREAM_ORIGIN` MUST parse as an HTTP or HTTPS URL with scheme,
   host, and optional port, MUST NOT include path, query, fragment, or
-  userinfo credentials, and MUST NOT use a wildcard host.
+  userinfo credentials, MUST NOT use a wildcard host, and MUST be at most 255
+  bytes.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at least one operation.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at most 256 operations, and each
   operation string MUST be at most 4,160 bytes.
@@ -370,8 +371,8 @@ Configuration parsing is fail-closed:
   Tokio `Semaphore::MAX_PERMITS`; request bytes 1,073,741,824; request header
   name/value bytes 1,048,576; response bytes 1,073,741,824; response header
   name/value bytes 1,048,576; incoming path bytes 4,096; incoming query bytes
-  8,192; allowed operation bytes 4,160; allowed operations 256; request
-  timeout 3,600 seconds.
+  8,192; allowed operation bytes 4,160; allowed operations 256; upstream
+  origin bytes 255; request timeout 3,600 seconds.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.

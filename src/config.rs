@@ -29,6 +29,8 @@ const MAX_RESPONSE_BYTES: u64 = 0x4000_0000;
 const MAX_RESPONSE_HEADER_BYTES: usize = 0x0010_0000;
 /// Maximum request timeout in seconds.
 const MAX_REQUEST_TIMEOUT_SECS: u64 = 3_600;
+/// Maximum upstream origin bytes.
+const MAX_UPSTREAM_ORIGIN_BYTES: usize = 255;
 
 /// A configured method-path operation.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -149,6 +151,15 @@ pub(crate) enum ConfigError {
     /// Upstream origin included credentials.
     #[error("upstream origin must not include credentials")]
     UpstreamOriginHasCredentials,
+
+    /// Upstream origin text exceeded the supported byte limit.
+    #[error("upstream origin must be at most {max} bytes, got {value}")]
+    UpstreamOriginTooLong {
+        /// Maximum accepted bytes.
+        max: u128,
+        /// Supplied bytes.
+        value: u128,
+    },
 
     /// Upstream origin used a wildcard host.
     #[error("upstream origin must not use a wildcard host")]
@@ -593,6 +604,13 @@ impl UpstreamOrigin {
     /// Returns a configuration error when the origin is not HTTP(S), uses a
     /// wildcard host, or contains path, query, fragment, username, or password.
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
+        if raw.len() > MAX_UPSTREAM_ORIGIN_BYTES {
+            return Err(ConfigError::UpstreamOriginTooLong {
+                max: usize_to_u128(MAX_UPSTREAM_ORIGIN_BYTES),
+                value: usize_to_u128(raw.len()),
+            });
+        }
+
         let url = Url::parse(raw).map_err(|source| ConfigError::InvalidUpstreamOrigin {
             raw: raw.to_owned(),
             source,
@@ -720,8 +738,8 @@ mod tests {
         AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
         MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
-        MAX_RESPONSE_HEADER_BYTES, ServeArgs, UpstreamOrigin, non_zero_usize,
-        parse_allowed_operations, usize_to_u128,
+        MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, ServeArgs, UpstreamOrigin,
+        non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -757,6 +775,19 @@ mod tests {
     /// Parses a test origin-form query.
     fn origin_form_query(query: &str) -> OriginFormQuery {
         OriginFormQuery::parse(query).expect("test query should parse")
+    }
+
+    /// Builds the longest valid origin accepted by the input byte cap.
+    fn maximum_supported_origin() -> String {
+        let labels = [
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(55),
+        ];
+        let origin = format!("https://{}", labels.join("."));
+        assert_eq!(origin.len(), MAX_UPSTREAM_ORIGIN_BYTES);
+        origin
     }
 
     #[test]
@@ -850,6 +881,27 @@ mod tests {
         assert!(matches!(
             UpstreamOrigin::parse("https://api.openai.com/v1"),
             Err(ConfigError::UpstreamOriginHasComponents),
+        ));
+    }
+
+    #[test]
+    fn upstream_origin_accepts_the_maximum_supported_length() {
+        let origin = maximum_supported_origin();
+
+        let parsed = UpstreamOrigin::parse(&origin).expect("maximum origin should parse");
+
+        assert_eq!(parsed.as_str(), origin);
+    }
+
+    #[test]
+    fn upstream_origin_rejects_lengths_over_the_supported_maximum() {
+        let origin = format!("{}a", maximum_supported_origin());
+
+        assert!(matches!(
+            UpstreamOrigin::parse(&origin),
+            Err(ConfigError::UpstreamOriginTooLong { max, value })
+                if max == usize_to_u128(MAX_UPSTREAM_ORIGIN_BYTES)
+                    && value == usize_to_u128(origin.len()),
         ));
     }
 
