@@ -77,16 +77,26 @@ static_linkage() {
 }
 
 proxy_publishes_no_ports() {
+  local container_id
   local published
 
-  published=$(docker compose port proxy 8080 2>/dev/null || true)
-  case "${published}" in
-  "" | *:0) ;;
-  *)
-    printf "proxy port 8080 is published to the host: %s\n" "${published}" >&2
+  if ! container_id=$(docker compose ps --quiet proxy); then
     return 1
-    ;;
-  esac
+  fi
+
+  if [[ -z "${container_id}" ]]; then
+    printf "proxy container was not found\n" >&2
+    return 1
+  fi
+
+  if ! published=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{$port}} {{end}}{{end}}' "${container_id}"); then
+    return 1
+  fi
+
+  if [[ -n "${published}" ]]; then
+    printf "proxy publishes host ports: %s\n" "${published}" >&2
+    return 1
+  fi
 }
 
 harness_cannot_reach_external() {
@@ -105,11 +115,11 @@ harness_reaches_gateway() {
   fi
 
   case "${status}" in
-  400 | 403 | 405) ;;
-  *)
-    printf "unexpected gateway status %s\n" "${status}" >&2
-    return 1
-    ;;
+    400 | 403 | 405) ;;
+    *)
+      printf "unexpected gateway status %s\n" "${status}" >&2
+      return 1
+      ;;
   esac
 }
 
