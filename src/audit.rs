@@ -2,10 +2,10 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
-use crate::config::{GatewayConfig, UpstreamOrigin};
+use crate::config::{AuditEventBytes, GatewayConfig, UpstreamOrigin};
 use ::http::{Method, StatusCode};
 use core::fmt;
-use core::num::{NonZeroU64, NonZeroUsize};
+use core::num::NonZeroU64;
 use non_empty_string::NonEmptyString;
 use serde::{Serialize, Serializer};
 use std::io;
@@ -362,7 +362,7 @@ pub(crate) struct AuditWriter {
     /// Audit log file guarded for append writes.
     file: Arc<Mutex<File>>,
     /// Maximum serialized event bytes, including the NDJSON newline.
-    max_event_bytes: NonZeroUsize,
+    max_event_bytes: AuditEventBytes,
 }
 
 /// Request identity used in audit events.
@@ -1155,7 +1155,7 @@ fn validate_run_token(text: &str) -> Result<(), RunTokenError> {
 /// Serializes one bounded audit event as NDJSON bytes.
 fn serialize_event(
     event: &AuditEvent,
-    max_event_bytes: NonZeroUsize,
+    max_event_bytes: AuditEventBytes,
 ) -> Result<Vec<u8>, AuditError> {
     let mut serialized = serialize_json_event(event);
     serialized.push(b'\n');
@@ -1201,7 +1201,7 @@ mod tests {
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::{GatewayConfig, UpstreamOrigin};
+    use crate::config::{GatewayConfig, ResponseBodyBytes, UpstreamOrigin};
     use ::http::{Method, StatusCode};
     use core::num::{NonZeroU64, NonZeroUsize};
     use core::pin::Pin;
@@ -1338,8 +1338,9 @@ mod tests {
 
     #[test]
     fn response_body_prefix_records_accepted_bytes() {
-        let mut account =
-            ResponseAccount::new(NonZeroU64::new(16).expect("limit should be non-zero"));
+        let mut account = ResponseAccount::new(ResponseBodyBytes::for_test(
+            NonZeroU64::new(16).expect("limit should be non-zero"),
+        ));
         account
             .add_chunk(b"accepted")
             .expect("chunk should fit under the limit");
@@ -1702,7 +1703,7 @@ mod proptests {
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::UpstreamOrigin;
+    use crate::config::{ResponseBodyBytes, UpstreamOrigin};
     use ::http::Method;
     use ::http::StatusCode;
     use core::num::NonZeroU64;
@@ -1743,7 +1744,9 @@ mod proptests {
 
     #[test]
     fn empty_response_account_serializes_as_empty_body() {
-        let account = ResponseAccount::new(NonZeroU64::new(1).expect("limit should be non-zero"));
+        let account = ResponseAccount::new(ResponseBodyBytes::for_test(
+            NonZeroU64::new(1).expect("limit should be non-zero"),
+        ));
         let summary = ObservedBodySummary::from_response_account(account).into_summary();
 
         let value = serde_json::to_value(summary).expect("summary should serialize");

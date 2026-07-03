@@ -1,9 +1,9 @@
 //! Bounded body accounting helpers.
 
+use crate::config::{RequestBodyBytes, ResponseBodyBytes};
 use axum::body::{Body, to_bytes};
 use blake3::{Hash, Hasher};
 use core::error::Error as CoreError;
-use core::num::{NonZeroU64, NonZeroUsize};
 use http_body_util::LengthLimitError;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
@@ -59,7 +59,7 @@ impl AccountedBody {
     /// read.
     pub(crate) async fn read_request(
         body: Body,
-        limit: NonZeroUsize,
+        limit: RequestBodyBytes,
     ) -> Result<Self, RequestBodyError> {
         let bytes = to_bytes(body, limit.get()).await.map_err(|source| {
             if source
@@ -112,7 +112,7 @@ pub(crate) struct ResponseAccount {
     /// Streaming BLAKE3 hasher.
     hasher: Hasher,
     /// Maximum allowed response bytes.
-    max_bytes: NonZeroU64,
+    max_bytes: ResponseBodyBytes,
 }
 
 impl ResponseAccount {
@@ -148,7 +148,7 @@ impl ResponseAccount {
 
     /// Creates a response account.
     #[must_use]
-    pub(crate) fn new(max_bytes: NonZeroU64) -> Self {
+    pub(crate) fn new(max_bytes: ResponseBodyBytes) -> Self {
         Self {
             bytes: 0,
             hasher: Hasher::new(),
@@ -193,6 +193,7 @@ fn chunk_len_u64(chunk: &[u8]) -> u64 {
 )]
 mod tests {
     use super::{AccountedBody, BodyDigest, BodyError, RequestBodyError, ResponseAccount};
+    use crate::config::{RequestBodyBytes, ResponseBodyBytes};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
     use futures_util::stream;
@@ -208,8 +209,18 @@ mod tests {
     }
 
     /// A roomy body limit for tests that should not hit the bound.
-    fn roomy_limit() -> NonZeroUsize {
-        NonZeroUsize::new(1_024).expect("limit should be non-zero")
+    fn request_limit(value: usize) -> RequestBodyBytes {
+        RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    /// A response body limit for tests.
+    fn response_limit(value: u64) -> ResponseBodyBytes {
+        ResponseBodyBytes::for_test(NonZeroU64::new(value).expect("limit should be non-zero"))
+    }
+
+    /// A roomy request body limit for tests that should not hit the bound.
+    fn roomy_limit() -> RequestBodyBytes {
+        request_limit(1_024)
     }
 
     #[tokio::test]
@@ -239,11 +250,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_request_rejects_bodies_over_the_limit() {
-        let result = AccountedBody::read_request(
-            Body::from("ab"),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        )
-        .await;
+        let result = AccountedBody::read_request(Body::from("ab"), request_limit(1)).await;
 
         assert!(matches!(result, Err(RequestBodyError::TooLarge)));
     }
@@ -261,7 +268,7 @@ mod tests {
 
     #[test]
     fn add_chunk_accepts_chunks_up_to_the_limit() {
-        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        let mut account = ResponseAccount::new(response_limit(5));
 
         let result = account.add_chunk(b"hello");
 
@@ -273,7 +280,7 @@ mod tests {
 
     #[test]
     fn add_chunk_rejects_totals_over_the_limit() {
-        let mut account = ResponseAccount::new(NonZeroU64::new(4).expect("limit is non-zero"));
+        let mut account = ResponseAccount::new(response_limit(4));
 
         let result = account.add_chunk(b"hello");
 
@@ -283,7 +290,7 @@ mod tests {
 
     #[test]
     fn add_chunk_rejects_accumulated_totals_over_the_limit() {
-        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        let mut account = ResponseAccount::new(response_limit(5));
         account
             .add_chunk(b"hell")
             .expect("first chunk should fit within the limit");
@@ -298,8 +305,7 @@ mod tests {
 
     #[test]
     fn add_chunk_rejects_counter_overflow() {
-        let mut account =
-            ResponseAccount::new(NonZeroU64::new(u64::MAX).expect("limit is non-zero"));
+        let mut account = ResponseAccount::new(response_limit(u64::MAX));
         account.bytes = u64::MAX;
 
         let result = account.add_chunk(b"x");
@@ -311,14 +317,14 @@ mod tests {
 
     #[test]
     fn finalize_digest_is_none_for_empty_responses() {
-        let account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        let account = ResponseAccount::new(response_limit(5));
 
         assert_eq!(account.into_digest_parts(), (0, None));
     }
 
     #[test]
     fn finalize_digest_hashes_accumulated_chunks() {
-        let mut account = ResponseAccount::new(NonZeroU64::new(5).expect("limit is non-zero"));
+        let mut account = ResponseAccount::new(response_limit(5));
         account
             .add_chunk(b"hel")
             .expect("first chunk should fit within the limit");

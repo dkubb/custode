@@ -1194,7 +1194,7 @@ mod tests {
         RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
-    use crate::config::{GatewayConfig, ServeArgs};
+    use crate::config::{GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
     use crate::ports::{
@@ -1209,7 +1209,7 @@ mod tests {
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
-    use axum::http::{HeaderMap, Request, StatusCode};
+    use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
     use axum::{
         Router,
         routing::{any, get},
@@ -1357,6 +1357,16 @@ mod tests {
             .expect("request should build")
     }
 
+    /// Builds a request body byte limit for tests.
+    fn request_body_limit(value: usize) -> RequestBodyBytes {
+        RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    /// Builds a response body byte limit for tests.
+    fn response_body_limit(value: u64) -> ResponseBodyBytes {
+        ResponseBodyBytes::for_test(NonZeroU64::new(value).expect("limit should be non-zero"))
+    }
+
     /// Builds an allowlist witness for response audit tests.
     fn allowed_target(config: &GatewayConfig, path: &str) -> AllowedTarget {
         let target = AcceptedTarget::new(path, None).expect("target should parse");
@@ -1366,7 +1376,7 @@ mod tests {
     /// Builds response audit state for direct stream tests.
     async fn response_audit_context(
         audit: MemoryAuditSink,
-        max_response_bytes: NonZeroU64,
+        max_response_bytes: ResponseBodyBytes,
     ) -> (ResponseAuditContext, mpsc::UnboundedReceiver<GatewayError>) {
         let config = GatewayConfig::for_runtime_test(
             PathBuf::from("unused-audit.ndjson"),
@@ -1379,12 +1389,9 @@ mod tests {
             FixedClock,
             SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
         );
-        let request_body = AccountedBody::read_request(
-            Body::empty(),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        )
-        .await
-        .expect("request body should be accounted");
+        let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
+            .await
+            .expect("request body should be accounted");
         let response_account = ResponseAccount::new(max_response_bytes);
         let (fatal_errors, fatal_receiver) = mpsc::unbounded_channel();
         let context = ResponseAuditContext {
@@ -1424,7 +1431,10 @@ mod tests {
 
     /// Builds an upstream router answering the models route with `hello`.
     fn hello_upstream_router() -> Router {
-        Router::new().route("/v1/models", get(|| async { "hello" }))
+        Router::new().route(
+            "/v1/models",
+            get(|| async { ([("x-upstream-observed", "yes")], "hello") }),
+        )
     }
 
     /// Returns the expected deterministic audit event for the injected-port test.
@@ -2362,6 +2372,10 @@ mod tests {
             .expect("proxy should respond");
 
         assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get("x-upstream-observed"),
+            Some(&HeaderValue::from_static("yes"))
+        );
         let body = to_bytes(response.into_body(), 1_024)
             .await
             .expect("response body should stream");
@@ -2966,14 +2980,10 @@ mod tests {
             FixedClock,
             SequentialRequestIds::new(RunToken::for_test("7e57-c0de")),
         );
-        let request_body = AccountedBody::read_request(
-            Body::empty(),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        )
-        .await
-        .expect("request body should be accounted");
-        let response_account =
-            ResponseAccount::new(NonZeroU64::new(1_024).expect("limit should be non-zero"));
+        let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
+            .await
+            .expect("request body should be accounted");
+        let response_account = ResponseAccount::new(response_body_limit(1_024));
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
         let context = ResponseAuditContext {
             fatal_errors,
@@ -3039,7 +3049,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn response_stream_reports_stream_errors_without_pending_chunks() {
         let (audit, audit_events) = MemoryAuditSink::new();
-        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
         let upstream_body = stream::iter([Err(UpstreamBodyError::new(
             "scripted upstream stream failed",
@@ -3080,7 +3090,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn response_stream_audits_empty_successful_responses() {
         let (audit, audit_events) = MemoryAuditSink::new();
-        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
         let upstream_body = stream::empty::<Result<Bytes, UpstreamBodyError>>();
         let upstream_response =
@@ -3115,7 +3125,7 @@ mod tests {
         let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
         let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
         let audit_observer = audit.clone();
-        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
         let upstream_body = stream::unfold(Some(false), |state| async move {
             match state {
@@ -3159,7 +3169,7 @@ mod tests {
     async fn response_stream_audits_pending_chunk_send_failures() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let audit_observer = audit.clone();
-        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
         let upstream_body = stream::unfold(Some(false), |state| async move {
             match state {
@@ -3212,7 +3222,7 @@ mod tests {
         let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
         let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
         let audit_observer = audit.clone();
-        let max_response_bytes = NonZeroU64::new(1_024).expect("limit should be non-zero");
+        let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
         let upstream_body = stream::unfold(false, |sent| async move {
             if sent {
@@ -3271,14 +3281,10 @@ mod tests {
         let gateway = production_gateway(config)
             .await
             .expect("gateway should initialize");
-        let request_body = AccountedBody::read_request(
-            Body::empty(),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        )
-        .await
-        .expect("request body should be accounted");
-        let mut response_account =
-            ResponseAccount::new(NonZeroU64::new(1_024).expect("limit should be non-zero"));
+        let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
+            .await
+            .expect("request body should be accounted");
+        let mut response_account = ResponseAccount::new(response_body_limit(1_024));
         response_account
             .add_chunk(b"hello")
             .expect("response chunk should be accounted");

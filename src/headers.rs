@@ -1,8 +1,8 @@
 //! Header filtering and redaction.
 
+use crate::config::{RequestHeaderBytes, ResponseHeaderBytes};
 use ::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
 use ::http::{HeaderMap, HeaderName};
-use core::num::NonZeroUsize;
 use std::collections::HashSet;
 use thiserror::Error;
 
@@ -83,11 +83,8 @@ fn connection_header_names(headers: &HeaderMap) -> Result<HashSet<HeaderName>, H
 }
 
 /// Enforces the configured aggregate header byte limit.
-fn enforce_header_limit(
-    headers: &HeaderMap,
-    max_header_bytes: NonZeroUsize,
-) -> Result<(), HeaderError> {
-    let max = max_header_bytes.get();
+fn enforce_header_limit(headers: &HeaderMap, max_header_bytes: usize) -> Result<(), HeaderError> {
+    let max = max_header_bytes;
     let mut bytes = 0_usize;
     for (name, value) in headers {
         bytes = add_header_bytes(bytes, name.as_str().len(), max)?;
@@ -125,9 +122,9 @@ const fn remaining_header_bytes(bytes: usize, max: usize) -> usize {
 /// `Connection` header contains an invalid token.
 pub(crate) fn forward_request_headers(
     incoming: &HeaderMap,
-    max_header_bytes: NonZeroUsize,
+    max_header_bytes: RequestHeaderBytes,
 ) -> Result<ForwardedRequestHeaders, HeaderError> {
-    enforce_header_limit(incoming, max_header_bytes)?;
+    enforce_header_limit(incoming, max_header_bytes.get())?;
     let connection_headers = connection_header_names(incoming)?;
 
     let mut outgoing = HeaderMap::new();
@@ -148,9 +145,9 @@ pub(crate) fn forward_request_headers(
 /// `Connection` header contains an invalid token.
 pub(crate) fn forward_response_headers(
     incoming: &HeaderMap,
-    max_header_bytes: NonZeroUsize,
+    max_header_bytes: ResponseHeaderBytes,
 ) -> Result<ForwardedResponseHeaders, HeaderError> {
-    enforce_header_limit(incoming, max_header_bytes)?;
+    enforce_header_limit(incoming, max_header_bytes.get())?;
     let connection_headers = connection_header_names(incoming)?;
 
     let mut outgoing = HeaderMap::new();
@@ -206,6 +203,7 @@ fn response_header_is_forwarded(
 )]
 mod tests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
+    use crate::config::{RequestHeaderBytes, ResponseHeaderBytes};
     use ::http::header::{
         AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, PROXY_AUTHORIZATION,
     };
@@ -213,17 +211,24 @@ mod tests {
     use core::num::NonZeroUsize;
     use pretty_assertions::assert_eq;
 
+    /// Builds a request header byte limit for tests.
+    fn request_limit(value: usize) -> RequestHeaderBytes {
+        RequestHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    /// Builds a response header byte limit for tests.
+    fn response_limit(value: usize) -> ResponseHeaderBytes {
+        ResponseHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
     #[test]
     fn request_headers_strip_connection_named_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(CONNECTION, HeaderValue::from_static("X-Trace"));
         headers.insert("x-trace", HeaderValue::from_static("secret"));
 
-        let forwarded = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("headers should fit");
+        let forwarded =
+            forward_request_headers(&headers, request_limit(1024)).expect("headers should fit");
 
         assert_eq!(forwarded.as_header_map().get("x-trace"), None);
     }
@@ -234,11 +239,8 @@ mod tests {
         headers.insert(CONNECTION, HeaderValue::from_static("X-Trace, x-trace"));
         headers.insert("x-trace", HeaderValue::from_static("secret"));
 
-        let forwarded = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("duplicate tokens should be accepted");
+        let forwarded = forward_request_headers(&headers, request_limit(1024))
+            .expect("duplicate tokens should be accepted");
 
         assert_eq!(forwarded.as_header_map().get("x-trace"), None);
     }
@@ -250,11 +252,8 @@ mod tests {
         headers.insert("x-api-key", HeaderValue::from_static("harness-key"));
         headers.insert(COOKIE, HeaderValue::from_static("session=bad"));
 
-        let forwarded = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("headers should fit");
+        let forwarded =
+            forward_request_headers(&headers, request_limit(1024)).expect("headers should fit");
 
         assert_eq!(
             forwarded.as_header_map().get(AUTHORIZATION),
@@ -277,11 +276,8 @@ mod tests {
         headers.insert(PROXY_AUTHORIZATION, HeaderValue::from_static("Basic bad"));
         headers.insert("x-visible", HeaderValue::from_static("ok"));
 
-        let forwarded = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("headers should fit");
+        let forwarded =
+            forward_request_headers(&headers, request_limit(1024)).expect("headers should fit");
 
         assert_eq!(
             forwarded.as_header_map().get("x-visible"),
@@ -296,10 +292,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONNECTION, HeaderValue::from_static("a,,b"));
 
-        let result = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        );
+        let result = forward_request_headers(&headers, request_limit(1024));
         let expected = Err(HeaderError::InvalidConnectionHeader);
 
         assert_eq!(result, expected);
@@ -311,10 +304,7 @@ mod tests {
         let value = HeaderValue::from_bytes(b"\xff").expect("opaque header value should build");
         headers.insert(CONNECTION, value);
 
-        let result = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        );
+        let result = forward_request_headers(&headers, request_limit(1024));
         let expected = Err(HeaderError::InvalidConnectionHeader);
 
         assert_eq!(result, expected);
@@ -326,11 +316,8 @@ mod tests {
         headers.insert("x-wide", HeaderValue::from_static("0123456789"));
 
         // The only header contributes 6 name bytes and 10 value bytes.
-        let forwarded = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(16).expect("literal should be non-zero"),
-        )
-        .expect("headers at the exact limit should fit");
+        let forwarded = forward_request_headers(&headers, request_limit(16))
+            .expect("headers at the exact limit should fit");
 
         assert_eq!(
             forwarded.as_header_map().get("x-wide"),
@@ -343,10 +330,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-wide", HeaderValue::from_static("0123456789"));
 
-        let result = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(1).expect("literal should be non-zero"),
-        );
+        let result = forward_request_headers(&headers, request_limit(1));
         let expected = Err(HeaderError::TooLarge);
 
         assert_eq!(result, expected);
@@ -357,10 +341,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-wide", HeaderValue::from_static("0123456789"));
 
-        let result = forward_request_headers(
-            &headers,
-            NonZeroUsize::new(6).expect("literal should be non-zero"),
-        );
+        let result = forward_request_headers(&headers, request_limit(6));
         let expected = Err(HeaderError::TooLarge);
 
         assert_eq!(result, expected);
@@ -371,10 +352,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(CONNECTION, HeaderValue::from_static("x trace"));
 
-        let result = forward_response_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        );
+        let result = forward_response_headers(&headers, response_limit(1024));
         let expected = Err(HeaderError::InvalidConnectionHeader);
 
         assert_eq!(result, expected);
@@ -387,11 +365,8 @@ mod tests {
         headers.insert("x-trace", HeaderValue::from_static("secret"));
         headers.insert("x-visible", HeaderValue::from_static("ok"));
 
-        let forwarded = forward_response_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("headers should fit");
+        let forwarded =
+            forward_response_headers(&headers, response_limit(1024)).expect("headers should fit");
         let expected = Some(&HeaderValue::from_static("ok"));
 
         assert_eq!(forwarded.as_header_map().get("x-trace"), None);
@@ -404,11 +379,8 @@ mod tests {
         headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
         headers.insert("x-visible", HeaderValue::from_static("ok"));
 
-        let forwarded = forward_response_headers(
-            &headers,
-            NonZeroUsize::new(1024).expect("literal should be non-zero"),
-        )
-        .expect("headers should fit");
+        let forwarded =
+            forward_response_headers(&headers, response_limit(1024)).expect("headers should fit");
 
         assert_eq!(forwarded.as_header_map().get(CONTENT_LENGTH), None);
         assert_eq!(
@@ -426,6 +398,7 @@ mod tests {
 )]
 mod proptests {
     use super::{HeaderError, forward_request_headers, forward_response_headers};
+    use crate::config::{RequestHeaderBytes, ResponseHeaderBytes};
     use ::http::header::{CONNECTION, CONTENT_LENGTH, HOST};
     use ::http::{HeaderMap, HeaderName, HeaderValue};
     use core::num::NonZeroUsize;
@@ -502,9 +475,24 @@ mod proptests {
         incoming
     }
 
-    /// A roomy header byte limit for filters that should not hit the bound.
-    fn roomy_limit() -> NonZeroUsize {
-        NonZeroUsize::new(0x8000).expect("limit should be non-zero")
+    /// Builds a request header byte limit for generated tests.
+    fn request_limit(value: usize) -> RequestHeaderBytes {
+        RequestHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    /// Builds a response header byte limit for generated tests.
+    fn response_limit(value: usize) -> ResponseHeaderBytes {
+        ResponseHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    /// A roomy request header byte limit for filters that should not hit the bound.
+    fn roomy_request_limit() -> RequestHeaderBytes {
+        request_limit(0x8000)
+    }
+
+    /// A roomy response header byte limit for filters that should not hit the bound.
+    fn roomy_response_limit() -> ResponseHeaderBytes {
+        response_limit(0x8000)
     }
 
     proptest! {
@@ -522,7 +510,7 @@ mod proptests {
                 host.as_deref(),
             );
 
-            let forwarded = forward_request_headers(&incoming, roomy_limit())
+            let forwarded = forward_request_headers(&incoming, roomy_request_limit())
                 .expect("generated headers should fit");
 
             prop_assert!(forwarded.as_header_map().get(HOST).is_none());
@@ -558,7 +546,7 @@ mod proptests {
                 host.as_deref(),
             );
 
-            let forwarded = forward_response_headers(&incoming, roomy_limit())
+            let forwarded = forward_response_headers(&incoming, roomy_response_limit())
                 .expect("generated headers should fit");
 
             prop_assert_eq!(forwarded.as_header_map().get(HOST), incoming.get(HOST));
@@ -603,7 +591,7 @@ mod proptests {
             )
             .expect("generated names have at least three bytes");
 
-            let result = forward_request_headers(&incoming, limit);
+            let result = forward_request_headers(&incoming, RequestHeaderBytes::for_test(limit));
 
             prop_assert_eq!(result, Err(HeaderError::TooLarge));
         }
@@ -618,7 +606,7 @@ mod proptests {
                 HeaderValue::from_str(&connection_value).expect("generated values are valid"),
             );
 
-            let result = forward_request_headers(&incoming, roomy_limit());
+            let result = forward_request_headers(&incoming, roomy_request_limit());
 
             prop_assert_eq!(result, Err(HeaderError::InvalidConnectionHeader));
         }

@@ -366,7 +366,7 @@ mod proptests {
     use super::{UpstreamDeadline, UpstreamRequest};
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
-    use crate::config::{GatewayConfig, UpstreamOrigin};
+    use crate::config::{GatewayConfig, RequestBodyBytes, RequestHeaderBytes, UpstreamOrigin};
     use crate::headers::forward_request_headers;
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
@@ -375,6 +375,14 @@ mod proptests {
     use std::path::PathBuf;
     use tokio::runtime::Runtime;
 
+    fn request_body_limit(value: usize) -> RequestBodyBytes {
+        RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    fn request_header_limit(value: usize) -> RequestHeaderBytes {
+        RequestHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
     proptest! {
         #[test]
         fn from_target_preserves_accepted_target(query in prop::option::of("[a-z0-9=&]{0,16}")) {
@@ -382,7 +390,7 @@ mod proptests {
                 .expect("runtime should build");
             let body = runtime.block_on(AccountedBody::read_request(
                 Body::from("payload"),
-                NonZeroUsize::new(16).expect("limit should be non-zero"),
+                request_body_limit(16),
             ))
                 .expect("request body should be accounted");
             let origin = UpstreamOrigin::parse("https://api.openai.com")
@@ -397,7 +405,7 @@ mod proptests {
                 .expect("target should be allowed");
             let headers = forward_request_headers(
                 &HeaderMap::new(),
-                NonZeroUsize::new(1024).expect("limit should be non-zero"),
+                request_header_limit(1024),
             )
                 .expect("headers should be forwarded");
 

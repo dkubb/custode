@@ -342,7 +342,7 @@ mod tests {
         AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId, RunToken,
     };
     use crate::body::{AccountedBody, ResponseAccount};
-    use crate::config::GatewayConfig;
+    use crate::config::{GatewayConfig, RequestBodyBytes};
     use ::http::{Method, StatusCode};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
@@ -391,12 +391,14 @@ mod tests {
 
     /// Reads a request body for audit input construction.
     async fn accounted_body(body: Body) -> AccountedBody {
-        AccountedBody::read_request(
-            body,
-            NonZeroUsize::new(1_024).expect("limit should be non-zero"),
-        )
-        .await
-        .expect("request body should be accounted")
+        AccountedBody::read_request(body, request_body_limit(1_024))
+            .await
+            .expect("request body should be accounted")
+    }
+
+    /// Builds a request body byte limit for tests.
+    fn request_body_limit(value: usize) -> RequestBodyBytes {
+        RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
     }
 
     /// Builds an allowlist witness for response audit tests.

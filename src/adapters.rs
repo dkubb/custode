@@ -208,7 +208,9 @@ mod tests {
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
     use crate::body::AccountedBody;
-    use crate::config::{GatewayConfig, RequestTimeout, UpstreamOrigin};
+    use crate::config::{
+        GatewayConfig, RequestBodyBytes, RequestHeaderBytes, RequestTimeout, UpstreamOrigin,
+    };
     use crate::headers::forward_request_headers;
     use crate::ports::{
         Clock as _, RequestIdError, RequestIdSource as _, UpstreamClient as _, UpstreamDeadline,
@@ -243,6 +245,14 @@ mod tests {
         }
     }
 
+    fn request_body_limit(value: usize) -> RequestBodyBytes {
+        RequestBodyBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    fn request_header_limit(value: usize) -> RequestHeaderBytes {
+        RequestHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
     async fn empty_upstream_request(origin_text: &str, timeout: RequestTimeout) -> UpstreamRequest {
         let origin = UpstreamOrigin::parse(origin_text).expect("test origin should parse");
         let config =
@@ -250,17 +260,11 @@ mod tests {
         let accepted_target = AcceptedTarget::new("/v1/models", None).expect("target should parse");
         let allowed_target =
             allow_target(&config, &Method::GET, accepted_target).expect("target should be allowed");
-        let headers = forward_request_headers(
-            &HeaderMap::new(),
-            NonZeroUsize::new(1024).expect("limit should be non-zero"),
-        )
-        .expect("headers should be forwarded");
-        let request_body = AccountedBody::read_request(
-            Body::empty(),
-            NonZeroUsize::new(1).expect("limit should be non-zero"),
-        )
-        .await
-        .expect("request body should be accounted");
+        let headers = forward_request_headers(&HeaderMap::new(), request_header_limit(1024))
+            .expect("headers should be forwarded");
+        let request_body = AccountedBody::read_request(Body::empty(), request_body_limit(1))
+            .await
+            .expect("request body should be accounted");
         UpstreamRequest::from_target(
             &origin,
             &allowed_target,

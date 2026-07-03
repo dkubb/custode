@@ -43,27 +43,27 @@ pub(crate) struct AllowedOperation {
 
 /// Parsed maximum serialized audit event bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AuditEventBytes(NonZeroUsize);
+pub(crate) struct AuditEventBytes(NonZeroUsize);
 
 /// Parsed maximum concurrent gateway requests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ConcurrentRequests(NonZeroUsize);
+pub(crate) struct ConcurrentRequests(NonZeroUsize);
 
 /// Parsed maximum incoming request body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RequestBodyBytes(NonZeroUsize);
+pub(crate) struct RequestBodyBytes(NonZeroUsize);
 
 /// Parsed maximum incoming request header bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RequestHeaderBytes(NonZeroUsize);
+pub(crate) struct RequestHeaderBytes(NonZeroUsize);
 
 /// Parsed maximum upstream response body bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResponseBodyBytes(NonZeroU64);
+pub(crate) struct ResponseBodyBytes(NonZeroU64);
 
 /// Parsed maximum upstream response header bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ResponseHeaderBytes(NonZeroUsize);
+pub(crate) struct ResponseHeaderBytes(NonZeroUsize);
 
 /// A configured allowed path.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -414,13 +414,13 @@ impl AllowedPath {
 impl AuditEventBytes {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroUsize) -> Self {
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
-    const fn get(self) -> NonZeroUsize {
-        self.0
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
     }
 
     /// Parses and bounds audit event bytes.
@@ -432,13 +432,13 @@ impl AuditEventBytes {
 impl ConcurrentRequests {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroUsize) -> Self {
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero request limit.
-    const fn get(self) -> NonZeroUsize {
-        self.0
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
     }
 
     /// Parses and bounds concurrent requests.
@@ -450,13 +450,13 @@ impl ConcurrentRequests {
 impl RequestBodyBytes {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroUsize) -> Self {
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
-    const fn get(self) -> NonZeroUsize {
-        self.0
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
     }
 
     /// Parses and bounds request body bytes.
@@ -468,13 +468,13 @@ impl RequestBodyBytes {
 impl RequestHeaderBytes {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroUsize) -> Self {
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
-    const fn get(self) -> NonZeroUsize {
-        self.0
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
     }
 
     /// Parses and bounds request header bytes.
@@ -486,13 +486,13 @@ impl RequestHeaderBytes {
 impl ResponseBodyBytes {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroU64) -> Self {
+    pub(crate) const fn for_test(value: NonZeroU64) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
-    const fn get(self) -> NonZeroU64 {
-        self.0
+    pub(crate) const fn get(self) -> u64 {
+        self.0.get()
     }
 
     /// Parses and bounds response body bytes.
@@ -504,13 +504,13 @@ impl ResponseBodyBytes {
 impl ResponseHeaderBytes {
     /// Wraps a test limit that was already proven non-zero.
     #[cfg(test)]
-    const fn for_test(value: NonZeroUsize) -> Self {
+    pub(crate) const fn for_test(value: NonZeroUsize) -> Self {
         Self(value)
     }
 
     /// Returns the parsed non-zero byte limit.
-    const fn get(self) -> NonZeroUsize {
-        self.0
+    pub(crate) const fn get(self) -> usize {
+        self.0.get()
     }
 
     /// Parses and bounds response header bytes.
@@ -635,38 +635,38 @@ impl GatewayConfig {
     /// Returns the maximum serialized audit event bytes, including the NDJSON
     /// newline.
     #[must_use]
-    pub(crate) const fn max_audit_event_bytes(&self) -> NonZeroUsize {
-        self.max_audit_event_bytes.get()
+    pub(crate) const fn max_audit_event_bytes(&self) -> AuditEventBytes {
+        self.max_audit_event_bytes
     }
 
     /// Returns the maximum concurrent requests.
     #[must_use]
-    pub(crate) const fn max_concurrent_requests(&self) -> NonZeroUsize {
-        self.max_concurrent_requests.get()
+    pub(crate) const fn max_concurrent_requests(&self) -> ConcurrentRequests {
+        self.max_concurrent_requests
     }
 
     /// Returns the maximum incoming request body bytes.
     #[must_use]
-    pub(crate) const fn max_request_bytes(&self) -> NonZeroUsize {
-        self.max_request_bytes.get()
+    pub(crate) const fn max_request_bytes(&self) -> RequestBodyBytes {
+        self.max_request_bytes
     }
 
     /// Returns the maximum incoming request header bytes.
     #[must_use]
-    pub(crate) const fn max_request_header_bytes(&self) -> NonZeroUsize {
-        self.max_request_header_bytes.get()
+    pub(crate) const fn max_request_header_bytes(&self) -> RequestHeaderBytes {
+        self.max_request_header_bytes
     }
 
     /// Returns the maximum upstream response body bytes.
     #[must_use]
-    pub(crate) const fn max_response_bytes(&self) -> NonZeroU64 {
-        self.max_response_bytes.get()
+    pub(crate) const fn max_response_bytes(&self) -> ResponseBodyBytes {
+        self.max_response_bytes
     }
 
     /// Returns the maximum upstream response header bytes.
     #[must_use]
-    pub(crate) const fn max_response_header_bytes(&self) -> NonZeroUsize {
-        self.max_response_header_bytes.get()
+    pub(crate) const fn max_response_header_bytes(&self) -> ResponseHeaderBytes {
+        self.max_response_header_bytes
     }
 
     /// Returns the upstream request timeout.
