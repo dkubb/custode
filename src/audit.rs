@@ -1311,8 +1311,8 @@ mod tests {
 mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
-        AuditRequestInput, AuditResponseError, AuditTarget, AuditUpstreamError,
-        AuditUpstreamTarget, ObservedBodySummary, RequestId,
+        AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
+        AuditUpstreamError, AuditUpstreamTarget, ObservedBodySummary, RequestId,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::BodyDigest;
@@ -1376,6 +1376,14 @@ mod proptests {
         }
     }
 
+    /// Returns one closed response-header error from a generated index.
+    const fn response_header_error(index: u8) -> AuditResponseHeaderError {
+        match index {
+            0 => AuditResponseHeaderError::InvalidConnectionHeader,
+            _ => AuditResponseHeaderError::TooLarge,
+        }
+    }
+
     /// Returns one closed upstream error from a generated index.
     const fn upstream_error(index: u8) -> AuditUpstreamError {
         match index {
@@ -1412,6 +1420,7 @@ mod proptests {
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
             denial_kind in 0_u8..12,
+            response_error_kind in 0_u8..5,
             upstream_error_kind in 0_u8..3,
             method in "[A-Z]{3,8}",
             path in raw_path(),
@@ -1461,14 +1470,43 @@ mod proptests {
                     )
                 }
                 2 => {
-                    let error =
-                        AuditResponseError::downstream_closed(observed_response_body, status);
+                    let (error, expected_body) = match response_error_kind {
+                        0 => (
+                            AuditResponseError::downstream_closed(
+                                observed_response_body,
+                                status,
+                            ),
+                            body_value(response_bytes, &response_digest),
+                        ),
+                        1 => (
+                            AuditResponseError::response_body_too_large(
+                                observed_response_body,
+                                status,
+                            ),
+                            body_value(response_bytes, &response_digest),
+                        ),
+                        2 => (
+                            AuditResponseError::response_header(response_header_error(0)),
+                            not_observed_body_value(),
+                        ),
+                        3 => (
+                            AuditResponseError::response_header(response_header_error(1)),
+                            not_observed_body_value(),
+                        ),
+                        _ => (
+                            AuditResponseError::upstream_response_stream_failed(
+                                observed_response_body,
+                                status,
+                            ),
+                            body_value(response_bytes, &response_digest),
+                        ),
+                    };
                     let (expected_error, _, expected_status) = error.into_parts();
                     (
                         AuditOutcome::response_error(error, upstream),
                         "response_error",
                         Some(expected_error),
-                        body_value(response_bytes, &response_digest),
+                        expected_body,
                         expected_status.as_u16(),
                         Some((upstream_path.as_str(), upstream_query.as_deref())),
                     )
