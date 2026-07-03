@@ -1,5 +1,35 @@
 [alias]
-clippy-all = ["clippy", "--all-features", "--all-targets", "--tests", "--workspace"]
+clippy-all = ["clippy", "--all-features", "--all-targets", "--tests", "--workspace", "--quiet"]
+coverage = [
+  "llvm-cov",
+  "test",
+  "--lib",
+  "--all-features",
+  "--branch",
+  "--json",
+  "--summary-only",
+  "--output-path",
+  "target/coverage/unit.json",
+  "--fail-uncovered-lines",
+  "0",
+  "--fail-uncovered-regions",
+  "0",
+  "--fail-uncovered-functions",
+  "0",
+]
+coverage-proptests = [
+  "llvm-cov",
+  "test",
+  "--lib",
+  "--all-features",
+  "--branch",
+  "--json",
+  "--summary-only",
+  "--output-path",
+  "target/coverage/proptests.json",
+  "--",
+  "proptests",
+]
 deny-check = ["deny", "check"]
 fmt-all = ["fmt", "--all"]
 fmt-check-all = ["fmt", "--all", "--check"]

@@ -12,7 +12,7 @@ fmt-check:
     cargo fmt-check-all
 
 lint:
-    cargo clippy-all --quiet
+    cargo clippy-all
 
 test:
     cargo test-workspace
@@ -33,7 +33,11 @@ docker-test:
     scripts/container-test.sh
 
 coverage:
-    cargo llvm-cov --workspace --all-features --summary-only
+    cargo coverage
+    scripts/check-coverage-summary.sh target/coverage/unit.json
+
+coverage-proptests:
+    cargo coverage-proptests
 
 mutants:
     cargo mutants-all

@@ -20,139 +20,139 @@ test_number=0
 failed=0
 
 cleanup() {
-  docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+	docker compose down --volumes --remove-orphans >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
 cleanup_static_artifacts() {
-  local container_id="${1}"
-  local binary_dir="${2}"
+	local container_id="${1}"
+	local binary_dir="${2}"
 
-  if [[ -n "${container_id}" ]]; then
-    docker rm "${container_id}" >/dev/null 2>&1 || true
-  fi
+	if [[ -n "${container_id}" ]]; then
+		docker rm "${container_id}" >/dev/null 2>&1 || true
+	fi
 
-  if [[ -n "${binary_dir}" ]]; then
-    rm -rf "${binary_dir}"
-  fi
+	if [[ -n "${binary_dir}" ]]; then
+		rm -rf "${binary_dir}"
+	fi
 }
 
 static_linkage() {
-  local container_id=""
-  local binary_dir=""
-  local linkage
+	local container_id=""
+	local binary_dir=""
+	local linkage
 
-  if ! container_id=$(docker create custode-proxy:local); then
-    return 1
-  fi
+	if ! container_id=$(docker create custode-proxy:local); then
+		return 1
+	fi
 
-  if ! binary_dir=$(mktemp -d); then
-    cleanup_static_artifacts "${container_id}" "${binary_dir}"
-    return 1
-  fi
+	if ! binary_dir=$(mktemp -d); then
+		cleanup_static_artifacts "${container_id}" "${binary_dir}"
+		return 1
+	fi
 
-  if ! docker cp "${container_id}:/custode-proxy" "${binary_dir}/custode-proxy"; then
-    cleanup_static_artifacts "${container_id}" "${binary_dir}"
-    return 1
-  fi
+	if ! docker cp "${container_id}:/custode-proxy" "${binary_dir}/custode-proxy"; then
+		cleanup_static_artifacts "${container_id}" "${binary_dir}"
+		return 1
+	fi
 
-  if ! docker rm "${container_id}" >/dev/null; then
-    cleanup_static_artifacts "${container_id}" "${binary_dir}"
-    return 1
-  fi
-  container_id=""
+	if ! docker rm "${container_id}" >/dev/null; then
+		cleanup_static_artifacts "${container_id}" "${binary_dir}"
+		return 1
+	fi
+	container_id=""
 
-  if ! linkage=$(file "${binary_dir}/custode-proxy"); then
-    cleanup_static_artifacts "${container_id}" "${binary_dir}"
-    return 1
-  fi
-  printf '%s\n' "${linkage}"
+	if ! linkage=$(file "${binary_dir}/custode-proxy"); then
+		cleanup_static_artifacts "${container_id}" "${binary_dir}"
+		return 1
+	fi
+	printf '%s\n' "${linkage}"
 
-  if ! grep -E "static-pie linked|statically linked" <<<"${linkage}" >/dev/null; then
-    cleanup_static_artifacts "${container_id}" "${binary_dir}"
-    return 1
-  fi
+	if ! grep -E "static-pie linked|statically linked" <<<"${linkage}" >/dev/null; then
+		cleanup_static_artifacts "${container_id}" "${binary_dir}"
+		return 1
+	fi
 
-  cleanup_static_artifacts "${container_id}" "${binary_dir}"
+	cleanup_static_artifacts "${container_id}" "${binary_dir}"
 }
 
 proxy_publishes_no_ports() {
-  local container_id
-  local published
+	local container_id
+	local published
 
-  if ! container_id=$(docker compose ps --quiet proxy); then
-    return 1
-  fi
+	if ! container_id=$(docker compose ps --quiet proxy); then
+		return 1
+	fi
 
-  if [[ -z "${container_id}" ]]; then
-    printf "proxy container was not found\n" >&2
-    return 1
-  fi
+	if [[ -z "${container_id}" ]]; then
+		printf "proxy container was not found\n" >&2
+		return 1
+	fi
 
-  if ! published=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{$port}} {{end}}{{end}}' "${container_id}"); then
-    return 1
-  fi
+	if ! published=$(docker inspect --format '{{range $port, $bindings := .NetworkSettings.Ports}}{{if $bindings}}{{$port}} {{end}}{{end}}' "${container_id}"); then
+		return 1
+	fi
 
-  if [[ -n "${published}" ]]; then
-    printf "proxy publishes host ports: %s\n" "${published}" >&2
-    return 1
-  fi
+	if [[ -n "${published}" ]]; then
+		printf "proxy publishes host ports: %s\n" "${published}" >&2
+		return 1
+	fi
 }
 
 harness_cannot_reach_external() {
-  if docker compose exec -T harness curl --silent --max-time 5 https://example.com >/dev/null 2>&1; then
-    printf "harness reached an external URL directly\n" >&2
-    return 1
-  fi
+	if docker compose exec -T harness curl --silent --max-time 5 https://example.com >/dev/null 2>&1; then
+		printf "harness reached an external URL directly\n" >&2
+		return 1
+	fi
 }
 
 harness_reaches_gateway() {
-  local status
+	local status
 
-  if ! status=$(docker compose exec -T harness curl --silent --output /dev/null \
-    --write-out '%{http_code}' --max-time 5 http://proxy:8080/denied); then
-    return 1
-  fi
+	if ! status=$(docker compose exec -T harness curl --silent --output /dev/null \
+		--write-out '%{http_code}' --max-time 5 http://proxy:8080/denied); then
+		return 1
+	fi
 
-  case "${status}" in
-    400 | 403 | 405) ;;
-    *)
-      printf "unexpected gateway status %s\n" "${status}" >&2
-      return 1
-      ;;
-  esac
+	case "${status}" in
+	400 | 403 | 405) ;;
+	*)
+		printf "unexpected gateway status %s\n" "${status}" >&2
+		return 1
+		;;
+	esac
 }
 
 tap_diag() {
-  local line
+	local line
 
-  if [[ -z "${1}" ]]; then
-    return 0
-  fi
+	if [[ -z "${1}" ]]; then
+		return 0
+	fi
 
-  while IFS= read -r line; do
-    printf '# %s\n' "${line}"
-  done <<<"${1}"
+	while IFS= read -r line; do
+		printf '# %s\n' "${line}"
+	done <<<"${1}"
 }
 
 run_test() {
-  local name="${1}"
-  local output
-  local status
+	local name="${1}"
+	local output
+	local status
 
-  shift
-  test_number=$((test_number + 1))
+	shift
+	test_number=$((test_number + 1))
 
-  if output="$("$@" 2>&1)"; then
-    printf 'ok %d - %s\n' "${test_number}" "${name}"
-    return 0
-  fi
+	if output="$("$@" 2>&1)"; then
+		printf 'ok %d - %s\n' "${test_number}" "${name}"
+		return 0
+	fi
 
-  status="${?}"
-  printf 'not ok %d - %s\n' "${test_number}" "${name}"
-  printf '# exit status: %d\n' "${status}"
-  tap_diag "${output}"
-  failed=1
+	status="${?}"
+	printf 'not ok %d - %s\n' "${test_number}" "${name}"
+	printf '# exit status: %d\n' "${status}"
+	tap_diag "${output}"
+	failed=1
 }
 
 printf 'TAP version 13\n'
@@ -171,5 +171,5 @@ run_test "harness cannot reach an external URL directly" harness_cannot_reach_ex
 run_test "harness reaches the gateway on the internal network" harness_reaches_gateway
 
 if [[ "${failed}" -ne 0 ]]; then
-  exit 1
+	exit 1
 fi
