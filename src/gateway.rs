@@ -67,8 +67,8 @@ pub(crate) struct ResponseAuditInput {
 pub(crate) enum ResponseAuditOutcome {
     /// Request was allowed and completed normally.
     Allowed {
-        /// Accounted response body.
-        response_account: ResponseAccount,
+        /// Response body summary.
+        response_body: AuditBodySummary,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -77,8 +77,8 @@ pub(crate) enum ResponseAuditOutcome {
     ResponseError {
         /// Stable error class.
         error_class: String,
-        /// Accounted response body.
-        response_account: ResponseAccount,
+        /// Response body summary.
+        response_body: AuditBodySummary,
         /// Response status returned to the harness.
         status: u16,
     },
@@ -95,9 +95,9 @@ pub(crate) enum ResponseAuditOutcome {
 impl ResponseAuditOutcome {
     /// Creates an allowed response outcome.
     #[must_use]
-    pub(crate) const fn allowed(response_account: ResponseAccount, status: u16) -> Self {
+    pub(crate) fn allowed(response_account: &ResponseAccount, status: u16) -> Self {
         Self::Allowed {
-            response_account,
+            response_body: response_body_summary(response_account),
             status,
         }
     }
@@ -106,12 +106,22 @@ impl ResponseAuditOutcome {
     #[must_use]
     pub(crate) fn response_error(
         error_class: impl Into<String>,
-        response_account: ResponseAccount,
+        response_account: &ResponseAccount,
         status: u16,
     ) -> Self {
         Self::ResponseError {
             error_class: error_class.into(),
-            response_account,
+            response_body: response_body_summary(response_account),
+            status,
+        }
+    }
+
+    /// Creates a response-error outcome before response body bytes were observed.
+    #[must_use]
+    pub(crate) fn response_error_without_body(error_class: impl Into<String>, status: u16) -> Self {
+        Self::ResponseError {
+            error_class: error_class.into(),
+            response_body: AuditBodySummary::not_observed(),
             status,
         }
     }
@@ -142,7 +152,7 @@ impl Gateway {
         status: u16,
     ) -> Result<(), GatewayError> {
         let request_summary =
-            request_body.map_or_else(AuditBodySummary::empty, request_body_summary);
+            request_body.map_or_else(AuditBodySummary::not_observed, request_body_summary);
         let request = AuditRequestInput::new(
             method.to_string(),
             target,
@@ -168,19 +178,14 @@ impl Gateway {
         let upstream = AuditUpstreamTarget::from(&input.target);
         let outcome = match input.outcome {
             ResponseAuditOutcome::Allowed {
-                response_account,
+                response_body,
                 status,
-            } => AuditOutcome::allowed(response_body_summary(&response_account), status, upstream),
+            } => AuditOutcome::allowed(response_body, status, upstream),
             ResponseAuditOutcome::ResponseError {
                 error_class,
-                response_account,
+                response_body,
                 status,
-            } => AuditOutcome::response_error(
-                error_class,
-                response_body_summary(&response_account),
-                status,
-                upstream,
-            ),
+            } => AuditOutcome::response_error(error_class, response_body, status, upstream),
             ResponseAuditOutcome::UpstreamError {
                 error_class,
                 status,
@@ -359,9 +364,37 @@ mod tests {
         assert_eq!(event["path"], "/");
         assert_eq!(event["status"], 405_u16);
         assert_eq!(event["request_bytes"], 0_u64);
+        assert_eq!(event["request_body_observed"], false);
         assert!(
             event["request_body_blake3"].is_null(),
-            "denials without a body should have no request digest"
+            "denials before body observation should have no request digest"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_denial_records_observed_empty_request_bodies() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let gateway = runtime_gateway(directory.path()).await;
+        let request_body = accounted_body(Body::empty()).await;
+
+        gateway
+            .audit_denial(
+                RequestId::from_parts("run", 1),
+                &Method::DELETE,
+                AuditTarget::from_uri_parts("/v1/models", None),
+                Some(&request_body),
+                "method_denied",
+                403,
+            )
+            .await
+            .expect("denial audit should be written");
+
+        let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["request_body_observed"], true);
+        assert_eq!(event["request_bytes"], 0_u64);
+        assert!(
+            event["request_body_blake3"].is_null(),
+            "observed empty bodies should have no request digest"
         );
     }
 
@@ -384,6 +417,7 @@ mod tests {
             .expect("denial audit should be written");
 
         let event = &single_audit_event(directory.path()).await;
+        assert_eq!(event["request_body_observed"], true);
         assert_eq!(event["request_bytes"], 5_u64);
         assert!(
             event["request_body_blake3"].is_string(),
@@ -402,7 +436,7 @@ mod tests {
             .expect("response chunk should be accounted");
         let input = ResponseAuditInput {
             method: "GET".to_owned(),
-            outcome: ResponseAuditOutcome::allowed(response_account, 200),
+            outcome: ResponseAuditOutcome::allowed(&response_account, 200),
             request_body,
             request_id: RequestId::from_parts("run", 1),
             target: AcceptedTarget::new("/v1/models", Some("limit=1"))
@@ -420,6 +454,8 @@ mod tests {
         assert_eq!(event["response_bytes"], 5_u64);
         assert_eq!(event["upstream_path"], "/v1/models");
         assert_eq!(event["upstream_query"], "limit=1");
+        assert_eq!(event["request_body_observed"], true);
+        assert_eq!(event["response_body_observed"], true);
         assert!(
             event["response_body_blake3"].is_string(),
             "completed responses should record a body digest"

@@ -286,10 +286,12 @@ Each audit event MUST include:
 - upstream path and query when an upstream request is attempted, where the
   upstream query MUST equal the accepted incoming query;
 - response status when one exists;
+- whether request body bytes were observed;
 - request byte count;
+- whether response body bytes were observed;
 - response byte count;
-- request body digest when a request body exists;
-- response body digest when a response body exists;
+- request body digest when an observed request body is non-empty;
+- response body digest when an observed response body is non-empty;
 - error class when a request fails before normal completion.
 
 Audit events MUST be newline-delimited JSON.

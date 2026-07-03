@@ -549,7 +549,9 @@ mod tests {
         assert_eq!(event["decision"], "allowed");
         assert_eq!(event["upstream_path"], "/v1/models");
         assert_eq!(event["status"], 200_u64);
-        assert_eq!(event["version"], 1_u64);
+        assert_eq!(event["request_body_observed"], true);
+        assert_eq!(event["response_body_observed"], true);
+        assert_eq!(event["version"], 2_u64);
     }
 
     #[tokio::test]

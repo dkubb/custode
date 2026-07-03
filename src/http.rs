@@ -115,10 +115,10 @@ impl ResponseAuditContext {
         } = self;
         let audit_outcome = match stream_outcome {
             ResponseStreamOutcome::Allowed => {
-                ResponseAuditOutcome::allowed(response_account, status)
+                ResponseAuditOutcome::allowed(&response_account, status)
             }
             ResponseStreamOutcome::ResponseError { error_class } => {
-                ResponseAuditOutcome::response_error(error_class, response_account, status)
+                ResponseAuditOutcome::response_error(error_class, &response_account, status)
             }
         };
         let input = ResponseAuditInput {
@@ -378,9 +378,8 @@ async fn forward_request(
         Err(error) => {
             let input = ResponseAuditInput {
                 method: method.to_string(),
-                outcome: ResponseAuditOutcome::response_error(
+                outcome: ResponseAuditOutcome::response_error_without_body(
                     response_header_error_class(error),
-                    ResponseAccount::new(gateway.config().max_response_bytes()),
                     StatusCode::BAD_GATEWAY.as_u16(),
                 ),
                 request_body,
@@ -688,16 +687,18 @@ mod tests {
         use tokio::runtime::Builder;
 
         /// Serialized audit event field names.
-        const AUDIT_FIELDS: [&str; 16] = [
+        const AUDIT_FIELDS: [&str; 18] = [
             "decision",
             "error_class",
             "method",
             "path",
             "query",
             "request_body_blake3",
+            "request_body_observed",
             "request_bytes",
             "request_id",
             "response_body_blake3",
+            "response_body_observed",
             "response_bytes",
             "status",
             "timestamp",
@@ -745,7 +746,7 @@ mod tests {
         /// Returns the expected audit decision tuple for a recording scenario.
         fn expected_audit_outcome(
             scenario: &Scenario,
-        ) -> (&'static str, Value, StatusCode, u64, Value, bool) {
+        ) -> (&'static str, Value, StatusCode, u64, Value, bool, bool) {
             match (scenario.admission(), scenario.bounds(), scenario.upstream()) {
                 (ScenarioAdmission::Saturated, _, _) => (
                     "denied",
@@ -754,6 +755,7 @@ mod tests {
                     0,
                     Value::Null,
                     false,
+                    false,
                 ),
                 (ScenarioAdmission::Open, _, ScenarioUpstream::Timeout) => (
                     "upstream_error",
@@ -761,6 +763,7 @@ mod tests {
                     StatusCode::GATEWAY_TIMEOUT,
                     0,
                     Value::Null,
+                    false,
                     true,
                 ),
                 (ScenarioAdmission::Open, ScenarioBounds::TinyResponse, _) => (
@@ -769,6 +772,7 @@ mod tests {
                     StatusCode::CREATED,
                     0,
                     Value::Null,
+                    true,
                     true,
                 ),
                 (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::StreamError) => {
@@ -779,6 +783,7 @@ mod tests {
                         5,
                         body_digest_value(b"first"),
                         true,
+                        true,
                     )
                 }
                 (ScenarioAdmission::Open, ScenarioBounds::Roomy, ScenarioUpstream::Respond) => (
@@ -787,6 +792,7 @@ mod tests {
                     StatusCode::CREATED,
                     8,
                     body_digest_value(b"scripted"),
+                    true,
                     true,
                 ),
             }
@@ -900,6 +906,11 @@ mod tests {
             }
         }
 
+        /// Returns whether the request body was observed for audit purposes.
+        const fn request_body_observed(scenario: &Scenario) -> bool {
+            matches!(scenario.admission(), ScenarioAdmission::Open)
+        }
+
         /// Returns the request path from a generated target.
         fn request_path(target: &str) -> &str {
             target.split_once('?').map_or(target, |(path, _query)| path)
@@ -928,8 +939,15 @@ mod tests {
                 prop_assert!(object.contains_key(field), "missing audit field {field}");
             }
 
-            let (decision, error_class, status, response_bytes, response_digest, has_upstream) =
-                expected_audit_outcome(scenario);
+            let (
+                decision,
+                error_class,
+                status,
+                response_bytes,
+                response_digest,
+                response_body_observed,
+                has_upstream,
+            ) = expected_audit_outcome(scenario);
             let path = request_path(scenario.request().target());
             let query = query_value(scenario.request().target());
             prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
@@ -945,6 +963,10 @@ mod tests {
                 &body_digest_value(request_body_for_audit(scenario))
             );
             prop_assert_eq!(
+                &object["request_body_observed"],
+                &Value::Bool(request_body_observed(scenario))
+            );
+            prop_assert_eq!(
                 &object["request_bytes"],
                 &Value::from(
                     u64::try_from(request_body_for_audit(scenario).len()).map_err(|_error| {
@@ -953,6 +975,10 @@ mod tests {
                 )
             );
             prop_assert_eq!(&object["response_body_blake3"], &response_digest);
+            prop_assert_eq!(
+                &object["response_body_observed"],
+                &Value::Bool(response_body_observed)
+            );
             prop_assert_eq!(&object["response_bytes"], &Value::from(response_bytes));
             prop_assert!(
                 response_bytes <= max_response_bytes(scenario),
@@ -974,7 +1000,7 @@ mod tests {
                 prop_assert_eq!(&object["upstream_path"], &Value::Null);
                 prop_assert_eq!(&object["upstream_query"], &Value::Null);
             }
-            prop_assert_eq!(&object["version"], &Value::from(1_u64));
+            prop_assert_eq!(&object["version"], &Value::from(2_u64));
             Ok(())
         }
 
@@ -1243,6 +1269,7 @@ mod tests {
                 "request_body_blake3".to_owned(),
                 Value::String(blake3::hash(b"hello").to_hex().to_string()),
             ),
+            ("request_body_observed".to_owned(), Value::Bool(true)),
             ("request_bytes".to_owned(), Value::from(5_u64)),
             (
                 "request_id".to_owned(),
@@ -1252,6 +1279,7 @@ mod tests {
                 "response_body_blake3".to_owned(),
                 Value::String(blake3::hash(b"scripted").to_hex().to_string()),
             ),
+            ("response_body_observed".to_owned(), Value::Bool(true)),
             ("response_bytes".to_owned(), Value::from(8_u64)),
             ("status".to_owned(), Value::from(201_u64)),
             (
@@ -1270,7 +1298,7 @@ mod tests {
                 "upstream_query".to_owned(),
                 Value::String("limit=1".to_owned()),
             ),
-            ("version".to_owned(), Value::from(1_u64)),
+            ("version".to_owned(), Value::from(2_u64)),
         ]))
     }
 
@@ -1289,12 +1317,14 @@ mod tests {
             ("path".to_owned(), Value::String("/v1/models".to_owned())),
             ("query".to_owned(), Value::Null),
             ("request_body_blake3".to_owned(), Value::Null),
+            ("request_body_observed".to_owned(), Value::Bool(true)),
             ("request_bytes".to_owned(), Value::from(0_u64)),
             (
                 "request_id".to_owned(),
                 Value::String("req-test-0000000000000001".to_owned()),
             ),
             ("response_body_blake3".to_owned(), Value::Null),
+            ("response_body_observed".to_owned(), Value::Bool(false)),
             ("response_bytes".to_owned(), Value::from(0_u64)),
             ("status".to_owned(), Value::from(504_u64)),
             (
@@ -1310,7 +1340,7 @@ mod tests {
                 Value::String("/v1/models".to_owned()),
             ),
             ("upstream_query".to_owned(), Value::Null),
-            ("version".to_owned(), Value::from(1_u64)),
+            ("version".to_owned(), Value::from(2_u64)),
         ]))
     }
 

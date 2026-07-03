@@ -76,12 +76,16 @@ pub(crate) struct AuditEvent {
     query: Option<String>,
     /// Request body digest.
     request_body_blake3: Option<String>,
+    /// Whether request body bytes were observed.
+    request_body_observed: bool,
     /// Request body bytes.
     request_bytes: u64,
     /// Request identity.
     request_id: RequestId,
     /// Response body digest.
     response_body_blake3: Option<String>,
+    /// Whether response body bytes were observed.
+    response_body_observed: bool,
     /// Response body bytes.
     response_bytes: u64,
     /// Response status returned to the harness, when one exists.
@@ -100,11 +104,20 @@ pub(crate) struct AuditEvent {
 
 /// Body accounting summary recorded in audit events.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct AuditBodySummary {
-    /// Body digest.
-    blake3: Option<String>,
-    /// Body byte count.
-    bytes: u64,
+pub(crate) enum AuditBodySummary {
+    /// Body was observed and empty.
+    Empty,
+
+    /// Body was observed and non-empty.
+    NonEmpty {
+        /// Body digest.
+        blake3: String,
+        /// Body byte count.
+        bytes: NonZeroU64,
+    },
+
+    /// Body bytes were not observed.
+    NotObserved,
 }
 
 /// Input used to construct an audit event.
@@ -215,19 +228,29 @@ impl AuditBodySummary {
     /// Creates an empty body summary.
     #[must_use]
     pub(crate) const fn empty() -> Self {
-        Self {
-            blake3: None,
-            bytes: 0,
+        Self::Empty
+    }
+
+    /// Consumes the summary into serialized audit body fields.
+    #[must_use]
+    fn into_event_fields(self) -> (Option<String>, bool, u64) {
+        match self {
+            Self::Empty => (None, true, 0),
+            Self::NonEmpty { blake3, bytes } => (Some(blake3), true, bytes.get()),
+            Self::NotObserved => (None, false, 0),
         }
     }
 
     /// Creates a non-empty body summary.
     #[must_use]
     pub(crate) const fn non_empty(blake3: String, bytes: NonZeroU64) -> Self {
-        Self {
-            blake3: Some(blake3),
-            bytes: bytes.get(),
-        }
+        Self::NonEmpty { blake3, bytes }
+    }
+
+    /// Creates an unobserved body summary.
+    #[must_use]
+    pub(crate) const fn not_observed() -> Self {
+        Self::NotObserved
     }
 }
 
@@ -405,7 +428,7 @@ impl AuditEvent {
             } => (
                 AuditDecision::Denied,
                 Some(error_class),
-                AuditBodySummary::empty(),
+                AuditBodySummary::not_observed(),
                 Some(status),
                 None,
             ),
@@ -428,7 +451,7 @@ impl AuditEvent {
             } => (
                 AuditDecision::UpstreamError,
                 Some(error_class),
-                AuditBodySummary::empty(),
+                AuditBodySummary::not_observed(),
                 Some(status),
                 Some(upstream),
             ),
@@ -437,6 +460,10 @@ impl AuditEvent {
             Some(upstream_target) => (Some(upstream_target.path), upstream_target.query),
             None => (None, None),
         };
+        let (request_body_blake3, request_body_observed, request_bytes) =
+            request_body.into_event_fields();
+        let (response_body_blake3, response_body_observed, response_bytes) =
+            response_body.into_event_fields();
 
         Self {
             decision,
@@ -444,17 +471,19 @@ impl AuditEvent {
             method,
             path: target.path().to_owned(),
             query: target.query().map(str::to_owned),
-            request_body_blake3: request_body.blake3,
-            request_bytes: request_body.bytes,
+            request_body_blake3,
+            request_body_observed,
+            request_bytes,
             request_id,
-            response_body_blake3: response_body.blake3,
-            response_bytes: response_body.bytes,
+            response_body_blake3,
+            response_body_observed,
+            response_bytes,
             status,
             timestamp,
             upstream_origin,
             upstream_path,
             upstream_query,
-            version: 1,
+            version: 2,
         }
     }
 }
@@ -677,9 +706,11 @@ mod tests {
             "path",
             "query",
             "request_body_blake3",
+            "request_body_observed",
             "request_bytes",
             "request_id",
             "response_body_blake3",
+            "response_body_observed",
             "response_bytes",
             "status",
             "timestamp",
@@ -692,14 +723,16 @@ mod tests {
             assert!(object.contains_key(field), "missing field {field}");
         }
         assert_eq!(object.len(), expected_fields.len());
-        assert_eq!(object["version"], 1_u64);
+        assert_eq!(object["version"], 2_u64);
         assert_eq!(object["decision"], "denied");
         assert_eq!(object["request_id"], "req-run-0000000000000001");
         assert!(object["upstream_path"].is_null());
         assert!(object["upstream_query"].is_null());
         assert!(object["query"].is_null());
         assert!(object["request_body_blake3"].is_null());
+        assert_eq!(object["request_body_observed"], true);
         assert!(object["response_body_blake3"].is_null());
+        assert_eq!(object["response_body_observed"], false);
         assert_eq!(object["status"], 403_u64);
     }
 
@@ -989,7 +1022,7 @@ mod proptests {
                 .expect("event should serialize");
             let object = value.as_object().expect("event should be a JSON object");
 
-            prop_assert_eq!(object.len(), 16);
+            prop_assert_eq!(object.len(), 18);
             prop_assert_eq!(object["decision"].as_str(), Some(decision));
             let expected_path = if path.is_empty() { "/" } else { path.as_str() };
             prop_assert_eq!(object["path"].as_str(), Some(expected_path));
@@ -1006,7 +1039,12 @@ mod proptests {
                 object["request_body_blake3"].as_str(),
                 Some(request_digest.as_str())
             );
+            prop_assert_eq!(object["request_body_observed"].as_bool(), Some(true));
             prop_assert_eq!(object["response_body_blake3"].as_str(), expected_response_digest);
+            prop_assert_eq!(
+                object["response_body_observed"].as_bool(),
+                Some(expected_response_digest.is_some())
+            );
             prop_assert_eq!(object["error_class"].as_str(), expected_error);
             prop_assert_eq!(object["request_bytes"].as_u64(), Some(request_bytes));
             prop_assert_eq!(object["response_bytes"].as_u64(), Some(expected_response_bytes));

@@ -416,7 +416,7 @@ The event schema is:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "timestamp": "2026-07-01T00:00:00.000000000Z",
   "request_id": "req-<run>-<sequence>",
   "decision": "allowed",
@@ -429,6 +429,8 @@ The event schema is:
   "status": 200,
   "request_bytes": 1234,
   "response_bytes": 5678,
+  "request_body_observed": true,
+  "response_body_observed": true,
   "request_body_blake3": "hex...",
   "response_body_blake3": "hex...",
   "error_class": null
@@ -460,8 +462,11 @@ accepted incoming query. `status` is the response status returned to the
 harness. Every decision records one: each closed audit outcome variant
 carries a mandatory status. The serialized `status` field is structurally
 nullable but always populated.
-`request_body_blake3` is null when the request has no body.
-`response_body_blake3` is null when the response has no body.
+`request_body_observed` and `response_body_observed` distinguish bodies the
+gateway observed from bodies it could not summarize. When an observed body is
+empty, the corresponding byte count is zero and the digest is null. When a
+body is not observed, the corresponding byte count is also zero and the digest
+is also null, but the observed flag is false.
 
 An audit write failure cannot be represented as an `audit_error` event in the
 required audit log because the failure mode is the inability to write that log.
@@ -726,7 +731,7 @@ and upstream-outcome classes every run; the property test then randomizes
 request dimensions inside those classes. The oracle asserts invariants over
 each scenario class: response status and stream outcome, fatal-channel
 behavior after response start, upstream request presence, forwarded-header
-safety, response byte bounds, and the 16-field audit event schema and closed
+safety, response byte bounds, and the 18-field audit event schema and closed
 decision set when auditing succeeds. Simulation tests use Tokio's paused
 virtual clock and MUST NOT use wall-clock sleeps; real-time sleeps are confined
 to real-socket tests that exercise Hyper, Reqwest, and integration timing.
