@@ -365,7 +365,8 @@ Configuration parsing is fail-closed:
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at most 256 operations, and each
   operation string MUST be at most 4,160 bytes.
 - Each operation MUST have the form `METHOD:exact:/path` or
-  `METHOD:prefix:/path`.
+  `METHOD:prefix:/path`, where `METHOD` is a valid HTTP token and MUST NOT be
+  `CONNECT`.
 - Every configured path or prefix MUST begin with `/` and MUST NOT contain a
   query delimiter, fragment delimiter, or literal backslash.
 - Every configured prefix MUST be non-root and MUST NOT end with `/`; use an
@@ -726,8 +727,8 @@ initial architecture.
 Unit tests live inline in each source file's `tests` module and cover:
 
 - configuration parsing, including the fail-closed rejections: empty
-  allowlists, unknown operation kinds, invalid methods, wildcard hosts,
-  origin credentials, and zero bounds;
+  allowlists, unknown operation kinds, invalid and unsupported methods,
+  wildcard hosts, origin credentials, and zero bounds;
 - operation allowlist decisions, proving each decision binds one method to one
   exact path or segment-bounded path prefix with no method and path
   cross-product;

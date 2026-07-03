@@ -168,6 +168,13 @@ pub(crate) enum ConfigError {
         value: u128,
     },
 
+    /// Method is outside the gateway protocol.
+    #[error("unsupported HTTP method {method:?}")]
+    UnsupportedMethod {
+        /// Raw method.
+        method: String,
+    },
+
     /// Upstream origin used an unsupported scheme.
     #[error("unsupported upstream scheme {scheme:?}")]
     UnsupportedUpstreamScheme {
@@ -354,6 +361,11 @@ impl AllowedOperation {
                 method: method_text.to_owned(),
             }
         })?;
+        if method == Method::CONNECT {
+            return Err(ConfigError::UnsupportedMethod {
+                method: method_text.to_owned(),
+            });
+        }
         let path = match kind {
             "exact" => AllowedPath::exact(path_text)?,
             "prefix" => AllowedPath::prefix(path_text)?,
@@ -1256,6 +1268,14 @@ mod tests {
     }
 
     #[test]
+    fn operation_rejects_connect_method() {
+        assert!(matches!(
+            AllowedOperation::parse("CONNECT:exact:/v1/models"),
+            Err(ConfigError::UnsupportedMethod { method }) if method == "CONNECT",
+        ));
+    }
+
+    #[test]
     fn zero_bounds_fail_closed() {
         assert!(matches!(
             non_zero_usize("CUSTODE_MAX_REQUEST_BYTES", 0),
@@ -1590,6 +1610,11 @@ mod proptests {
         ]
     }
 
+    /// Valid HTTP token methods outside the gateway protocol.
+    fn method_unsupported() -> impl Strategy<Value = String> {
+        Just("CONNECT".to_owned())
+    }
+
     /// Methods containing a representative non-token byte.
     fn method_invalid() -> impl Strategy<Value = String> {
         (
@@ -1795,6 +1820,21 @@ mod proptests {
                 Err(ConfigError::InvalidMethod { .. }),
             );
             prop_assert!(is_invalid_method);
+        }
+
+        #[test]
+        fn parse_rejects_unsupported_methods(
+            method in method_unsupported(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+
+            let is_unsupported_method = matches!(
+                AllowedOperation::parse(&raw),
+                Err(ConfigError::UnsupportedMethod { .. }),
+            );
+            prop_assert!(is_unsupported_method);
         }
 
         #[test]
