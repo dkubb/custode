@@ -23,7 +23,9 @@ use url as _;
 use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::extract::State;
-use axum::http::{HeaderMap, Request};
+use axum::http::header::LOCATION;
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::any;
 use core::net::SocketAddr;
 use core::time::Duration;
@@ -68,6 +70,15 @@ type Recorder = Arc<Mutex<Vec<RecordedRequest>>>;
 
 /// Shared recording of fake proxy requests.
 type ProxyRecorder = Arc<Mutex<Vec<Vec<u8>>>>;
+
+/// Shared redirecting upstream state.
+#[derive(Clone, Debug)]
+struct RedirectState {
+    /// Redirect target sent in the `Location` header.
+    location: String,
+    /// Request recorder.
+    recorder: Recorder,
+}
 
 /// A gateway child process that is killed on drop.
 #[derive(Debug)]
@@ -288,6 +299,12 @@ fn not_observed_body_value() -> Value {
 
 /// Records one upstream request and returns a fixed body.
 async fn record(State(recorder): State<Recorder>, request: Request<Body>) -> &'static str {
+    record_request(&recorder, request).await;
+    "ok"
+}
+
+/// Records one upstream request.
+async fn record_request(recorder: &Recorder, request: Request<Body>) {
     let (parts, body_stream) = request.into_parts();
     let recorded_body = to_bytes(body_stream, MAX_RECORDED_BODY_BYTES)
         .await
@@ -304,7 +321,15 @@ async fn record(State(recorder): State<Recorder>, request: Request<Body>) -> &'s
         .lock()
         .expect("recorder mutex should not be poisoned")
         .push(entry);
-    "ok"
+}
+
+/// Records one upstream request and redirects to a configured target.
+async fn redirect_to(
+    State(state): State<RedirectState>,
+    request: Request<Body>,
+) -> impl IntoResponse {
+    record_request(&state.recorder, request).await;
+    (StatusCode::FOUND, [(LOCATION, state.location)], "")
 }
 
 /// Returns sorted, UTF-8 upstream request headers.
@@ -337,6 +362,29 @@ async fn start_upstream() -> (SocketAddr, Recorder) {
     let app = Router::new()
         .fallback(any(record))
         .with_state(Arc::clone(&recorder));
+    drop(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("test upstream should serve");
+    }));
+    (addr, recorder)
+}
+
+/// Starts a local redirecting upstream and returns its address and recorder.
+async fn start_redirecting_upstream(location: String) -> (SocketAddr, Recorder) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("upstream listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("upstream listener should report its address");
+    let recorder: Recorder = Arc::new(Mutex::new(Vec::new()));
+    let app = Router::new()
+        .fallback(any(redirect_to))
+        .with_state(RedirectState {
+            location,
+            recorder: Arc::clone(&recorder),
+        });
     drop(tokio::spawn(async move {
         axum::serve(listener, app)
             .await
@@ -503,12 +551,13 @@ fn wait_for_failure(mut child: Child) -> bool {
 )]
 mod tests {
     use super::{
-        Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, Stdio,
+        Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, StatusCode, Stdio,
         empty_body_value, free_local_addr, non_empty_body_value, not_observed_body_value,
-        raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy, start_upstream,
-        tempdir, wait_for_failure,
+        raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy,
+        start_redirecting_upstream, start_upstream, tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
+    use reqwest::redirect::Policy;
 
     /// Asserts that a header was not received by the upstream.
     fn assert_header_absent(request: &RecordedRequest, name: &str) {
@@ -619,6 +668,39 @@ mod tests {
             recorded_hits(&decoy_recorder).len(),
             0,
             "host header must not select the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_redirects_do_not_select_a_new_upstream() {
+        let _guard = lock_gateway_test().await;
+        let (decoy, decoy_recorder) = start_upstream().await;
+        let (configured, configured_recorder) =
+            start_redirecting_upstream(format!("http://{decoy}/v1/models")).await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{configured}"), "GET:exact:/v1/models").await;
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .build()
+            .expect("test client should build");
+        let response = client
+            .get(format!("{}/v1/models", gateway.base_url()))
+            .header("x-api-key", "harness-key")
+            .send()
+            .await
+            .expect("gateway request should complete");
+
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert_eq!(
+            recorded_hits(&configured_recorder).len(),
+            1,
+            "configured upstream should receive the original request"
+        );
+        assert_eq!(
+            recorded_hits(&decoy_recorder).len(),
+            0,
+            "redirects must not select a new upstream"
         );
     }
 

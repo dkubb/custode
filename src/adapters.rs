@@ -11,6 +11,7 @@ use crate::ports::{
 use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
+use reqwest::redirect::Policy;
 use std::fs::File;
 use std::io::Read as _;
 use thiserror::Error;
@@ -79,7 +80,10 @@ impl ReqwestUpstreamClient {
     /// Builds a reqwest-backed upstream client.
     #[must_use]
     pub(crate) fn new() -> Self {
-        let result = reqwest::Client::builder().no_proxy().build();
+        let result = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(Policy::none())
+            .build();
         Self::from_build_result(result).expect("no-proxy rustls reqwest client should build")
     }
 }
