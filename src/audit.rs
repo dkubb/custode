@@ -1434,9 +1434,9 @@ async fn validate_existing_audit_events(
         if bytes_read == 0 {
             break;
         }
-        if line.last() == Some(&b'\n') {
-            let _newline = line.pop();
-        }
+        // Callers validate existing events only after tail classification proves
+        // that the log is newline-terminated.
+        let _newline = line.pop();
 
         let numbered_line =
             NonZeroU64::new(line_number).expect("audit log line numbering starts at one");
@@ -1640,7 +1640,8 @@ mod tests {
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
         AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
         ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
-        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, write_serialized_event,
+        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
+        validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -2688,6 +2689,31 @@ mod tests {
 
         assert!(
             matches!(result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_existing_audit_events_reports_reader_errors() {
+        let path = Path::new("audit.ndjson");
+        let mut initial_seek_reader =
+            TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::InitialSeek);
+        let mut read_reader = TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::Read);
+        let mut final_seek_reader =
+            TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::FinalSeek);
+
+        let initial_seek_result =
+            validate_existing_audit_events(path, &mut initial_seek_reader).await;
+        let read_result = validate_existing_audit_events(path, &mut read_reader).await;
+        let final_seek_result = validate_existing_audit_events(path, &mut final_seek_reader).await;
+
+        assert!(
+            matches!(initial_seek_result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+        assert!(
+            matches!(read_result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
+        );
+        assert!(
+            matches!(final_seek_result, Err(AuditError::Inspect { path: error_path, .. }) if error_path == path)
         );
     }
 
