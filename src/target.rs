@@ -108,6 +108,9 @@ impl OriginFormPath {
         if !path.starts_with('/') {
             return Err(OriginFormPathError::NonOriginForm);
         }
+        if path.starts_with("//") {
+            return Err(OriginFormPathError::NonOriginForm);
+        }
         if has_path_component_delimiter(path) {
             return Err(OriginFormPathError::NonOriginForm);
         }
@@ -621,7 +624,6 @@ pub mod testing {
             1 => Just("/".to_owned()),
             3 => origin_form_path_plain_valid(),
             1 => origin_form_path_plain_valid().prop_map(|path| format!("{path}/")),
-            1 => origin_form_path_plain_valid().prop_map(|path| format!("/{path}")),
         ]
     }
 
@@ -843,6 +845,10 @@ mod tests {
     fn path_rejects_non_origin_form_paths() {
         assert_eq!(
             OriginFormPath::parse("v1/models"),
+            Err(OriginFormPathError::NonOriginForm),
+        );
+        assert_eq!(
+            OriginFormPath::parse("//evil.example/v1/models"),
             Err(OriginFormPathError::NonOriginForm),
         );
     }
@@ -1084,7 +1090,7 @@ mod proptests {
     /// Valid paths with one dot segment spliced in.
     fn path_with_dot_segment() -> impl Strategy<Value = String> {
         (path_valid(), segment_dot(), path_valid())
-            .prop_map(|(prefix, dot, suffix)| format!("{prefix}/{dot}{suffix}"))
+            .prop_map(|(prefix, dot, suffix)| path_with_segment(&prefix, &dot, &suffix))
     }
 
     /// Paths whose final percent escape is truncated or non-hex.
@@ -1149,7 +1155,21 @@ mod proptests {
 
     /// Paths missing the leading slash.
     fn path_non_origin_form() -> impl Strategy<Value = String> {
-        "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
+        prop_oneof![
+            "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}",
+            Just("//evil.example/v1/models".to_owned()),
+        ]
+    }
+
+    /// Inserts one path segment without producing an authority-looking path.
+    fn path_with_segment(prefix: &str, segment: &str, suffix: &str) -> String {
+        let trimmed_prefix = prefix.trim_end_matches('/');
+        let trimmed_suffix = suffix.trim_start_matches('/');
+        if trimmed_suffix.is_empty() {
+            format!("{trimmed_prefix}/{segment}")
+        } else {
+            format!("{trimmed_prefix}/{segment}/{trimmed_suffix}")
+        }
     }
 
     /// Paths containing one literal delimiter that belongs outside the path.

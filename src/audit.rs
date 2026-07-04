@@ -7413,11 +7413,19 @@ mod proptests {
         )]))
     }
 
+    /// Origin-form paths accepted by upstream target serialization.
+    fn origin_path() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("/".to_owned()),
+            "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,20}".prop_map(|path| format!("/{path}")),
+        ]
+    }
+
     /// Raw request paths: origin-form spellings biased with the empty path
     /// that `from_uri_parts` replaces with `/`.
     fn raw_path() -> impl Strategy<Value = String> {
         prop_oneof![
-            4 => "/[A-Za-z0-9/_-]{0,20}",
+            4 => origin_path(),
             1 => Just(String::new()),
         ]
     }
@@ -7893,7 +7901,7 @@ mod proptests {
             method in method_text(),
             path in raw_path(),
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
-            upstream_path in "/[A-Za-z0-9/_-]{0,20}",
+            upstream_path in origin_path(),
             upstream_query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
             status_code_value in 100_u16..600,
             request_body_bytes in non_empty_body(),
