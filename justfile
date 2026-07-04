@@ -20,7 +20,7 @@ test:
         {{cargo}} test-workspace
 
 docs:
-    mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
+    mado check README.md docs/IDEA.md docs/ARCHITECTURE.md docs/STRESS.md
 
 deny:
     {{cargo}} deny-check
