@@ -93,10 +93,12 @@ enum ScenarioClassKind {
         upstream: ScenarioUpstream,
     },
 
-    /// Reachable downstream disconnect during successful streaming response.
+    /// Reachable downstream disconnect after a response has started.
     DownstreamDisconnect {
         /// Downstream response consumption behavior.
         downstream: ScenarioDownstream,
+        /// Scripted upstream behavior after response start.
+        upstream: ScenarioUpstream,
     },
 }
 
@@ -232,6 +234,9 @@ impl ScenarioUpstream {
         Self::StreamError,
         Self::Timeout,
     ];
+
+    /// Upstream variants that start a response stream.
+    const RESPONSE_STARTED: [Self; 3] = [Self::BodyTimeout, Self::Respond, Self::StreamError];
 }
 
 /// Scripted upstream client for deterministic handler tests.
@@ -450,13 +455,16 @@ impl Scenario {
                 request,
                 upstream,
             },
-            ScenarioClassKind::DownstreamDisconnect { downstream } => Self {
+            ScenarioClassKind::DownstreamDisconnect {
+                downstream,
+                upstream,
+            } => Self {
                 admission: ScenarioAdmission::Open,
                 audit: ScenarioAudit::Record,
                 bounds: ScenarioBounds::Roomy,
                 downstream,
                 request,
-                upstream: ScenarioUpstream::Respond,
+                upstream,
             },
         }
     }
@@ -466,7 +474,7 @@ impl ScenarioClass {
     /// Returns every scenario fault-class combination.
     #[must_use]
     pub(super) fn all() -> Vec<Self> {
-        let mut classes = Vec::with_capacity(Self::count());
+        let mut classes = Vec::new();
         for admission in ScenarioAdmission::ALL {
             for audit in ScenarioAudit::ALL {
                 for bounds in ScenarioBounds::ALL {
@@ -484,9 +492,14 @@ impl ScenarioClass {
             }
         }
         for downstream in ScenarioDownstream::DISCONNECTS {
-            classes.push(Self {
-                kind: ScenarioClassKind::DownstreamDisconnect { downstream },
-            });
+            for upstream in ScenarioUpstream::RESPONSE_STARTED {
+                classes.push(Self {
+                    kind: ScenarioClassKind::DownstreamDisconnect {
+                        downstream,
+                        upstream,
+                    },
+                });
+            }
         }
         classes
     }
@@ -494,13 +507,7 @@ impl ScenarioClass {
     /// Returns the derived number of reachable scenario classes.
     #[must_use]
     pub(super) fn count() -> usize {
-        ScenarioAdmission::ALL
-            .len()
-            .checked_mul(ScenarioAudit::ALL.len())
-            .and_then(|count| count.checked_mul(ScenarioBounds::ALL.len()))
-            .and_then(|count| count.checked_mul(ScenarioUpstream::ALL.len()))
-            .and_then(|count| count.checked_add(ScenarioDownstream::DISCONNECTS.len()))
-            .expect("scenario class count should not overflow")
+        Self::all().len()
     }
 }
 

@@ -795,11 +795,12 @@ and generated header sets over both forwarded and stripped header names. The
 current fault grammar covers saturated admission permits, audit write failure
 on the terminal event, provider success, virtual-time upstream stalls past the
 carried deadline, upstream response stream failure after a body chunk, and
-response byte bounds smaller than the scripted response. A deterministic class
-sweep covers the full 24-element product of admission, audit, response-bound,
-and upstream-outcome classes every run, plus the two reachable downstream
-disconnect classes for a successful streamed response; the property test then
-randomizes request dimensions inside those classes. The oracle asserts
+upstream response body timeout after a body chunk, and response byte bounds
+smaller than the scripted response. A deterministic class sweep covers the full
+32-element product of admission, audit, response-bound, and upstream-outcome
+classes every run, plus the six reachable downstream-disconnect classes across
+response-starting upstream outcomes; the property test then randomizes request
+dimensions inside those classes. The oracle asserts
 invariants over each scenario class: response status and stream outcome,
 fatal-channel behavior after response start, upstream request presence,
 forwarded-header safety, response byte bounds, and the 14-field audit event

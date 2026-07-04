@@ -1051,7 +1051,9 @@ mod tests {
                     ScenarioAudit::Record,
                     ScenarioBounds::Roomy,
                     ScenarioDownstream::DropBeforeFirstChunk,
-                    ScenarioUpstream::Respond,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
                 ) => ScenarioBody::Dropped(Bytes::new()),
                 (
                     ScenarioAdmission::Open,
@@ -1060,6 +1062,13 @@ mod tests {
                     ScenarioDownstream::DropBeforeFinalChunk,
                     ScenarioUpstream::Respond,
                 ) => ScenarioBody::Dropped(Bytes::from_static(b"script")),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFinalChunk,
+                    ScenarioUpstream::StreamError | ScenarioUpstream::BodyTimeout,
+                ) => ScenarioBody::Dropped(Bytes::from_static(b"first")),
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
