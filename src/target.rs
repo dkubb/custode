@@ -24,6 +24,9 @@ pub(crate) enum OriginFormPathError {
     /// Path contained invalid percent-encoding.
     InvalidPercentEncoding,
 
+    /// Path contained a byte outside HTTP request-target syntax.
+    InvalidRequestTargetCharacter,
+
     /// Path was not origin-form.
     NonOriginForm,
 
@@ -46,6 +49,9 @@ pub(crate) enum OriginFormQueryError {
 
     /// Query contained invalid percent-encoding.
     InvalidPercentEncoding,
+
+    /// Query contained a byte outside HTTP request-target syntax.
+    InvalidRequestTargetCharacter,
 
     /// Query exceeded the supported byte limit.
     TooLong,
@@ -105,6 +111,9 @@ impl OriginFormPath {
         if has_path_component_delimiter(path) {
             return Err(OriginFormPathError::NonOriginForm);
         }
+        if has_invalid_path_character(path) {
+            return Err(OriginFormPathError::InvalidRequestTargetCharacter);
+        }
         if !has_valid_percent_encoding(path) {
             return Err(OriginFormPathError::InvalidPercentEncoding);
         }
@@ -140,6 +149,9 @@ impl OriginFormQuery {
         }
         if has_query_component_delimiter(query) {
             return Err(OriginFormQueryError::FragmentDelimiter);
+        }
+        if has_invalid_query_character(query) {
+            return Err(OriginFormQueryError::InvalidRequestTargetCharacter);
         }
         if !has_valid_percent_encoding(query) {
             return Err(OriginFormQueryError::InvalidPercentEncoding);
@@ -213,6 +225,58 @@ fn has_forbidden_separator(path: &str) -> bool {
         }
     }
     false
+}
+
+/// Returns true when raw path text cannot occur in an HTTP request-target.
+fn has_invalid_path_character(path: &str) -> bool {
+    path.as_bytes()
+        .iter()
+        .copied()
+        .any(|byte| !is_origin_form_path_byte(byte))
+}
+
+/// Returns true when raw query text cannot occur in an HTTP request-target.
+fn has_invalid_query_character(query: &str) -> bool {
+    query
+        .as_bytes()
+        .iter()
+        .copied()
+        .any(|byte| !is_origin_form_query_byte(byte))
+}
+
+/// Returns true when the byte is valid raw origin-form path text.
+const fn is_origin_form_path_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'-'
+            | b'.'
+            | b'_'
+            | b'~'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b':'
+            | b'@'
+            | b'/'
+            | b'%'
+            | b'\\'
+    )
+}
+
+/// Returns true when the byte is valid raw origin-form query text.
+const fn is_origin_form_query_byte(byte: u8) -> bool {
+    is_origin_form_path_byte(byte) || byte == b'?'
 }
 
 /// Returns true when a path segment is a literal or percent-encoded dot segment.
@@ -529,6 +593,24 @@ mod tests {
     }
 
     #[test]
+    fn path_rejects_invalid_request_target_characters() {
+        for path in [
+            "/v1/models with-space",
+            "/v1/models\t",
+            "/v1/models\n",
+            "/v1/models\u{7f}",
+            "/v1/models\u{80}",
+            "/v1/[models]",
+        ] {
+            assert_eq!(
+                OriginFormPath::parse(path),
+                Err(OriginFormPathError::InvalidRequestTargetCharacter),
+                "path {path:?} should fail closed",
+            );
+        }
+    }
+
+    #[test]
     fn path_rejects_percent_encoded_dot_segments() {
         assert_eq!(
             OriginFormPath::parse("/v1/responses/%2e%2e/models"),
@@ -616,6 +698,24 @@ mod tests {
             OriginFormQuery::parse("bad=%zz"),
             Err(OriginFormQueryError::InvalidPercentEncoding),
         );
+    }
+
+    #[test]
+    fn query_rejects_invalid_request_target_characters() {
+        for query in [
+            "q=hello world",
+            "q=\t",
+            "q=\n",
+            "q=\u{7f}",
+            "q=\u{80}",
+            "q=[models]",
+        ] {
+            assert_eq!(
+                OriginFormQuery::parse(query),
+                Err(OriginFormQueryError::InvalidRequestTargetCharacter),
+                "query {query:?} should fail closed",
+            );
+        }
     }
 
     #[test]
@@ -776,6 +876,21 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
+    /// Bytes that cannot appear as raw HTTP request-target text.
+    fn invalid_request_target_character() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(" ".to_owned()),
+            Just("\t".to_owned()),
+            Just("\n".to_owned()),
+            Just("\r".to_owned()),
+            Just("\u{7f}".to_owned()),
+            Just("\u{80}".to_owned()),
+            Just("\"".to_owned()),
+            Just("[".to_owned()),
+            Just("]".to_owned()),
+        ]
+    }
+
     /// Paths containing one forbidden literal or encoded path separator.
     fn path_with_forbidden_separator() -> impl Strategy<Value = String> {
         (
@@ -790,6 +905,16 @@ mod proptests {
             "[A-Za-z0-9_-]{1,8}",
         )
             .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
+    }
+
+    /// Paths containing one raw byte outside HTTP request-target syntax.
+    fn path_with_invalid_request_target_character() -> impl Strategy<Value = String> {
+        (
+            path_valid(),
+            invalid_request_target_character(),
+            "[A-Za-z0-9_-]{0,8}",
+        )
+            .prop_map(|(prefix, invalid, suffix)| format!("{prefix}{invalid}{suffix}"))
     }
 
     /// Paths missing the leading slash.
@@ -825,6 +950,16 @@ mod proptests {
             ],
         )
             .prop_map(|(prefix, escape)| format!("{prefix}%{escape}"))
+    }
+
+    /// Queries containing one raw byte outside HTTP request-target syntax.
+    fn query_with_invalid_request_target_character() -> impl Strategy<Value = String> {
+        (
+            "[A-Za-z0-9_=&.-]{0,12}",
+            invalid_request_target_character(),
+            "[A-Za-z0-9_=&.-]{0,12}",
+        )
+            .prop_map(|(prefix, invalid, suffix)| format!("{prefix}{invalid}{suffix}"))
     }
 
     /// Queries containing a literal fragment delimiter.
@@ -873,6 +1008,16 @@ mod proptests {
         }
 
         #[test]
+        fn parse_rejects_every_invalid_request_target_character(
+            path in path_with_invalid_request_target_character(),
+        ) {
+            prop_assert_eq!(
+                OriginFormPath::parse(&path),
+                Err(OriginFormPathError::InvalidRequestTargetCharacter)
+            );
+        }
+
+        #[test]
         fn parse_rejects_every_non_origin_form_path(path in path_non_origin_form()) {
             prop_assert_eq!(
                 OriginFormPath::parse(&path),
@@ -913,6 +1058,16 @@ mod proptests {
             prop_assert_eq!(
                 OriginFormQuery::parse(&query),
                 Err(OriginFormQueryError::InvalidPercentEncoding)
+            );
+        }
+
+        #[test]
+        fn query_parse_rejects_every_invalid_request_target_character(
+            query in query_with_invalid_request_target_character(),
+        ) {
+            prop_assert_eq!(
+                OriginFormQuery::parse(&query),
+                Err(OriginFormQueryError::InvalidRequestTargetCharacter)
             );
         }
 

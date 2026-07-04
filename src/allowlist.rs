@@ -152,7 +152,9 @@ const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReaso
         OriginFormPathError::DotSegment => RejectionReason::DotSegment,
         OriginFormPathError::EncodedSeparator => RejectionReason::EncodedSeparator,
         OriginFormPathError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
-        OriginFormPathError::NonOriginForm => RejectionReason::NonOriginForm,
+        OriginFormPathError::InvalidRequestTargetCharacter | OriginFormPathError::NonOriginForm => {
+            RejectionReason::NonOriginForm
+        }
         OriginFormPathError::TooLong => RejectionReason::PathTooLong,
     }
 }
@@ -160,8 +162,9 @@ const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReaso
 /// Maps origin-form query errors into request rejection reasons.
 const fn rejection_from_query_error(error: OriginFormQueryError) -> RejectionReason {
     match error {
-        OriginFormQueryError::FragmentDelimiter => RejectionReason::NonOriginForm,
         OriginFormQueryError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
+        OriginFormQueryError::FragmentDelimiter
+        | OriginFormQueryError::InvalidRequestTargetCharacter => RejectionReason::NonOriginForm,
         OriginFormQueryError::TooLong => RejectionReason::QueryTooLong,
     }
 }
@@ -236,6 +239,18 @@ mod tests {
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some("bad=%zz")),
             Err(RejectionReason::InvalidPercentEncoding),
+        );
+    }
+
+    #[test]
+    fn target_rejects_invalid_request_target_characters_as_non_origin_form() {
+        assert_eq!(
+            AcceptedTarget::new("/v1/models with-space", None),
+            Err(RejectionReason::NonOriginForm),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/models", Some("q=hello world")),
+            Err(RejectionReason::NonOriginForm),
         );
     }
 
@@ -508,6 +523,21 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
+    /// Bytes that cannot appear as raw HTTP request-target text.
+    fn invalid_request_target_character() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(" ".to_owned()),
+            Just("\t".to_owned()),
+            Just("\n".to_owned()),
+            Just("\r".to_owned()),
+            Just("\u{7f}".to_owned()),
+            Just("\u{80}".to_owned()),
+            Just("\"".to_owned()),
+            Just("[".to_owned()),
+            Just("]".to_owned()),
+        ]
+    }
+
     /// Paths containing one forbidden literal or encoded path separator.
     fn path_with_forbidden_separator() -> impl Strategy<Value = String> {
         (
@@ -522,6 +552,16 @@ mod proptests {
             "[A-Za-z0-9_-]{1,8}",
         )
             .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
+    }
+
+    /// Paths containing one raw byte outside HTTP request-target syntax.
+    fn path_with_invalid_request_target_character() -> impl Strategy<Value = String> {
+        (
+            path_valid(),
+            invalid_request_target_character(),
+            "[A-Za-z0-9_-]{0,8}",
+        )
+            .prop_map(|(prefix, invalid, suffix)| format!("{prefix}{invalid}{suffix}"))
     }
 
     /// Paths missing the leading slash (first invalid origin-form).
@@ -539,6 +579,16 @@ mod proptests {
     fn query_too_long() -> impl Strategy<Value = String> {
         (MAX_ORIGIN_FORM_QUERY_BYTES + 1..=MAX_ORIGIN_FORM_QUERY_BYTES + 64)
             .prop_map(|len| "a".repeat(len))
+    }
+
+    /// Queries containing one raw byte outside HTTP request-target syntax.
+    fn query_with_invalid_request_target_character() -> impl Strategy<Value = String> {
+        (
+            "[A-Za-z0-9_=&.-]{0,12}",
+            invalid_request_target_character(),
+            "[A-Za-z0-9_=&.-]{0,12}",
+        )
+            .prop_map(|(prefix, invalid, suffix)| format!("{prefix}{invalid}{suffix}"))
     }
 
     proptest! {
@@ -575,6 +625,26 @@ mod proptests {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
                 Err(RejectionReason::EncodedSeparator)
+            );
+        }
+
+        #[test]
+        fn new_rejects_every_invalid_request_target_path_character(
+            path in path_with_invalid_request_target_character(),
+        ) {
+            prop_assert_eq!(
+                AcceptedTarget::new(&path, None),
+                Err(RejectionReason::NonOriginForm)
+            );
+        }
+
+        #[test]
+        fn new_rejects_every_invalid_request_target_query_character(
+            query in query_with_invalid_request_target_character(),
+        ) {
+            prop_assert_eq!(
+                AcceptedTarget::new("/v1/models", Some(&query)),
+                Err(RejectionReason::NonOriginForm)
             );
         }
 
