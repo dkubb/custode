@@ -907,6 +907,10 @@ mod tests {
             "version",
         ];
 
+        /// Expected fatal error for the deterministic audit sink failure.
+        const EXPECTED_FATAL_AUDIT_WRITE_ERROR: &str =
+            "failed to write audit event: scripted audit failure";
+
         /// Returns one denial reason by index.
         const fn denial_reason(index: u8) -> AuditDenialReason {
             match index {
@@ -1187,11 +1191,12 @@ mod tests {
             }
         }
 
-        /// Returns true when the scenario should report a fatal post-start error.
-        fn expected_fatal_error(scenario: &Scenario) -> bool {
-            scenario.admission() == ScenarioAdmission::Open
+        /// Returns the exact fatal post-start error expected for a scenario.
+        fn expected_fatal_error(scenario: &Scenario) -> Option<&'static str> {
+            (scenario.admission() == ScenarioAdmission::Open
                 && scenario.audit() == ScenarioAudit::FailFirst
-                && scenario.upstream() != ScenarioUpstream::Timeout
+                && scenario.upstream() != ScenarioUpstream::Timeout)
+                .then_some(EXPECTED_FATAL_AUDIT_WRITE_ERROR)
         }
 
         /// Returns the expected status for the harness response.
@@ -1345,7 +1350,7 @@ mod tests {
         ) -> Result<(), TestCaseError> {
             prop_assert_eq!(run.status, expected_status(scenario));
             prop_assert_eq!(&run.response_body, &expected_body(scenario));
-            prop_assert_eq!(run.fatal_error.is_some(), expected_fatal_error(scenario));
+            prop_assert_eq!(run.fatal_error.as_deref(), expected_fatal_error(scenario));
             Ok(())
         }
 
