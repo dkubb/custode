@@ -565,6 +565,10 @@ digest of the observed bytes.
 For `response_body_too_large`, `response_body` MUST be `non_empty`. It records
 the bytes observed through the chunk that crossed the configured response-byte
 bound, so its byte count can be larger than that configured bound.
+For `response_stream_timeout`, `response_body` records bytes observed before
+the gateway response-streaming deadline expired. This class is distinct from
+`upstream_response_timeout`, which records an upstream body timeout reported by
+the upstream adapter while the gateway is still able to poll it.
 
 An audit write failure cannot be represented as an `audit_error` event in the
 required audit log because the failure mode is the inability to write that log.

@@ -165,6 +165,9 @@ enum ResponseStreamOutcome {
         response_body: OversizedResponseBody,
     },
 
+    /// Response streaming exceeded the configured gateway deadline.
+    ResponseStreamTimeout,
+
     /// Upstream response stream failed after upstream I/O started.
     UpstreamResponseStreamFailed,
 
@@ -187,6 +190,9 @@ impl ResponseAuditContext {
             }
             ResponseStreamOutcome::ResponseBodyTooLarge { response_body } => {
                 ResponseAuditOutcome::response_body_too_large(response_body, self.status)
+            }
+            ResponseStreamOutcome::ResponseStreamTimeout => {
+                ResponseAuditOutcome::response_stream_timeout(&self.response_account, self.status)
             }
             ResponseStreamOutcome::UpstreamResponseStreamFailed => {
                 ResponseAuditOutcome::upstream_response_stream_failed(
@@ -542,7 +548,7 @@ fn response_stream(
         .await;
         if stream_result.is_err() {
             let _audit_result = context
-                .audit_after_response_started(ResponseStreamOutcome::UpstreamResponseTimeout)
+                .audit_after_response_started(ResponseStreamOutcome::ResponseStreamTimeout)
                 .await
                 .inspect_err(log_upstream_body_audit_error);
             try_send_terminal_stream_error(&sender);
@@ -4880,7 +4886,7 @@ mod tests {
             .first()
             .expect("stalled stream timeout should be audited");
         assert_eq!(event["decision"], "response_error");
-        assert_eq!(event["error_class"], "upstream_response_timeout");
+        assert_eq!(event["error_class"], "response_stream_timeout");
         assert_eq!(event["response_body"], non_empty_body_value(&observed_body));
         let fatal_result = fatal_receiver.try_recv();
         assert!(

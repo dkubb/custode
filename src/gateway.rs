@@ -117,6 +117,14 @@ enum ResponseAuditOutcomeKind {
         error: AuditResponseHeaderError,
     },
 
+    /// Response streaming exceeded the configured gateway deadline.
+    ResponseStreamTimeout {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
+
     /// Upstream request failed before a response completed.
     UpstreamError {
         /// Upstream request error.
@@ -191,6 +199,20 @@ impl ResponseAuditOutcome {
     pub(crate) const fn response_header_error(error: AuditResponseHeaderError) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseHeaderError { error },
+        }
+    }
+
+    /// Creates a response-stream-timeout outcome.
+    #[must_use]
+    pub(crate) fn response_stream_timeout(
+        response_account: &ResponseAccount,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: ResponseAuditOutcomeKind::ResponseStreamTimeout {
+                response_body: ObservedBodySummary::from_response_account(response_account),
+                status,
+            },
         }
     }
 
@@ -320,6 +342,13 @@ impl Gateway {
             ResponseAuditOutcomeKind::ResponseHeaderError { error } => {
                 let response_error = AuditResponseError::response_header(error);
                 AuditEventInput::response_error(request, response_error)
+            }
+            ResponseAuditOutcomeKind::ResponseStreamTimeout {
+                response_body,
+                status,
+            } => {
+                let error = AuditResponseError::response_stream_timeout(response_body, status);
+                AuditEventInput::response_error(request, error)
             }
             ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
                 response_body,

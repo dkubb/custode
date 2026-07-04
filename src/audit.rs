@@ -326,6 +326,14 @@ enum AuditResponseErrorKind {
         error: AuditResponseHeaderError,
     },
 
+    /// Gateway response streaming exceeded the configured deadline.
+    ResponseStreamTimeout {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
+
     /// Upstream response stream failed after upstream I/O started.
     UpstreamResponseStreamFailed {
         /// Response body summary.
@@ -719,6 +727,9 @@ enum ExistingAuditErrorClass {
     /// Response headers exceeded the supported byte limit.
     ResponseHeadersTooLarge,
 
+    /// Gateway response streaming exceeded the configured deadline.
+    ResponseStreamTimeout,
+
     /// Concurrency limit rejected the request.
     TooManyRequests,
 
@@ -783,6 +794,7 @@ impl ExistingAuditErrorClass {
             Self::UpstreamTimeout => Some(StatusCode::GATEWAY_TIMEOUT),
             Self::DownstreamClosed
             | Self::ResponseBodyTooLarge
+            | Self::ResponseStreamTimeout
             | Self::UpstreamResponseStreamFailed
             | Self::UpstreamResponseTimeout => None,
         }
@@ -818,6 +830,7 @@ impl ExistingAuditErrorClass {
             Self::DownstreamClosed
                 | Self::InvalidResponseConnectionHeader
                 | Self::ResponseBodyTooLarge
+                | Self::ResponseStreamTimeout
                 | Self::ResponseHeadersTooLarge
                 | Self::UpstreamResponseStreamFailed
                 | Self::UpstreamResponseTimeout
@@ -1058,6 +1071,7 @@ impl ExistingAuditEventFields {
             ExistingAuditErrorClass::DownstreamClosed
             | ExistingAuditErrorClass::InvalidResponseConnectionHeader
             | ExistingAuditErrorClass::ResponseBodyTooLarge
+            | ExistingAuditErrorClass::ResponseStreamTimeout
             | ExistingAuditErrorClass::ResponseHeadersTooLarge
             | ExistingAuditErrorClass::UpstreamConnectFailed
             | ExistingAuditErrorClass::UpstreamRequestFailed
@@ -1175,6 +1189,7 @@ impl ExistingAuditEventFields {
             }
             Some(
                 ExistingAuditErrorClass::DownstreamClosed
+                | ExistingAuditErrorClass::ResponseStreamTimeout
                 | ExistingAuditErrorClass::UpstreamResponseStreamFailed
                 | ExistingAuditErrorClass::UpstreamResponseTimeout,
             ) if self.response_body.is_observed() => Ok(()),
@@ -2002,6 +2017,14 @@ impl AuditResponseError {
                 AuditBodySummary::non_empty(response_body.observation()),
                 status,
             ),
+            AuditResponseErrorKind::ResponseStreamTimeout {
+                response_body,
+                status,
+            } => (
+                "response_stream_timeout",
+                response_body.into_summary(),
+                status,
+            ),
             AuditResponseErrorKind::ResponseHeader { error } => (
                 error.error_class(),
                 AuditBodySummary::not_observed(),
@@ -2045,6 +2068,20 @@ impl AuditResponseError {
     pub(crate) const fn response_header(error: AuditResponseHeaderError) -> Self {
         Self {
             kind: AuditResponseErrorKind::ResponseHeader { error },
+        }
+    }
+
+    /// Creates a response-stream-timeout response error.
+    #[must_use]
+    pub(crate) const fn response_stream_timeout(
+        response_body: ObservedBodySummary,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::ResponseStreamTimeout {
+                response_body,
+                status,
+            },
         }
     }
 
@@ -4482,7 +4519,7 @@ mod tests {
     }
 
     /// Builds valid response-error existing audit event lines.
-    pub(super) fn response_error_existing_event_lines() -> [(&'static str, Vec<u8>); 6] {
+    pub(super) fn response_error_existing_event_lines() -> [(&'static str, Vec<u8>); 7] {
         [
             (
                 "invalid response connection header",
@@ -4512,6 +4549,14 @@ mod tests {
                 "downstream closed",
                 response_error_existing_event_line(
                     "downstream_closed",
+                    Value::from(200_u64),
+                    non_empty_body_value(),
+                ),
+            ),
+            (
+                "response stream timeout",
+                response_error_existing_event_line(
+                    "response_stream_timeout",
                     Value::from(200_u64),
                     non_empty_body_value(),
                 ),
@@ -4637,7 +4682,7 @@ mod tests {
     }
 
     /// Builds response-level semantically invalid body lines.
-    fn semantic_invalid_response_body_lines() -> [(&'static str, Vec<u8>); 5] {
+    fn semantic_invalid_response_body_lines() -> [(&'static str, Vec<u8>); 6] {
         [
             (
                 "response body too large with empty response body",
@@ -4671,6 +4716,18 @@ mod tests {
                     (
                         "error_class",
                         Value::String("upstream_response_stream_failed".to_owned()),
+                    ),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "response stream timeout with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("response_stream_timeout".to_owned()),
                     ),
                     ("status", Value::from(200_u64)),
                     ("upstream_path", Value::String("/v1/models".to_owned())),
@@ -5662,6 +5719,7 @@ mod tests {
                 Some(StatusCode::BAD_GATEWAY),
             ),
             (ExistingAuditErrorClass::ResponseBodyTooLarge, None),
+            (ExistingAuditErrorClass::ResponseStreamTimeout, None),
             (
                 ExistingAuditErrorClass::ResponseHeadersTooLarge,
                 Some(StatusCode::BAD_GATEWAY),
@@ -7830,7 +7888,7 @@ mod proptests {
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
             denial_kind in 0_u8..16,
-            response_error_kind in 0_u8..6,
+            response_error_kind in 0_u8..7,
             upstream_error_kind in 0_u8..3,
             method in method_text(),
             path in raw_path(),
@@ -7909,6 +7967,13 @@ mod proptests {
                             not_observed_body_value(),
                         ),
                         4 => (
+                            AuditResponseError::response_stream_timeout(
+                                observed_response_body,
+                                status,
+                            ),
+                            body_value(response_bytes, &response_digest),
+                        ),
+                        5 => (
                             AuditResponseError::upstream_response_stream_failed(
                                 observed_response_body,
                                 status,
