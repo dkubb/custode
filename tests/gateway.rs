@@ -980,6 +980,7 @@ mod tests {
             .header("connection", "x-secret")
             .header("host", "attacker.invalid")
             .header("proxy-authorization", "Basic bad")
+            .header("proxy-connection", "keep-alive")
             .header("x-api-key", "harness-key")
             .header("x-secret", "hidden")
             .body("payload")
@@ -998,6 +999,7 @@ mod tests {
         assert_header_values(hit, "x-api-key", &["harness-key"]);
         assert_header_absent(hit, "connection");
         assert_header_absent(hit, "proxy-authorization");
+        assert_header_absent(hit, "proxy-connection");
         assert_header_absent(hit, "x-secret");
     }
 

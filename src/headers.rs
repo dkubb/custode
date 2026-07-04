@@ -172,6 +172,7 @@ fn is_standard_hop_by_hop(name: &HeaderName) -> bool {
             | "keep-alive"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "proxy-connection"
             | "te"
             | "trailer"
             | "transfer-encoding"
@@ -428,6 +429,7 @@ mod proptests {
             Just("keep-alive".to_owned()),
             Just("proxy-authenticate".to_owned()),
             Just("proxy-authorization".to_owned()),
+            Just("proxy-connection".to_owned()),
             Just("te".to_owned()),
             Just("trailer".to_owned()),
             Just("transfer-encoding".to_owned()),

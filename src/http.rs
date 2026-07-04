@@ -1240,6 +1240,7 @@ mod tests {
                     | "keep-alive"
                     | "proxy-authenticate"
                     | "proxy-authorization"
+                    | "proxy-connection"
                     | "te"
                     | "trailer"
                     | "transfer-encoding"
@@ -1551,6 +1552,7 @@ mod tests {
                             ("authorization".to_owned(), "Bearer harness".to_owned()),
                             ("connection".to_owned(), "te, x-drop".to_owned()),
                             ("host".to_owned(), "proxy:8080".to_owned()),
+                            ("proxy-connection".to_owned(), "keep-alive".to_owned()),
                             ("te".to_owned(), "trailers".to_owned()),
                             ("x-drop".to_owned(), "secret".to_owned()),
                             ("x-request-id".to_owned(), "trace-1".to_owned()),
@@ -2604,6 +2606,7 @@ mod tests {
                     ("connection".to_owned(), "keep-alive".to_owned()),
                     ("host".to_owned(), "proxy:8080".to_owned()),
                     ("proxy-authorization".to_owned(), "Basic leak".to_owned()),
+                    ("proxy-connection".to_owned(), "keep-alive".to_owned()),
                     ("x-request-id".to_owned(), "trace-1".to_owned()),
                 ],
                 ScenarioTarget::models(Some(
