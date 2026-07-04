@@ -591,9 +591,17 @@ fn response_stream(
             pending = Some(chunk);
         }
 
-        if let Some(final_chunk) = pending
-            && sender.send(Ok(final_chunk)).await.is_err()
-        {
+        let Some(final_chunk) = pending else {
+            let audit_result = context
+                .audit_after_response_started(ResponseStreamOutcome::Allowed)
+                .await;
+            if let Err(error) = audit_result {
+                send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
+            }
+            return;
+        };
+
+        let Ok(final_permit) = sender.reserve().await else {
             if let Err(audit_error) = context
                 .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                 .await
@@ -601,13 +609,17 @@ fn response_stream(
                 tracing::error!(%audit_error, "failed to audit downstream close");
             }
             return;
-        }
+        };
 
         let audit_result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
-        if let Err(error) = audit_result {
-            send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
+        match audit_result {
+            Ok(()) => final_permit.send(Ok(final_chunk)),
+            Err(error) => {
+                drop(final_permit);
+                send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
+            }
         }
     });
 
@@ -3468,7 +3480,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn response_stream_reports_fatal_when_allowed_audit_fails_after_completion() {
+    async fn response_stream_withholds_final_chunk_when_allowed_audit_fails() {
         let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
         let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
         let audit_observer = audit.clone();
@@ -3480,17 +3492,10 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let chunk = response_body
-            .next()
-            .await
-            .expect("final chunk should be sent")
-            .expect("final chunk should be ok");
-
-        assert_eq!(chunk, Bytes::from_static(b"final"));
         let terminal = response_body
             .next()
             .await
-            .expect("audit failure should be sent after final chunk");
+            .expect("audit failure should be sent instead of final chunk");
         let error = terminal.expect_err("terminal item should be an audit error");
         assert_eq!(error.to_string(), "audit_failed");
         assert!(
