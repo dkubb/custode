@@ -46,6 +46,13 @@ pub(crate) struct AllowedOperation {
     path: AllowedPath,
 }
 
+/// Canonical, duplicate-free configured operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AllowedOperations {
+    /// Operations sorted by method, match kind, and path.
+    operations: Vec<AllowedOperation>,
+}
+
 /// A configured HTTP method accepted by the gateway protocol.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllowedMethod {
@@ -258,7 +265,7 @@ pub(crate) enum ConfigError {
 #[derive(Clone, Debug)]
 pub(crate) struct GatewayConfig {
     /// Allowed method-path operations.
-    allowed_operations: Vec<AllowedOperation>,
+    allowed_operations: AllowedOperations,
     /// Newline-delimited audit log path.
     audit_log: PathBuf,
     /// Gateway bind address.
@@ -440,6 +447,57 @@ impl AllowedOperation {
             self.path.kind.as_str(),
             self.path.value.as_str()
         )
+    }
+}
+
+impl AllowedOperations {
+    /// Returns the canonical operations as a slice.
+    #[must_use]
+    pub(crate) fn as_slice(&self) -> &[AllowedOperation] {
+        &self.operations
+    }
+
+    /// Parses allowed operation strings and rejects an empty operation set.
+    fn parse(operations: Vec<String>) -> Result<Self, ConfigError> {
+        // An entirely empty list (no entries, or the single empty entry an unset
+        // environment variable produces) is a missing allowlist. An empty entry
+        // mixed with real entries is an invalid operation, not something to skip
+        // silently.
+        if operations.iter().all(String::is_empty) {
+            return Err(ConfigError::EmptyOperations);
+        }
+        if operations.len() > MAX_ALLOWED_OPERATIONS {
+            return Err(ConfigError::TooManyAllowedOperations {
+                max: usize_to_u128(MAX_ALLOWED_OPERATIONS),
+                value: usize_to_u128(operations.len()),
+            });
+        }
+
+        let mut parsed = operations
+            .into_iter()
+            .map(|operation| AllowedOperation::parse(&operation))
+            .collect::<Result<Vec<_>, _>>()?;
+        parsed.sort_unstable_by(AllowedOperation::cmp_config);
+
+        if let Some(duplicate) = parsed
+            .iter()
+            .zip(parsed.iter().skip(1))
+            .find_map(|(left, right)| (left == right).then_some(right))
+        {
+            return Err(ConfigError::DuplicateAllowedOperation {
+                operation: duplicate.to_config_text(),
+            });
+        }
+
+        Ok(Self { operations: parsed })
+    }
+
+    /// Returns a singleton operation set for tests.
+    #[cfg(test)]
+    fn singleton(allowed_operation: AllowedOperation) -> Self {
+        Self {
+            operations: vec![allowed_operation],
+        }
     }
 }
 
@@ -701,7 +759,7 @@ impl GatewayConfig {
     /// Returns the allowed operations.
     #[must_use]
     pub(crate) fn allowed_operations(&self) -> &[AllowedOperation] {
-        &self.allowed_operations
+        self.allowed_operations.as_slice()
     }
 
     /// Returns the audit log path.
@@ -721,11 +779,11 @@ impl GatewayConfig {
     #[must_use]
     pub(crate) fn for_runtime_test(audit_log: PathBuf, upstream_origin: &str) -> Self {
         Self {
-            allowed_operations: vec![
-                AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse"),
-                AllowedOperation::parse("POST:prefix:/v1/responses")
-                    .expect("operation should parse"),
-            ],
+            allowed_operations: AllowedOperations::parse(vec![
+                "GET:exact:/v1/models".to_owned(),
+                "POST:prefix:/v1/responses".to_owned(),
+            ])
+            .expect("operations should parse"),
             audit_log,
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
             max_audit_event_bytes: AuditEventBytes::for_test(
@@ -756,9 +814,8 @@ impl GatewayConfig {
     #[must_use]
     pub(crate) fn for_test(audit_log: PathBuf, max_audit_event_bytes: NonZeroUsize) -> Self {
         Self {
-            allowed_operations: vec![
-                AllowedOperation::parse("GET:exact:/v1/models").expect("operation should parse"),
-            ],
+            allowed_operations: AllowedOperations::parse(vec!["GET:exact:/v1/models".to_owned()])
+                .expect("operations should parse"),
             audit_log,
             bind: "127.0.0.1:0".parse().expect("bind address should parse"),
             max_audit_event_bytes: AuditEventBytes::for_test(max_audit_event_bytes),
@@ -836,7 +893,7 @@ impl GatewayConfig {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_allowed_operation(mut self, allowed_operation: AllowedOperation) -> Self {
-        self.allowed_operations = vec![allowed_operation];
+        self.allowed_operations = AllowedOperations::singleton(allowed_operation);
         self
     }
 
@@ -875,7 +932,7 @@ impl TryFrom<ServeArgs> for GatewayConfig {
     type Error = ConfigError;
 
     fn try_from(args: ServeArgs) -> Result<Self, Self::Error> {
-        let allowed_operations = parse_allowed_operations(args.allowed_operations)?;
+        let allowed_operations = AllowedOperations::parse(args.allowed_operations)?;
         let request_timeout = RequestTimeout::parse_seconds(
             "CUSTODE_REQUEST_TIMEOUT_SECS",
             args.request_timeout_secs,
@@ -1025,41 +1082,6 @@ fn usize_to_u128(value: usize) -> u128 {
     u128::try_from(value).expect("usize should fit into u128")
 }
 
-/// Parses allowed operation strings and rejects an empty operation set.
-fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperation>, ConfigError> {
-    // An entirely empty list (no entries, or the single empty entry an unset
-    // environment variable produces) is a missing allowlist. An empty entry
-    // mixed with real entries is an invalid operation, not something to skip
-    // silently.
-    if operations.iter().all(String::is_empty) {
-        return Err(ConfigError::EmptyOperations);
-    }
-    if operations.len() > MAX_ALLOWED_OPERATIONS {
-        return Err(ConfigError::TooManyAllowedOperations {
-            max: usize_to_u128(MAX_ALLOWED_OPERATIONS),
-            value: usize_to_u128(operations.len()),
-        });
-    }
-
-    let mut parsed = operations
-        .into_iter()
-        .map(|operation| AllowedOperation::parse(&operation))
-        .collect::<Result<Vec<_>, _>>()?;
-    parsed.sort_unstable_by(AllowedOperation::cmp_config);
-
-    if let Some(duplicate) = parsed
-        .iter()
-        .zip(parsed.iter().skip(1))
-        .find_map(|(left, right)| (left == right).then_some(right))
-    {
-        return Err(ConfigError::DuplicateAllowedOperation {
-            operation: duplicate.to_config_text(),
-        });
-    }
-
-    Ok(parsed)
-}
-
 /// Parses an allowed path string.
 fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
     if has_forbidden_allowed_path_character(path) {
@@ -1100,12 +1122,12 @@ fn has_forbidden_allowed_path_character(path: &str) -> bool {
 )]
 mod tests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_METHOD_BYTES,
-        MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES,
-        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
-        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES,
-        MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
-        non_zero_usize, parse_allowed_operations, usize_to_u128,
+        AllowedOperation, AllowedOperations, AllowedPath, ConfigError, GatewayConfig,
+        MAX_ALLOWED_METHOD_BYTES, MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS,
+        MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
+        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
+        MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
+        UpstreamOrigin, non_zero_usize, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -1445,7 +1467,7 @@ mod tests {
     fn empty_operations_fail_closed() {
         for operations in [Vec::new(), vec![String::new()]] {
             assert!(matches!(
-                parse_allowed_operations(operations),
+                AllowedOperations::parse(operations),
                 Err(ConfigError::EmptyOperations),
             ));
         }
@@ -1456,7 +1478,7 @@ mod tests {
         let operations = vec!["GET:exact:/v1/models".to_owned(), String::new()];
 
         assert!(matches!(
-            parse_allowed_operations(operations),
+            AllowedOperations::parse(operations),
             Err(ConfigError::InvalidAllowedOperation { .. }),
         ));
     }
@@ -1470,7 +1492,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            parse_allowed_operations(operations),
+            AllowedOperations::parse(operations),
             Err(ConfigError::DuplicateAllowedOperation { operation })
                 if operation == "GET:exact:/v1/models",
         ));
@@ -1484,8 +1506,9 @@ mod tests {
             "POST:exact:/v1/responses".to_owned(),
         ];
 
-        let parsed = parse_allowed_operations(operations).expect("operations should parse");
+        let parsed = AllowedOperations::parse(operations).expect("operations should parse");
         let operation_text: Vec<String> = parsed
+            .as_slice()
             .iter()
             .map(AllowedOperation::to_config_text)
             .collect();
@@ -1506,9 +1529,9 @@ mod tests {
         let operations = unique_allowed_operations(MAX_ALLOWED_OPERATIONS);
 
         let parsed =
-            parse_allowed_operations(operations).expect("maximum operation count should parse");
+            AllowedOperations::parse(operations).expect("maximum operation count should parse");
 
-        assert_eq!(parsed.len(), MAX_ALLOWED_OPERATIONS);
+        assert_eq!(parsed.as_slice().len(), MAX_ALLOWED_OPERATIONS);
     }
 
     #[test]
@@ -1521,7 +1544,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            parse_allowed_operations(operations),
+            AllowedOperations::parse(operations),
             Err(ConfigError::TooManyAllowedOperations { max, value })
                 if max == expected_usize_u128(MAX_ALLOWED_OPERATIONS)
                     && value == expected_usize_u128(MAX_ALLOWED_OPERATIONS + 1),
@@ -1538,7 +1561,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            parse_allowed_operations(operations),
+            AllowedOperations::parse(operations),
             Err(ConfigError::EmptyOperations),
         ));
     }
@@ -1899,11 +1922,11 @@ mod tests {
 )]
 mod proptests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_METHOD_BYTES,
-        MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES,
-        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
-        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES,
-        MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin, parse_allowed_operations,
+        AllowedOperation, AllowedOperations, AllowedPath, ConfigError, GatewayConfig,
+        MAX_ALLOWED_METHOD_BYTES, MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS,
+        MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
+        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
+        MAX_RESPONSE_HEADER_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
         tests::serve_args, usize_to_u128,
     };
     use crate::target::{
@@ -2101,13 +2124,14 @@ mod proptests {
 
     #[test]
     fn parse_allowed_operations_canonicalizes_unique_inputs() {
-        let parsed = parse_allowed_operations(vec![
+        let parsed = AllowedOperations::parse(vec![
             "POST:prefix:/v1/responses".to_owned(),
             "GET:exact:/v1/models".to_owned(),
             "POST:exact:/v1/responses".to_owned(),
         ])
         .expect("unique operations should parse");
         let operation_text: Vec<String> = parsed
+            .as_slice()
             .iter()
             .map(AllowedOperation::to_config_text)
             .collect();
@@ -2125,7 +2149,7 @@ mod proptests {
 
     #[test]
     fn parse_allowed_operations_rejects_duplicate_entries() {
-        let result = parse_allowed_operations(vec![
+        let result = AllowedOperations::parse(vec![
             "POST:prefix:/v1/responses".to_owned(),
             "GET:exact:/v1/models".to_owned(),
             "GET:exact:/v1/models".to_owned(),
@@ -2319,7 +2343,7 @@ mod proptests {
             let mut raw = raw_operations;
             raw.extend(iter::repeat_n(String::new(), empty_entries));
 
-            let result = parse_allowed_operations(raw);
+            let result = AllowedOperations::parse(raw);
 
             if expected_count == 0 {
                 let is_empty_error = matches!(result, Err(ConfigError::EmptyOperations));
@@ -2335,13 +2359,14 @@ mod proptests {
             } else {
                 let parsed = result.expect("valid operations should parse");
                 let operation_text: Vec<String> = parsed
+                    .as_slice()
                     .iter()
                     .map(AllowedOperation::to_config_text)
                     .collect();
                 let mut sorted_text = operation_text.clone();
                 sorted_text.sort();
 
-                prop_assert_eq!(parsed.len(), expected_count);
+                prop_assert_eq!(parsed.as_slice().len(), expected_count);
                 prop_assert_eq!(operation_text, sorted_text);
             }
         }
@@ -2354,7 +2379,7 @@ mod proptests {
             let raw = vec!["GET:exact:/v1/models".to_owned(); count];
 
             let is_too_many = matches!(
-                parse_allowed_operations(raw),
+                AllowedOperations::parse(raw),
                 Err(ConfigError::TooManyAllowedOperations { .. }),
             );
             prop_assert!(is_too_many);
