@@ -51,6 +51,12 @@ const ALREADY_EXISTS_OS_ERROR: i32 = 17;
 /// Maximum body size recorded by the test upstream.
 const MAX_RECORDED_BODY_BYTES: usize = 0x0010_0000;
 
+/// Maximum accepted origin-form path bytes.
+const MAX_ORIGIN_FORM_PATH_BYTES: usize = 4_096;
+
+/// Maximum accepted origin-form query bytes.
+const MAX_ORIGIN_FORM_QUERY_BYTES: usize = 8_192;
+
 /// One request observed by the recording upstream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedRequest {
@@ -552,10 +558,11 @@ fn wait_for_failure(mut child: Child) -> bool {
 )]
 mod tests {
     use super::{
-        Command, Duration, GatewayProcess, GatewayTestLock, RecordedRequest, StatusCode, Stdio,
-        empty_body_value, free_local_addr, non_empty_body_value, not_observed_body_value,
-        raw_response_status_line, sleep, spawn_gateway_command, start_fake_proxy,
-        start_redirecting_upstream, start_upstream, tempdir, wait_for_failure,
+        Command, Duration, GatewayProcess, GatewayTestLock, MAX_ORIGIN_FORM_PATH_BYTES,
+        MAX_ORIGIN_FORM_QUERY_BYTES, RecordedRequest, StatusCode, Stdio, Value, empty_body_value,
+        free_local_addr, non_empty_body_value, not_observed_body_value, raw_response_status_line,
+        sleep, spawn_gateway_command, start_fake_proxy, start_redirecting_upstream, start_upstream,
+        tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
     use reqwest::redirect::Policy;
@@ -572,6 +579,13 @@ mod tests {
     /// Asserts all values received for one upstream header.
     fn assert_header_values(request: &RecordedRequest, name: &str, expected: &[&str]) {
         assert_eq!(header_values(request, name), expected);
+    }
+
+    /// Asserts that a serialized audit field carries the bounded truncation suffix.
+    fn assert_truncated_audit_text(value: &Value, max_len: usize, original_len: usize) {
+        let text = value.as_str().expect("audit text should be a string");
+        assert_eq!(text.len(), max_len);
+        assert!(text.ends_with(&format!("...[truncated original_bytes={original_len}]")));
     }
 
     /// Returns all recorded values for one header.
@@ -656,6 +670,123 @@ mod tests {
         assert_eq!(event["request_body"], empty_body_value());
         assert_eq!(event["response_body"], non_empty_body_value(b"ok"));
         assert_eq!(event["version"], 3_u64);
+    }
+
+    #[tokio::test]
+    async fn maximum_path_is_allowed_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES - 1));
+        let allowed_operations = format!("GET:exact:{path}");
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), &allowed_operations).await;
+
+        let response = reqwest::get(format!("{}{}", gateway.base_url(), path))
+            .await
+            .expect("maximum path request should succeed");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.text().await.expect("response body should read"),
+            "ok"
+        );
+        let hits = recorded_hits(&recorder);
+        assert_eq!(hits.len(), 1);
+        let hit = hits.first().expect("one hit should be recorded");
+        assert_eq!(hit.path, path);
+        assert_eq!(hit.query, None);
+
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["path"].as_str(), Some(path.as_str()));
+        assert_eq!(event["query"], Value::Null);
+        assert_eq!(event["upstream_path"].as_str(), Some(path.as_str()));
+        assert_eq!(event["upstream_query"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn maximum_query_is_allowed_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let query = "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES);
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let response = reqwest::get(format!("{}/v1/models?{query}", gateway.base_url()))
+            .await
+            .expect("maximum query request should succeed");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.text().await.expect("response body should read"),
+            "ok"
+        );
+        let hits = recorded_hits(&recorder);
+        assert_eq!(hits.len(), 1);
+        let hit = hits.first().expect("one hit should be recorded");
+        assert_eq!(hit.path, "/v1/models");
+        assert_eq!(hit.query.as_deref(), Some(query.as_str()));
+
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["path"], "/v1/models");
+        assert_eq!(event["query"].as_str(), Some(query.as_str()));
+        assert_eq!(event["upstream_path"], "/v1/models");
+        assert_eq!(event["upstream_query"].as_str(), Some(query.as_str()));
+    }
+
+    #[tokio::test]
+    async fn overflow_path_and_query_are_denied_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+        let path_request = format!(
+            "GET {path} HTTP/1.1\r\n\
+             Host: proxy.local\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let path_status = raw_response_status_line(gateway.addr, &path_request).await;
+        assert_eq!(path_status, "HTTP/1.1 414 URI Too Long");
+
+        let query = "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+        let query_request = format!(
+            "GET /v1/models?{query} HTTP/1.1\r\n\
+             Host: proxy.local\r\n\
+             Connection: close\r\n\r\n"
+        );
+        let query_status = raw_response_status_line(gateway.addr, &query_request).await;
+        assert_eq!(query_status, "HTTP/1.1 414 URI Too Long");
+
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "overflow targets must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(2).await;
+        assert_eq!(events.len(), 2);
+
+        let path_event = events.first().expect("path denial should be audited");
+        assert_eq!(path_event["decision"], "denied");
+        assert_eq!(path_event["error_class"], "path_too_long");
+        assert_truncated_audit_text(&path_event["path"], MAX_ORIGIN_FORM_PATH_BYTES, path.len());
+        assert_eq!(path_event["query"], Value::Null);
+
+        let query_event = events.get(1).expect("query denial should be audited");
+        assert_eq!(query_event["decision"], "denied");
+        assert_eq!(query_event["error_class"], "query_too_long");
+        assert_eq!(query_event["path"], "/v1/models");
+        assert_truncated_audit_text(
+            &query_event["query"],
+            MAX_ORIGIN_FORM_QUERY_BYTES,
+            query.len(),
+        );
     }
 
     #[tokio::test]
