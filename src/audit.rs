@@ -8,7 +8,7 @@ use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, Up
 use crate::target::{
     MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
 };
-use ::http::{Method, StatusCode};
+use ::http::{Method, StatusCode, Uri};
 use core::fmt;
 use core::num::NonZeroU64;
 use serde::de::{Error as SerdeError, Unexpected};
@@ -590,6 +590,28 @@ impl ExistingAuditErrorClass {
 }
 
 impl ExistingAuditEventFields {
+    /// Validates that the audit target is authority-bearing.
+    fn expect_authority_target(&self, message: &'static str) -> Result<(), &'static str> {
+        if self.target_has_authority() {
+            Ok(())
+        } else {
+            Err(message)
+        }
+    }
+
+    /// Validates that the audit target is rejected without carrying authority.
+    fn expect_non_authority_target_rejection(
+        &self,
+        expected: RejectionReason,
+        message: &'static str,
+    ) -> Result<(), &'static str> {
+        if self.target_has_authority() {
+            Err(message)
+        } else {
+            self.expect_target_rejection(expected, message)
+        }
+    }
+
     /// Validates that the audit target reproduces the expected parser rejection.
     fn expect_target_rejection(
         &self,
@@ -610,6 +632,19 @@ impl ExistingAuditEventFields {
             .upstream_origin
             .join_path_query(accepted.origin_form_path(), accepted.origin_form_query());
         Ok(AuditUpstreamTarget::from_url(&url))
+    }
+
+    /// Returns the audited request target as it appeared on the wire.
+    fn raw_target_text(&self) -> String {
+        self.query.as_ref().map_or_else(
+            || self.path.clone(),
+            |query| format!("{}?{query}", self.path),
+        )
+    }
+
+    /// Returns true when the audited target carries an HTTP authority.
+    fn target_has_authority(&self) -> bool {
+        Uri::try_from(self.raw_target_text().as_str()).is_ok_and(|uri| uri.authority().is_some())
     }
 
     /// Validates cross-field invariants that JSON shape alone cannot encode.
@@ -637,8 +672,10 @@ impl ExistingAuditEventFields {
         }
 
         match error_class {
-            ExistingAuditErrorClass::AbsoluteFormUnsupported
-            | ExistingAuditErrorClass::NonOriginForm => self.expect_target_rejection(
+            ExistingAuditErrorClass::AbsoluteFormUnsupported => {
+                self.expect_authority_target("audit target does not match absolute-form denial")
+            }
+            ExistingAuditErrorClass::NonOriginForm => self.expect_non_authority_target_rejection(
                 RejectionReason::NonOriginForm,
                 "audit target does not match non-origin-form denial",
             ),
@@ -4429,6 +4466,71 @@ mod tests {
     }
 
     #[test]
+    pub(super) fn existing_denied_target_distinguishes_authority_targets() {
+        let absolute_form = existing_denied_target_fields(
+            ExistingAuditErrorClass::AbsoluteFormUnsupported,
+            "http://evil.example/steal",
+            Some("limit=1"),
+        );
+        let absolute_form_misclassified = existing_denied_target_fields(
+            ExistingAuditErrorClass::NonOriginForm,
+            "http://evil.example/steal",
+            Some("limit=1"),
+        );
+        let non_origin_form =
+            existing_denied_target_fields(ExistingAuditErrorClass::NonOriginForm, "*", None);
+        let non_origin_form_misclassified = existing_denied_target_fields(
+            ExistingAuditErrorClass::AbsoluteFormUnsupported,
+            "*",
+            None,
+        );
+
+        assert_eq!(
+            absolute_form.validate_denied_target(absolute_form.error_class),
+            Ok(())
+        );
+        assert_eq!(
+            absolute_form_misclassified
+                .validate_denied_target(absolute_form_misclassified.error_class),
+            Err("audit target does not match non-origin-form denial")
+        );
+        assert_eq!(
+            non_origin_form.validate_denied_target(non_origin_form.error_class),
+            Ok(())
+        );
+        assert_eq!(
+            non_origin_form_misclassified
+                .validate_denied_target(non_origin_form_misclassified.error_class),
+            Err("audit target does not match absolute-form denial")
+        );
+    }
+
+    fn existing_denied_target_fields(
+        error_class: ExistingAuditErrorClass,
+        path: &str,
+        query: Option<&str>,
+    ) -> ExistingAuditEventFields {
+        ExistingAuditEventFields {
+            decision: ExistingAuditDecision::Denied,
+            error_class: Some(error_class),
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: query.map(str::to_owned),
+            request_body: ExistingAuditBodySummary::Empty,
+            request_id: "req-000000000000000a-000000000000000b-0000000000000001".to_owned(),
+            response_body: ExistingAuditBodySummary::NotObserved,
+            status: error_class
+                .fixed_status()
+                .expect("denial should have a fixed status"),
+            timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
+            upstream_origin: upstream_origin(),
+            upstream_path: None,
+            upstream_query: None,
+            version: AuditSchemaVersion::CURRENT,
+        }
+    }
+
+    #[test]
     pub(super) fn existing_upstream_targets_are_derived_from_accepted_targets() {
         let accepted = existing_upstream_error_fields(
             "/v1/models",
@@ -5507,6 +5609,7 @@ mod proptests {
     use super::tests::{
         TailReader, TailReaderFailure, denial_existing_event_lines,
         existing_denial_error_classes_bind_statuses,
+        existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
         existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
@@ -6022,6 +6125,7 @@ mod proptests {
     #[test]
     fn existing_audit_helpers_cover_closed_domains_under_property_filter() {
         existing_denial_error_classes_bind_statuses();
+        existing_denied_target_distinguishes_authority_targets();
         existing_denied_target_rejects_non_denial_error_classes();
         existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
