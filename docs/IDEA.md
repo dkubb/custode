@@ -289,7 +289,8 @@ Each audit event MUST include:
 - incoming path and query;
 - configured upstream origin;
 - upstream path and query when an upstream request is attempted, where the
-  upstream query MUST equal the accepted incoming query;
+  upstream query records the query from the joined upstream URL and MAY differ
+  from the accepted incoming query only by URL serialization;
 - response status when one exists;
 - request body summary with one of three states: not observed, observed empty,
   or observed non-empty with byte count and body digest;
