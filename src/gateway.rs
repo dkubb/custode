@@ -14,6 +14,7 @@ use ::http::{Error as HttpError, StatusCode};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 
 /// Shared gateway state.
 #[derive(Clone, Debug)]
@@ -26,6 +27,8 @@ pub(crate) struct Gateway {
     clock: Arc<dyn Clock>,
     /// Parsed gateway configuration.
     config: Arc<GatewayConfig>,
+    /// Gate that blocks new upstream forwarding when audit fails.
+    forwarding_gate: Arc<RwLock<()>>,
     /// Request identity source.
     request_ids: Arc<dyn RequestIdSource>,
 }
@@ -52,6 +55,13 @@ pub(crate) enum GatewayError {
     /// Gateway response could not be built.
     #[error("failed to build response: {0}")]
     ResponseBuild(HttpError),
+}
+
+/// Permit proving upstream forwarding started before audit closed.
+#[derive(Debug)]
+pub(crate) struct ForwardingPermit {
+    /// Read guard held until upstream dispatch completes.
+    _guard: OwnedRwLockReadGuard<()>,
 }
 
 /// Input for response audit events.
@@ -243,7 +253,7 @@ impl Gateway {
     /// Writes one required audit event and records permanent audit failure.
     async fn append_required_audit_event(&self, event: &AuditEvent) -> Result<(), GatewayError> {
         if let Err(error) = self.audit.append_event(event).await {
-            self.audit_failed.store(true, Ordering::SeqCst);
+            self.close_forwarding().await;
             Err(GatewayError::Audit(error))
         } else {
             Ok(())
@@ -334,6 +344,22 @@ impl Gateway {
         self.append_required_audit_event(&event).await
     }
 
+    /// Starts upstream forwarding unless audit has already failed.
+    pub(crate) async fn begin_forwarding(&self) -> Result<ForwardingPermit, GatewayError> {
+        let guard = Arc::clone(&self.forwarding_gate).read_owned().await;
+        if self.audit_available() {
+            Ok(ForwardingPermit { _guard: guard })
+        } else {
+            Err(GatewayError::AuditUnavailable)
+        }
+    }
+
+    /// Closes future upstream forwarding after a required audit failure.
+    async fn close_forwarding(&self) {
+        let _guard = self.forwarding_gate.write().await;
+        self.audit_failed.store(true, Ordering::SeqCst);
+    }
+
     /// Returns the parsed configuration.
     #[must_use]
     pub(crate) fn config(&self) -> &GatewayConfig {
@@ -353,6 +379,7 @@ impl Gateway {
             audit_failed: Arc::new(AtomicBool::new(false)),
             clock: Arc::new(clock),
             config: Arc::new(config),
+            forwarding_gate: Arc::new(RwLock::new(())),
             request_ids: Arc::new(request_ids),
         }
     }
@@ -366,6 +393,7 @@ impl Gateway {
     }
 
     /// Returns an error when a previous required audit event failed.
+    #[cfg(test)]
     pub(crate) fn require_audit_available(&self) -> Result<(), GatewayError> {
         if self.audit_available() {
             Ok(())
@@ -480,6 +508,15 @@ mod tests {
             SequentialRequestIds::new(RunToken::for_test("000000000000000a-000000000000000b")),
         );
 
+        let permit = gateway
+            .begin_forwarding()
+            .await
+            .expect("forwarding should start before audit failure");
+        drop(permit);
+        gateway
+            .require_audit_available()
+            .expect("audit should start available");
+
         let result = gateway
             .audit_denial(
                 RequestId::from_parts(
@@ -500,6 +537,10 @@ mod tests {
         assert!(!gateway.audit_available());
         assert!(matches!(
             gateway.require_audit_available(),
+            Err(GatewayError::AuditUnavailable)
+        ));
+        assert!(matches!(
+            gateway.begin_forwarding().await,
             Err(GatewayError::AuditUnavailable)
         ));
     }

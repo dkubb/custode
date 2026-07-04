@@ -450,15 +450,17 @@ async fn forward_request(
         request_id,
         target,
     } = accepted_request;
-    gateway.require_audit_available()?;
-
     let upstream_request = UpstreamRequest::from_target(
         &target,
         request_headers,
         &request_body,
         UpstreamDeadline::from_timeout(gateway.config().request_timeout()),
     );
-    let upstream_response = match client.send(upstream_request).await {
+    let upstream_result = {
+        let _forwarding_permit = gateway.begin_forwarding().await?;
+        client.send(upstream_request).await
+    };
+    let upstream_response = match upstream_result {
         Ok(upstream_response) => upstream_response,
         Err(error) => {
             let audit_error = audit_upstream_error(&error);
@@ -1678,8 +1680,8 @@ mod tests {
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::{HeaderError, forward_request_headers};
     use crate::ports::{
-        AuditSink, BoxFuture, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline,
-        UpstreamError, UpstreamErrorKind, UpstreamResponse,
+        AuditSink, BoxFuture, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamClient,
+        UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
     };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
@@ -1824,6 +1826,17 @@ mod tests {
         release_first_append: Arc<Notify>,
     }
 
+    /// Upstream client that blocks the first send until released.
+    #[derive(Clone, Debug)]
+    struct BlockingFirstUpstreamClient {
+        /// First send notification.
+        first_send_started: Arc<Notify>,
+        /// Release notification for the first send.
+        release_first_send: Arc<Notify>,
+        /// Number of upstream sends attempted.
+        send_count: Arc<Mutex<usize>>,
+    }
+
     impl AuditSink for BlockingFirstAuditSink {
         fn append_event<'future>(
             &'future self,
@@ -1861,6 +1874,39 @@ mod tests {
         }
     }
 
+    impl UpstreamClient for BlockingFirstUpstreamClient {
+        fn send(
+            &self,
+            _request: UpstreamRequest,
+        ) -> BoxFuture<'_, Result<UpstreamResponse, UpstreamError>> {
+            let first_send_started = Arc::clone(&self.first_send_started);
+            let release_first_send = Arc::clone(&self.release_first_send);
+            let send_count = Arc::clone(&self.send_count);
+
+            Box::pin(async move {
+                let send_number = {
+                    let mut count = send_count
+                        .lock()
+                        .expect("blocking upstream send count should not be poisoned");
+                    let next = count
+                        .checked_add(1)
+                        .expect("blocking upstream send count should not overflow");
+                    *count = next;
+                    next
+                };
+                if send_number == 1 {
+                    first_send_started.notify_one();
+                    release_first_send.notified().await;
+                }
+                Ok(UpstreamResponse::new(
+                    StatusCode::OK,
+                    HeaderMap::new(),
+                    stream::empty::<Result<Bytes, UpstreamBodyError>>().boxed(),
+                ))
+            })
+        }
+    }
+
     impl BlockingFirstAuditSink {
         /// Returns the number of attempted audit events.
         #[must_use]
@@ -1890,6 +1936,36 @@ mod tests {
                     release_first_append,
                 },
             )
+        }
+    }
+
+    impl BlockingFirstUpstreamClient {
+        /// Builds a blocking first-send upstream client.
+        #[must_use]
+        fn new() -> Self {
+            Self {
+                first_send_started: Arc::new(Notify::new()),
+                release_first_send: Arc::new(Notify::new()),
+                send_count: Arc::new(Mutex::new(0)),
+            }
+        }
+
+        /// Releases the first upstream send.
+        fn release_first_send(&self) {
+            self.release_first_send.notify_one();
+        }
+
+        /// Returns the number of upstream sends attempted.
+        fn send_count(&self) -> usize {
+            *self
+                .send_count
+                .lock()
+                .expect("blocking upstream send count should not be poisoned")
+        }
+
+        /// Waits until the first upstream send starts.
+        async fn wait_for_first_send(&self) {
+            self.first_send_started.notified().await;
         }
     }
 
@@ -3664,6 +3740,117 @@ mod tests {
 
         assert!(matches!(result, Err(GatewayError::AuditUnavailable)));
         assert!(recorded_upstream_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_forwarding_waits_for_audit_failure_before_upstream() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let target = allowed_target(&config, "/v1/models");
+        let (audit, _audit_recorder) =
+            MemoryAuditSink::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"));
+        let audit_observer = audit.clone();
+        let upstream = BlockingFirstUpstreamClient::new();
+        let upstream_client: Arc<dyn UpstreamClient> = Arc::new(upstream.clone());
+        let gateway = Gateway::from_ports(config, audit, FixedClock, fixed_request_ids());
+        let (fatal_errors, _fatal_receiver) = mpsc::unbounded_channel();
+        let first_forward = {
+            let first_request = ForwardRequestInput {
+                permit: test_permit(),
+                request_body: AccountedBody::read_request(Body::empty(), request_body_limit(1))
+                    .await
+                    .expect("empty request body should be accounted"),
+                request_headers: forward_request_headers(
+                    &HeaderMap::new(),
+                    gateway.config().max_request_header_bytes(),
+                )
+                .expect("empty headers should forward"),
+                request_id: RequestId::from_parts(
+                    &RunToken::for_test("0000000000007e57-000000000000c0de"),
+                    NonZeroU64::new(1).expect("sequence should be non-zero"),
+                ),
+                target: target.clone(),
+            };
+            tokio::spawn(forward_request(
+                fatal_errors.clone(),
+                gateway.clone(),
+                Arc::clone(&upstream_client),
+                first_request,
+            ))
+        };
+
+        upstream.wait_for_first_send().await;
+
+        let audit_close = tokio::spawn({
+            let audit_gateway = gateway.clone();
+            async move {
+                audit_gateway
+                    .audit_denial(
+                        RequestId::from_parts(
+                            &RunToken::for_test("0000000000007e57-000000000000c0de"),
+                            NonZeroU64::new(3).expect("sequence should be non-zero"),
+                        ),
+                        AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(
+                            &Uri::from_static("/"),
+                        )),
+                        None,
+                    )
+                    .await
+            }
+        });
+        while audit_observer.event_count() == 0 {
+            yield_now().await;
+        }
+        yield_now().await;
+
+        let second_forward = {
+            let second_request = ForwardRequestInput {
+                permit: test_permit(),
+                request_body: AccountedBody::read_request(Body::empty(), request_body_limit(1))
+                    .await
+                    .expect("empty request body should be accounted"),
+                request_headers: forward_request_headers(
+                    &HeaderMap::new(),
+                    gateway.config().max_request_header_bytes(),
+                )
+                .expect("empty headers should forward"),
+                request_id: RequestId::from_parts(
+                    &RunToken::for_test("0000000000007e57-000000000000c0de"),
+                    NonZeroU64::new(2).expect("sequence should be non-zero"),
+                ),
+                target,
+            };
+            tokio::spawn(forward_request(
+                fatal_errors,
+                gateway,
+                Arc::clone(&upstream_client),
+                second_request,
+            ))
+        };
+        yield_now().await;
+
+        assert_eq!(upstream.send_count(), 1);
+        assert!(!second_forward.is_finished());
+
+        upstream.release_first_send();
+
+        let first_result = first_forward
+            .await
+            .expect("first forwarding task should join");
+        let audit_result = audit_close.await.expect("audit close task should join");
+        let second_result = second_forward
+            .await
+            .expect("second forwarding task should join");
+
+        first_result.expect("first forwarding should have started before audit closed");
+        assert!(matches!(
+            audit_result,
+            Err(GatewayError::Audit(AuditError::Write(_)))
+        ));
+        assert!(matches!(second_result, Err(GatewayError::AuditUnavailable)));
+        assert_eq!(upstream.send_count(), 1);
     }
 
     #[tokio::test]
