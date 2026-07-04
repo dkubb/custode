@@ -1036,13 +1036,20 @@ impl UpstreamOrigin {
 #[cfg(fuzzing)]
 /// Fuzz-only configuration parser oracles.
 pub mod fuzzing {
-    use super::AllowedOperation;
+    use super::{AllowedOperation, UpstreamOrigin};
 
     /// Parses arbitrary bytes as a lossy allowed-operation string.
     pub fn allowed_operation_parse(input: &[u8]) {
         let raw = String::from_utf8_lossy(input);
 
         let _result = AllowedOperation::parse(raw.as_ref());
+    }
+
+    /// Parses arbitrary bytes as a lossy upstream-origin string.
+    pub fn upstream_origin_parse(input: &[u8]) {
+        let raw = String::from_utf8_lossy(input);
+
+        let _result = UpstreamOrigin::parse(raw.as_ref());
     }
 }
 

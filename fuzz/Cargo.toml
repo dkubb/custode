@@ -26,5 +26,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "upstream_origin_parse"
+path = "fuzz_targets/upstream_origin_parse.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]
