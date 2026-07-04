@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
-use tokio::fs::{File, OpenOptions, create_dir_all};
+use tokio::fs::{OpenOptions, create_dir_all};
 use tokio::io::{
     AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _,
 };
@@ -193,6 +193,10 @@ pub(crate) enum AuditError {
         source: io::Error,
     },
 
+    /// Audit log may contain a partial event from an earlier write failure.
+    #[error("audit writer is poisoned after a previous write failure")]
+    Poisoned,
+
     /// Audit log ended with a partial NDJSON event.
     #[error("audit path {path} has a partial final event")]
     TornLog {
@@ -220,6 +224,11 @@ enum AuditLogTail {
 trait AuditLogTailReader: AsyncRead + AsyncSeek + Send + Unpin {}
 
 impl<T> AuditLogTailReader for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
+
+/// Sendable writer surface required to append audit events.
+trait AuditLogWriter: AsyncWrite + Send + Unpin {}
+
+impl<T> AuditLogWriter for T where T: AsyncWrite + Send + Unpin {}
 
 /// Structured audit event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -427,12 +436,20 @@ pub(crate) struct AuditTarget {
 }
 
 /// Newline-delimited JSON audit writer.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct AuditWriter {
-    /// Audit log file guarded for append writes.
-    file: Arc<Mutex<File>>,
     /// Maximum serialized event bytes, including the NDJSON newline.
     max_event_bytes: AuditEventBytes,
+    /// Audit log writer state guarded for append writes.
+    state: Arc<Mutex<AuditWriterState>>,
+}
+
+/// Mutable audit writer state.
+struct AuditWriterState {
+    /// Whether a prior write may have left a partial event.
+    poisoned: bool,
+    /// Concrete append writer.
+    writer: Box<dyn AuditLogWriter>,
 }
 
 /// Request identity used in audit events.
@@ -996,6 +1013,14 @@ impl From<&AcceptedTarget> for AuditTarget {
     }
 }
 
+impl fmt::Debug for AuditWriter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AuditWriter")
+            .field("max_event_bytes", &self.max_event_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
 impl AuditEvent {
     /// Creates an audit event for a request decision.
     #[cfg(test)]
@@ -1075,6 +1100,29 @@ impl AuditEvent {
     }
 }
 
+impl AuditWriterState {
+    /// Creates append state around one concrete audit writer.
+    fn new(writer: impl AuditLogWriter + 'static) -> Self {
+        Self {
+            poisoned: false,
+            writer: Box::new(writer),
+        }
+    }
+
+    /// Writes serialized audit bytes unless a previous write failed.
+    async fn write_serialized(&mut self, serialized: &[u8]) -> Result<(), AuditError> {
+        if self.poisoned {
+            return Err(AuditError::Poisoned);
+        }
+
+        let result = write_serialized_event(&mut *self.writer, serialized).await;
+        if matches!(&result, Err(AuditError::Write(_error))) {
+            self.poisoned = true;
+        }
+        result
+    }
+}
+
 impl AuditWriter {
     /// Opens an audit writer in append mode.
     ///
@@ -1110,8 +1158,8 @@ impl AuditWriter {
             }
         }
         Ok(Self {
-            file: Arc::new(Mutex::new(audit_file)),
             max_event_bytes: config.max_audit_event_bytes(),
+            state: Arc::new(Mutex::new(AuditWriterState::new(audit_file))),
         })
     }
 
@@ -1123,10 +1171,21 @@ impl AuditWriter {
     pub(crate) async fn write_event(&self, event: &AuditEvent) -> Result<(), AuditError> {
         let serialized = serialize_event(event, self.max_event_bytes)?;
 
-        let mut file = self.file.lock().await;
-        let result = write_serialized_event(&mut *file, &serialized).await;
-        drop(file);
-        result
+        self.state.lock().await.write_serialized(&serialized).await
+    }
+}
+
+#[cfg(test)]
+impl AuditWriter {
+    /// Creates an audit writer around a supplied test writer.
+    fn for_test_writer(
+        writer: impl AuditLogWriter + 'static,
+        max_event_bytes: AuditEventBytes,
+    ) -> Self {
+        Self {
+            max_event_bytes,
+            state: Arc::new(Mutex::new(AuditWriterState::new(writer))),
+        }
     }
 }
 
@@ -1419,7 +1478,7 @@ fn serialize_json_event(event: &AuditEvent) -> Vec<u8> {
 /// Writes serialized audit bytes to the supplied writer.
 async fn write_serialized_event<W>(writer: &mut W, serialized: &[u8]) -> Result<(), AuditError>
 where
-    W: AsyncWrite + Unpin,
+    W: AsyncWrite + Unpin + ?Sized,
 {
     writer
         .write_all(serialized)
@@ -1444,7 +1503,9 @@ mod tests {
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::{GatewayConfig, MIN_AUDIT_EVENT_BYTES, ResponseBodyBytes, UpstreamOrigin};
+    use crate::config::{
+        AuditEventBytes, GatewayConfig, MIN_AUDIT_EVENT_BYTES, ResponseBodyBytes, UpstreamOrigin,
+    };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, StatusCode};
     use core::num::{NonZeroU64, NonZeroUsize};
@@ -1457,6 +1518,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::Command;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::UNIX_EPOCH;
     use std::{fs, io};
     use tempfile::tempdir;
@@ -1469,6 +1531,20 @@ mod tests {
         failure: WriterFailure,
     }
 
+    /// Test writer that writes a prefix, then fails the next write.
+    #[derive(Debug)]
+    struct PartialWriteThenFailWriter {
+        /// Bytes successfully written before failure.
+        bytes: SharedWrittenBytes,
+        /// Prefix bytes to write before failing.
+        prefix_bytes: usize,
+        /// Write calls observed by the writer.
+        write_calls: u8,
+    }
+
+    /// Shared captured bytes from a test writer.
+    type SharedWrittenBytes = StdArc<StdMutex<Vec<u8>>>;
+
     /// Test writer failure mode.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     enum WriterFailure {
@@ -1477,6 +1553,17 @@ mod tests {
 
         /// Fail writes.
         Write,
+    }
+
+    impl PartialWriteThenFailWriter {
+        /// Creates a writer that writes `prefix_bytes` before failing.
+        fn new(bytes: SharedWrittenBytes, prefix_bytes: usize) -> Self {
+            Self {
+                bytes,
+                prefix_bytes,
+                write_calls: 0,
+            }
+        }
     }
 
     /// Test reader that can fail one audit-tail inspection operation.
@@ -1642,6 +1729,55 @@ mod tests {
                 }
                 WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
             }
+        }
+    }
+
+    impl AsyncWrite for PartialWriteThenFailWriter {
+        fn is_write_vectored(&self) -> bool {
+            false
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.write_calls > 0 {
+                return Poll::Ready(Err(io::Error::other("partial write failed")));
+            }
+
+            let length = self.prefix_bytes.min(buf.len());
+            let prefix = buf
+                .get(..length)
+                .expect("prefix length should be bounded by buffer length");
+            self.bytes
+                .lock()
+                .expect("written bytes should lock")
+                .extend_from_slice(prefix);
+            self.write_calls = self
+                .write_calls
+                .checked_add(1)
+                .expect("test write count should not overflow");
+            Poll::Ready(Ok(length))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let Some(first) = bufs.iter().find(|buf| !buf.is_empty()) else {
+                return Poll::Ready(Ok(0));
+            };
+            self.poll_write(cx, first)
         }
     }
 
@@ -2332,6 +2468,7 @@ mod tests {
             .await
             .expect("audit writer should open");
 
+        assert!(format!("{writer:?}").contains("AuditWriter"));
         writer
             .write_event(&denied_event())
             .await
@@ -2438,6 +2575,32 @@ mod tests {
         ));
         let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
         assert_eq!(contents, "");
+    }
+
+    #[tokio::test]
+    async fn write_event_poisons_writer_after_partial_write_failure() {
+        let written = StdArc::new(StdMutex::new(Vec::new()));
+        let writer = AuditWriter::for_test_writer(
+            PartialWriteThenFailWriter::new(StdArc::clone(&written), 8),
+            AuditEventBytes::for_test(roomy_event_limit()),
+        );
+
+        let first = writer.write_event(&denied_event()).await;
+
+        assert!(matches!(first, Err(AuditError::Write(_))));
+        let after_first = written.lock().expect("written bytes should lock").clone();
+        assert_eq!(after_first, b"{\"decisi");
+
+        let second = writer.write_event(&denied_event()).await;
+
+        assert!(matches!(second, Err(AuditError::Poisoned)));
+        assert_eq!(
+            written
+                .lock()
+                .expect("written bytes should lock")
+                .as_slice(),
+            after_first.as_slice()
+        );
     }
 
     #[tokio::test]
