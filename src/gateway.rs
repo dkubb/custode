@@ -47,10 +47,6 @@ pub(crate) enum GatewayError {
     #[error("{0}")]
     RequestId(#[from] RequestIdError),
 
-    /// Final response chunk could not be queued after the allowed audit event.
-    #[error("downstream closed after allowed response audit")]
-    ResponseBodyClosedAfterAllowedAudit,
-
     /// Gateway response could not be built.
     #[error("failed to build response: {0}")]
     ResponseBuild(HttpError),
