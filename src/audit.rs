@@ -760,6 +760,11 @@ impl ExistingAuditEventFields {
         Ok(AuditUpstreamTarget::from_url(&url))
     }
 
+    /// Returns true when the complete audited target parses with an authority.
+    fn parsed_target_has_authority(&self) -> bool {
+        Uri::try_from(self.raw_target_text().as_str()).is_ok_and(|uri| uri.authority().is_some())
+    }
+
     /// Returns the audited request target as it appeared on the wire.
     fn raw_target_text(&self) -> String {
         self.query.as_ref().map_or_else(
@@ -770,7 +775,13 @@ impl ExistingAuditEventFields {
 
     /// Returns true when the audited target carries an HTTP authority.
     fn target_has_authority(&self) -> bool {
-        Uri::try_from(self.raw_target_text().as_str()).is_ok_and(|uri| uri.authority().is_some())
+        self.parsed_target_has_authority() || self.truncated_target_has_authority()
+    }
+
+    /// Returns true when writer-shaped truncation preserves an authority prefix.
+    fn truncated_target_has_authority(&self) -> bool {
+        truncated_audit_text_prefix(&self.path, MAX_AUDIT_TARGET_PATH_BYTES)
+            .is_some_and(|prefix| Uri::try_from(prefix).is_ok_and(|uri| uri.authority().is_some()))
     }
 
     /// Validates cross-field invariants that JSON shape alone cannot encode.
@@ -3329,6 +3340,10 @@ mod tests {
 
     /// Builds valid writer-shaped denied existing audit event lines.
     pub(super) fn denial_existing_event_lines() -> Vec<(&'static str, Vec<u8>)> {
+        let absolute_form_too_long = format!(
+            "http://evil.example/{}",
+            "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES)
+        );
         let path_too_long = format!("/{}", "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES));
         let query_too_long = "q".repeat(MAX_AUDIT_TARGET_QUERY_BYTES + 1);
 
@@ -3338,6 +3353,14 @@ mod tests {
                 serialized_denial_event_line(
                     "GET",
                     AuditTarget::from_uri_parts("http://evil.example/steal", None),
+                    AuditDenialReason::AbsoluteFormUnsupported,
+                ),
+            ),
+            (
+                "absolute form unsupported with truncated target",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts(&absolute_form_too_long, None),
                     AuditDenialReason::AbsoluteFormUnsupported,
                 ),
             ),
@@ -4667,6 +4690,13 @@ mod tests {
 
     #[test]
     pub(super) fn existing_denied_target_distinguishes_authority_targets() {
+        let absolute_form_too_long = AuditTarget::from_uri_parts(
+            &format!(
+                "http://evil.example/{}",
+                "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES)
+            ),
+            None,
+        );
         let absolute_form = existing_denied_target_fields(
             ExistingAuditErrorClass::AbsoluteFormUnsupported,
             "http://evil.example/steal",
@@ -4676,6 +4706,16 @@ mod tests {
             ExistingAuditErrorClass::NonOriginForm,
             "http://evil.example/steal",
             Some("limit=1"),
+        );
+        let truncated_absolute_form = existing_denied_target_fields(
+            ExistingAuditErrorClass::AbsoluteFormUnsupported,
+            absolute_form_too_long.path(),
+            absolute_form_too_long.query(),
+        );
+        let truncated_absolute_form_misclassified = existing_denied_target_fields(
+            ExistingAuditErrorClass::NonOriginForm,
+            absolute_form_too_long.path(),
+            absolute_form_too_long.query(),
         );
         let non_origin_form =
             existing_denied_target_fields(ExistingAuditErrorClass::NonOriginForm, "*", None);
@@ -4692,6 +4732,15 @@ mod tests {
         assert_eq!(
             absolute_form_misclassified
                 .validate_denied_target(absolute_form_misclassified.error_class),
+            Err("audit target does not match non-origin-form denial")
+        );
+        assert_eq!(
+            truncated_absolute_form.validate_denied_target(truncated_absolute_form.error_class),
+            Ok(())
+        );
+        assert_eq!(
+            truncated_absolute_form_misclassified
+                .validate_denied_target(truncated_absolute_form_misclassified.error_class),
             Err("audit target does not match non-origin-form denial")
         );
         assert_eq!(
