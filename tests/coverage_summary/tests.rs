@@ -174,9 +174,8 @@ fn exclude_test_modules_requires_detailed_events_for_summary_misses() {
 
     assert_ne!(output.status.code(), Some(0_i32));
     assert!(
-        stderr.contains(
-            "coverage detail missing uncovered functions events despite summary misses"
-        ),
+        stderr
+            .contains("coverage detail missing uncovered functions events despite summary misses"),
         "{stderr}"
     );
 }
