@@ -829,16 +829,20 @@ mod tests {
         use crate::http::TERMINAL_STREAM_ABORT_ERROR;
         use crate::ports::AuditSink as _;
         use crate::sim::{
-            MAX_SCENARIO_BODY_BYTES, MemoryAuditSink, Scenario, ScenarioAdmission, ScenarioAudit,
+            MAX_SCENARIO_BODY_BYTES, MAX_SCENARIO_HEADER_NAME_BYTES,
+            MAX_SCENARIO_HEADER_VALUE_BYTES, MAX_SCENARIO_HEADERS, MemoryAuditSink,
+            SCENARIO_HEADER_NAMES, Scenario, ScenarioAdmission, ScenarioAudit,
             ScenarioBody as ScenarioRequestBody, ScenarioBounds, ScenarioClass, ScenarioDownstream,
-            ScenarioRequest, ScenarioRequestError, ScenarioTarget, ScenarioUpstream, scenario_any,
+            ScenarioHeaders, ScenarioRequest, ScenarioRequestError, ScenarioTarget,
+            ScenarioUpstream, scenario_any,
         };
         use crate::target::{OriginFormPath, OriginFormQuery};
         use axum::body::Bytes;
         use core::num::{NonZeroU64, NonZeroUsize};
         use http::{Method, StatusCode, Uri};
-        use proptest::collection;
         use proptest::prelude::*;
+        use proptest::sample::select;
+        use proptest::{collection, prop_oneof};
         use serde_json::{Map, Value};
         use std::path::PathBuf;
         use tokio::runtime::Builder;
@@ -1472,9 +1476,89 @@ mod tests {
             )
         }
 
+        /// Generates invalid deterministic scenario header names.
+        fn invalid_scenario_header_name_any() -> impl Strategy<Value = String> {
+            select(vec!["", "not a header", "bad:header"]).prop_map(str::to_owned)
+        }
+
+        /// Generates invalid deterministic scenario header values.
+        fn invalid_scenario_header_value_any() -> impl Strategy<Value = String> {
+            select(vec!["\r", "\n", "ok\r"]).prop_map(str::to_owned)
+        }
+
+        /// Generates invalid deterministic scenario `Connection` values.
+        fn invalid_scenario_connection_value_any() -> impl Strategy<Value = String> {
+            select(vec!["", ",", "te,", "accept", "bad header"]).prop_map(str::to_owned)
+        }
+
+        /// Generates overlong deterministic scenario header names.
+        fn overlong_scenario_header_name_any() -> impl Strategy<Value = String> {
+            (1..33_usize).prop_map(|extra| {
+                let length = MAX_SCENARIO_HEADER_NAME_BYTES
+                    .checked_add(extra)
+                    .expect("test header name length should not overflow");
+                "x".repeat(length)
+            })
+        }
+
+        /// Generates overlong deterministic scenario header values.
+        fn overlong_scenario_header_value_any() -> impl Strategy<Value = String> {
+            (1..33_usize).prop_map(|extra| {
+                let length = MAX_SCENARIO_HEADER_VALUE_BYTES
+                    .checked_add(extra)
+                    .expect("test header value length should not overflow");
+                "A".repeat(length)
+            })
+        }
+
+        /// Generates unsupported deterministic scenario header names.
+        fn unsupported_scenario_header_name_any() -> impl Strategy<Value = String> {
+            select(vec!["accept", "content-type", "x-test"]).prop_map(str::to_owned)
+        }
+
         /// Generates valid deterministic scenario body bytes.
         fn valid_scenario_body_bytes_any() -> impl Strategy<Value = Vec<u8>> {
             collection::vec(any::<u8>(), 0..(MAX_SCENARIO_BODY_BYTES + 1))
+        }
+
+        /// Generates valid deterministic scenario header fields.
+        fn valid_scenario_header_field_any() -> impl Strategy<Value = (String, String)> {
+            valid_scenario_header_name_any().prop_flat_map(|name| {
+                let value = if name == "connection" {
+                    valid_scenario_connection_value_any().boxed()
+                } else {
+                    valid_scenario_header_value_any().boxed()
+                };
+                (Just(name), value)
+            })
+        }
+
+        /// Generates valid deterministic scenario header field sets.
+        fn valid_scenario_header_fields_any() -> impl Strategy<Value = Vec<(String, String)>> {
+            collection::vec(
+                valid_scenario_header_field_any(),
+                0..(MAX_SCENARIO_HEADERS + 1),
+            )
+        }
+
+        /// Generates valid deterministic scenario header names.
+        fn valid_scenario_header_name_any() -> impl Strategy<Value = String> {
+            select(SCENARIO_HEADER_NAMES.to_vec()).prop_map(str::to_owned)
+        }
+
+        /// Generates valid deterministic scenario header values.
+        fn valid_scenario_header_value_any() -> impl Strategy<Value = String> {
+            prop_oneof![
+                collection::vec(b' '..=b'~', 0..(MAX_SCENARIO_HEADER_VALUE_BYTES + 1),).prop_map(
+                    |bytes| String::from_utf8(bytes).expect("ASCII bytes should be UTF-8")
+                ),
+                Just("x-visible, x-drop".to_owned()),
+            ]
+        }
+
+        /// Generates valid deterministic scenario `Connection` values.
+        fn valid_scenario_connection_value_any() -> impl Strategy<Value = String> {
+            select(vec!["te", "upgrade", "x-drop", "x-visible, x-drop"]).prop_map(str::to_owned)
         }
 
         proptest! {
@@ -1535,6 +1619,140 @@ mod tests {
                 );
             }
 
+            #[test]
+            fn scenario_headers_parser_accepts_valid_fields(
+                fields in valid_scenario_header_fields_any(),
+            ) {
+                let headers = ScenarioHeaders::try_from_fields(fields.clone())
+                    .expect("valid header fields should parse");
+
+                prop_assert_eq!(headers.as_slice(), fields.as_slice());
+                prop_assert_eq!(headers.parsed_slice().len(), fields.len());
+                for (expected, parsed) in fields.iter().zip(headers.parsed_slice()) {
+                    prop_assert_eq!(parsed.0.as_str(), expected.0.as_str());
+                    prop_assert_eq!(
+                        parsed.1.to_str().expect("valid header should be visible ASCII"),
+                        expected.1.as_str()
+                    );
+                }
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_too_many_fields(
+                fields in collection::vec(
+                    valid_scenario_header_field_any(),
+                    (MAX_SCENARIO_HEADERS + 1)..(MAX_SCENARIO_HEADERS + 9),
+                ),
+            ) {
+                let field_count = fields.len();
+
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(fields),
+                    Err(ScenarioRequestError::TooManyHeaders {
+                        count: field_count,
+                        max: MAX_SCENARIO_HEADERS,
+                    })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_invalid_names(
+                name in invalid_scenario_header_name_any(),
+            ) {
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![(name.clone(), "value".to_owned())]),
+                    Err(ScenarioRequestError::InvalidHeaderName { name })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_overlong_names(
+                name in overlong_scenario_header_name_any(),
+            ) {
+                let byte_count = name.len();
+
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![(name.clone(), "value".to_owned())]),
+                    Err(ScenarioRequestError::HeaderNameTooLong {
+                        name,
+                        bytes: byte_count,
+                        max: MAX_SCENARIO_HEADER_NAME_BYTES,
+                    })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_unsupported_names(
+                name in unsupported_scenario_header_name_any(),
+            ) {
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![(name.clone(), "value".to_owned())]),
+                    Err(ScenarioRequestError::UnsupportedHeaderName { name })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_invalid_values(
+                value in invalid_scenario_header_value_any(),
+            ) {
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![("x-visible".to_owned(), value.clone())]),
+                    Err(ScenarioRequestError::InvalidHeaderValue {
+                        name: "x-visible".to_owned(),
+                        value,
+                    })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_invalid_connection_values(
+                value in invalid_scenario_connection_value_any(),
+            ) {
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![("connection".to_owned(), value.clone())]),
+                    Err(ScenarioRequestError::InvalidHeaderValue {
+                        name: "connection".to_owned(),
+                        value,
+                    })
+                );
+            }
+
+            #[test]
+            fn scenario_headers_parser_rejects_overlong_values(
+                value in overlong_scenario_header_value_any(),
+            ) {
+                let byte_count = value.len();
+
+                prop_assert_eq!(
+                    ScenarioHeaders::try_from_fields(vec![("x-visible".to_owned(), value.clone())]),
+                    Err(ScenarioRequestError::HeaderValueTooLong {
+                        name: "x-visible".to_owned(),
+                        value,
+                        bytes: byte_count,
+                        max: MAX_SCENARIO_HEADER_VALUE_BYTES,
+                    })
+                );
+            }
+
+            #[test]
+            fn scenario_request_parser_accepts_valid_parts(
+                body in valid_scenario_body_bytes_any(),
+                headers in valid_scenario_header_fields_any(),
+            ) {
+                let request = ScenarioRequest::try_from_parts(
+                    body.clone(),
+                    headers.clone(),
+                    ScenarioTarget::models(Some(
+                        OriginFormQuery::parse("limit=1").expect("test query should parse"),
+                    )),
+                )
+                .expect("valid scenario parts should parse");
+
+                prop_assert_eq!(request.body(), body.as_slice());
+                prop_assert_eq!(request.headers(), headers.as_slice());
+                prop_assert_eq!(request.target_path(), "/v1/models");
+                prop_assert_eq!(request.target_query(), Some("limit=1"));
+            }
         }
 
         #[tokio::test]
