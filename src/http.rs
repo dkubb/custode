@@ -145,7 +145,7 @@ struct ForwardRequestInput {
 struct ResponseAuditFailure;
 
 /// Terminal response stream outcome.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResponseStreamOutcome {
     /// Response completed successfully.
     Allowed,
@@ -549,17 +549,6 @@ fn response_stream(
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
                 Err(upstream_body_error) => {
-                    if let Some(previous_chunk) = pending.take()
-                        && sender.send(Ok(previous_chunk)).await.is_err()
-                    {
-                        if let Err(audit_error) = context
-                            .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
-                            .await
-                        {
-                            tracing::error!(%audit_error, "failed to audit downstream close");
-                        }
-                        return;
-                    }
                     let (outcome, stream_error) = match upstream_body_error.kind() {
                         UpstreamBodyErrorKind::Stream => (
                             ResponseStreamOutcome::UpstreamResponseStreamFailed,
@@ -570,6 +559,16 @@ fn response_stream(
                             StreamAbortReason::UpstreamBodyTimeout,
                         ),
                     };
+                    if let Some(previous_chunk) = pending.take()
+                        && sender.send(Ok(previous_chunk)).await.is_err()
+                    {
+                        if let Err(audit_error) =
+                            context.audit_after_response_started(outcome).await
+                        {
+                            tracing::error!(%audit_error, "failed to audit upstream body error");
+                        }
+                        return;
+                    }
                     send_stream_error(
                         &sender,
                         context.audit_after_response_started(outcome).await,
@@ -3682,7 +3681,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
-    async fn response_stream_audits_pending_chunk_send_failures() {
+    async fn response_stream_preserves_upstream_errors_when_pending_chunk_send_fails() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let audit_observer = audit.clone();
         let max_response_bytes = response_body_limit(1_024);
@@ -3718,11 +3717,9 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert_eq!(events.len(), 1);
-        let event = events
-            .first()
-            .expect("pending chunk send failure should be audited");
+        let event = events.first().expect("upstream failure should be audited");
         assert_eq!(event["decision"], "response_error");
-        assert_eq!(event["error_class"], "downstream_closed");
+        assert_eq!(event["error_class"], "upstream_response_stream_failed");
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(
