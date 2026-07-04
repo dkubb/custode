@@ -34,8 +34,8 @@ use std::io;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -121,6 +121,20 @@ struct ResponseAuditContext {
     response_account: ResponseAccount,
     /// Upstream response status.
     status: StatusCode,
+    /// Allowlist witness for the accepted method and target.
+    target: AllowedTarget,
+}
+
+/// Accepted request state ready for upstream forwarding.
+struct ForwardRequestInput {
+    /// Admission permit held until this request completes.
+    permit: OwnedSemaphorePermit,
+    /// Accounted request body.
+    request_body: AccountedBody,
+    /// Forwarded request headers.
+    request_headers: ForwardedRequestHeaders,
+    /// Request identity.
+    request_id: RequestId,
     /// Allowlist witness for the accepted method and target.
     target: AllowedTarget,
 }
@@ -293,7 +307,7 @@ async fn proxy(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    let _permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
+    let permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
             let request_id = match allocate_request_id(&state.gateway, &state.fatal_errors) {
@@ -324,7 +338,15 @@ async fn proxy(
     };
 
     Ok(
-        match handle_request(state.fatal_errors, state.gateway, state.client, request).await {
+        match handle_request(
+            state.fatal_errors,
+            state.gateway,
+            state.client,
+            permit,
+            request,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 tracing::error!(%error, "request failed");
@@ -339,6 +361,7 @@ async fn handle_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
     client: Arc<dyn UpstreamClient>,
+    permit: OwnedSemaphorePermit,
     request: Request<Body>,
 ) -> Result<Response<Body>, GatewayError> {
     let request_id = allocate_request_id(&gateway, &fatal_errors)?;
@@ -401,16 +424,14 @@ async fn handle_request(
         }
     };
 
-    forward_request(
-        fatal_errors,
-        gateway,
-        client,
+    let input = ForwardRequestInput {
+        permit,
+        request_body,
+        request_headers,
         request_id,
         target,
-        request_headers,
-        request_body,
-    )
-    .await
+    };
+    forward_request(fatal_errors, gateway, client, input).await
 }
 
 /// Allocates a request identity or reports an unauditable fatal failure.
@@ -432,11 +453,15 @@ async fn forward_request(
     fatal_errors: mpsc::UnboundedSender<GatewayError>,
     gateway: Gateway,
     client: Arc<dyn UpstreamClient>,
-    request_id: RequestId,
-    target: AllowedTarget,
-    request_headers: ForwardedRequestHeaders,
-    request_body: AccountedBody,
+    accepted_request: ForwardRequestInput,
 ) -> Result<Response<Body>, GatewayError> {
+    let ForwardRequestInput {
+        permit,
+        request_body,
+        request_headers,
+        request_id,
+        target,
+    } = accepted_request;
     let upstream_request = UpstreamRequest::from_target(
         gateway.config().upstream_origin(),
         &target,
@@ -476,13 +501,13 @@ async fn forward_request(
         status,
         target,
     };
-    let stream = response_stream(context, upstream_response);
     let response_header_map = response_headers.into_header_map();
 
     let mut response = Response::builder().status(status);
     for (name, value) in &response_header_map {
         response = response.header(name, value);
     }
+    let stream = response_stream(context, upstream_response, permit);
     response
         .body(Body::from_stream(stream))
         .map_err(GatewayError::ResponseBuild)
@@ -502,10 +527,12 @@ async fn audit_response_status(
 fn response_stream(
     mut context: ResponseAuditContext,
     upstream_response: UpstreamResponse,
+    permit: OwnedSemaphorePermit,
 ) -> ReceiverStream<Result<Bytes, io::Error>> {
     let (sender, receiver) = mpsc::channel(8);
 
     tokio::spawn(async move {
+        let _permit = permit;
         let mut stream = upstream_response.into_body();
         let mut pending = None;
         while let Some(chunk_result) = stream.next().await {
@@ -1346,7 +1373,7 @@ mod tests {
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
     use tokio::net::TcpListener;
-    use tokio::sync::{Semaphore, mpsc};
+    use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
     use tokio::task::yield_now;
     use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
@@ -1496,6 +1523,13 @@ mod tests {
     /// Builds a response body byte limit for tests.
     fn response_body_limit(value: u64) -> ResponseBodyBytes {
         ResponseBodyBytes::for_test(NonZeroU64::new(value).expect("limit should be non-zero"))
+    }
+
+    /// Builds an admission permit for direct response-stream tests.
+    fn test_permit() -> OwnedSemaphorePermit {
+        Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("test permit should be available")
     }
 
     /// Builds an allowlist witness for response audit tests.
@@ -2764,6 +2798,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_holds_request_permit_until_stream_completion() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let upstream = spawn_upstream(slow_upstream_router()).await;
+        let (config, _audit_log) = runtime_config(directory.path(), &upstream);
+        let (router, _fatal_receiver) = proxy_router(config, 1).await;
+
+        let first_response = router
+            .clone()
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("first request should respond");
+        let second_response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("second request should respond");
+
+        assert_eq!(second_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let first_body = to_bytes(first_response.into_body(), 1_024)
+            .await
+            .expect("first response should complete");
+        assert_eq!(first_body, Bytes::from_static(b"firstsecond"));
+    }
+
+    #[tokio::test]
     async fn proxy_fails_when_the_permit_denial_audit_fails() {
         let directory = tempdir().expect("temporary directory should be created");
         let (config, _audit_log) = tiny_config(directory.path(), 1);
@@ -3267,7 +3325,7 @@ mod tests {
         });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let mut response_body = response_stream(context, upstream_response);
+        let mut response_body = response_stream(context, upstream_response, test_permit());
 
         let first = response_body
             .next()
@@ -3308,7 +3366,7 @@ mod tests {
         ))]);
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let mut response_body = response_stream(context, upstream_response);
+        let mut response_body = response_stream(context, upstream_response, test_permit());
 
         let result = response_body
             .next()
@@ -3347,7 +3405,7 @@ mod tests {
         let upstream_body = stream::empty::<Result<Bytes, UpstreamBodyError>>();
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let mut response_body = response_stream(context, upstream_response);
+        let mut response_body = response_stream(context, upstream_response, test_permit());
 
         assert!(
             response_body.next().await.is_none(),
@@ -3382,7 +3440,7 @@ mod tests {
         let upstream_body = stream::empty::<Result<Bytes, UpstreamBodyError>>();
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let mut response_body = response_stream(context, upstream_response);
+        let mut response_body = response_stream(context, upstream_response, test_permit());
 
         let outcome = response_body
             .next()
@@ -3420,7 +3478,7 @@ mod tests {
             stream::once(async { Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")) });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let mut response_body = response_stream(context, upstream_response);
+        let mut response_body = response_stream(context, upstream_response, test_permit());
 
         let chunk = response_body
             .next()
@@ -3477,7 +3535,7 @@ mod tests {
         });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let response_body = response_stream(context, upstream_response);
+        let response_body = response_stream(context, upstream_response, test_permit());
 
         yield_now().await;
         drop(response_body);
@@ -3521,7 +3579,7 @@ mod tests {
         });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let response_body = response_stream(context, upstream_response);
+        let response_body = response_stream(context, upstream_response, test_permit());
 
         yield_now().await;
         drop(response_body);
@@ -3569,7 +3627,7 @@ mod tests {
         });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let response_body = response_stream(context, upstream_response);
+        let response_body = response_stream(context, upstream_response, test_permit());
 
         yield_now().await;
         drop(response_body);
@@ -3607,7 +3665,7 @@ mod tests {
         });
         let upstream_response =
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
-        let response_body = response_stream(context, upstream_response);
+        let response_body = response_stream(context, upstream_response, test_permit());
 
         yield_now().await;
         drop(response_body);
