@@ -15,7 +15,8 @@ use std::time::SystemTime;
 use thiserror::Error;
 use tokio::fs::{OpenOptions, create_dir_all};
 use tokio::io::{
-    AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite, AsyncWriteExt as _,
+    AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite,
+    AsyncWriteExt as _, BufReader,
 };
 use tokio::sync::Mutex;
 
@@ -166,6 +167,17 @@ pub(crate) enum AuditUpstreamError {
 /// Audit log error.
 #[derive(Debug, Error)]
 pub(crate) enum AuditError {
+    /// Existing audit log contained a complete but invalid NDJSON event.
+    #[error("audit path {path} has invalid JSON on line {line}: {source}")]
+    CorruptLog {
+        /// Path that failed.
+        path: PathBuf,
+        /// One-based line number of the corrupt audit event.
+        line: NonZeroU64,
+        /// JSON parse error.
+        source: serde_json::Error,
+    },
+
     /// Audit event exceeded configured maximum.
     #[error("audit event has {bytes} bytes, maximum is {max}")]
     EventTooLarge {
@@ -1150,7 +1162,8 @@ impl AuditWriter {
                 source,
             })?;
         match inspect_audit_log_tail(path, &mut audit_file).await? {
-            AuditLogTail::Empty | AuditLogTail::Complete => {}
+            AuditLogTail::Empty => {}
+            AuditLogTail::Complete => validate_existing_audit_events(path, &mut audit_file).await?,
             AuditLogTail::Torn => {
                 return Err(AuditError::TornLog {
                     path: path.to_owned(),
@@ -1320,6 +1333,63 @@ async fn classify_audit_log_tail(reader: &mut dyn AuditLogTailReader) -> io::Res
     } else {
         Ok(AuditLogTail::Torn)
     }
+}
+
+/// Validates newline-terminated events in an existing audit log.
+async fn validate_existing_audit_events(
+    path: &Path,
+    reader: &mut dyn AuditLogTailReader,
+) -> Result<(), AuditError> {
+    reader
+        .seek(SeekFrom::Start(0))
+        .await
+        .map_err(|source| AuditError::Inspect {
+            path: path.to_owned(),
+            source,
+        })?;
+
+    let mut line_number = 1_u64;
+    let mut line = Vec::new();
+    let mut buffered = BufReader::new(reader);
+    loop {
+        line.clear();
+        let bytes_read = buffered
+            .read_until(b'\n', &mut line)
+            .await
+            .map_err(|source| AuditError::Inspect {
+                path: path.to_owned(),
+                source,
+            })?;
+        if bytes_read == 0 {
+            break;
+        }
+        if line.last() == Some(&b'\n') {
+            let _newline = line.pop();
+        }
+
+        let numbered_line =
+            NonZeroU64::new(line_number).expect("audit log line numbering starts at one");
+        serde_json::from_slice::<serde_json::Value>(&line).map_err(|source| {
+            AuditError::CorruptLog {
+                path: path.to_owned(),
+                line: numbered_line,
+                source,
+            }
+        })?;
+        line_number = line_number
+            .checked_add(1)
+            .expect("audit log line count should not overflow");
+    }
+
+    buffered
+        .get_mut()
+        .seek(SeekFrom::End(0))
+        .await
+        .map_err(|source| AuditError::Inspect {
+            path: path.to_owned(),
+            source,
+        })?;
+    Ok(())
 }
 
 /// Parses a run token into its entropy bytes.
@@ -2357,6 +2427,47 @@ mod tests {
         assert_eq!(first, "{\"version\":3}");
         assert_eq!(decision, "denied");
         assert_eq!(lines.next(), None);
+    }
+
+    #[tokio::test]
+    async fn open_rejects_complete_non_json_audit_logs() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(&audit_log, b"not-json\n").expect("corrupt log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        let first_line = NonZeroU64::new(1).expect("literal should be non-zero");
+        assert!(
+            matches!(
+                result,
+                Err(AuditError::CorruptLog { path, line, .. })
+                    if path == audit_log && line == first_line
+            ),
+            "complete non-JSON logs should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_reports_the_corrupt_audit_log_line_number() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(&audit_log, b"{\"version\":3}\nnot-json\n")
+            .expect("corrupt log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        let second_line = NonZeroU64::new(2).expect("literal should be non-zero");
+        assert!(
+            matches!(
+                result,
+                Err(AuditError::CorruptLog { path, line, .. })
+                    if path == audit_log && line == second_line
+            ),
+            "corrupt audit logs should report the corrupt line"
+        );
     }
 
     #[tokio::test]
