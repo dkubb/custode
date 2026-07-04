@@ -122,7 +122,14 @@ pub(crate) enum AuditDenialReason {
 
 /// Closed denied request audit input.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum AuditDenial {
+pub(crate) struct AuditDenial {
+    /// Closed denial variant.
+    kind: AuditDenialKind,
+}
+
+/// Closed denied request audit variant.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum AuditDenialKind {
     /// Request target included a scheme or authority.
     AbsoluteFormUnsupported {
         /// Request method.
@@ -1421,77 +1428,87 @@ impl AuditDenial {
     /// Creates an absolute-form denial.
     #[must_use]
     pub(crate) const fn absolute_form_unsupported(method: Method, target: AuditTarget) -> Self {
-        Self::AbsoluteFormUnsupported { method, target }
+        Self::from_kind(AuditDenialKind::AbsoluteFormUnsupported { method, target })
     }
 
     /// Creates a CONNECT denial.
     #[must_use]
     pub(crate) const fn connect_unsupported(target: AuditTarget) -> Self {
-        Self::ConnectUnsupported { target }
+        Self::from_kind(AuditDenialKind::ConnectUnsupported { target })
     }
 
     /// Creates a dot-segment denial.
     #[must_use]
     pub(crate) const fn dot_segment(method: Method, target: AuditTarget) -> Self {
-        Self::DotSegment { method, target }
+        Self::from_kind(AuditDenialKind::DotSegment { method, target })
     }
 
     /// Creates an encoded-separator denial.
     #[must_use]
     pub(crate) const fn encoded_separator(method: Method, target: AuditTarget) -> Self {
-        Self::EncodedSeparator { method, target }
+        Self::from_kind(AuditDenialKind::EncodedSeparator { method, target })
+    }
+
+    /// Creates a denial from its private closed variant.
+    #[must_use]
+    const fn from_kind(kind: AuditDenialKind) -> Self {
+        Self { kind }
     }
 
     /// Consumes the denial into its method, target, and reason.
     #[must_use]
     fn into_parts(self) -> (Method, AuditTarget, AuditDenialReason) {
-        match self {
-            Self::AbsoluteFormUnsupported { method, target } => {
+        match self.kind {
+            AuditDenialKind::AbsoluteFormUnsupported { method, target } => {
                 (method, target, AuditDenialReason::AbsoluteFormUnsupported)
             }
-            Self::ConnectUnsupported { target } => (
+            AuditDenialKind::ConnectUnsupported { target } => (
                 Method::CONNECT,
                 target,
                 AuditDenialReason::ConnectUnsupported,
             ),
-            Self::DotSegment { method, target } => (method, target, AuditDenialReason::DotSegment),
-            Self::EncodedSeparator { method, target } => {
+            AuditDenialKind::DotSegment { method, target } => {
+                (method, target, AuditDenialReason::DotSegment)
+            }
+            AuditDenialKind::EncodedSeparator { method, target } => {
                 (method, target, AuditDenialReason::EncodedSeparator)
             }
-            Self::InvalidPercentEncoding { method, target } => {
+            AuditDenialKind::InvalidPercentEncoding { method, target } => {
                 (method, target, AuditDenialReason::InvalidPercentEncoding)
             }
-            Self::InvalidRequestConnectionHeader { method, target } => (
+            AuditDenialKind::InvalidRequestConnectionHeader { method, target } => (
                 method,
                 target,
                 AuditDenialReason::InvalidRequestConnectionHeader,
             ),
-            Self::MethodDenied { method, target } => {
+            AuditDenialKind::MethodDenied { method, target } => {
                 (method, target, AuditDenialReason::MethodDenied)
             }
-            Self::NonOriginForm { method, target } => {
+            AuditDenialKind::NonOriginForm { method, target } => {
                 (method, target, AuditDenialReason::NonOriginForm)
             }
-            Self::PathDenied { method, target } => (method, target, AuditDenialReason::PathDenied),
-            Self::PathTooLong { method, target } => {
+            AuditDenialKind::PathDenied { method, target } => {
+                (method, target, AuditDenialReason::PathDenied)
+            }
+            AuditDenialKind::PathTooLong { method, target } => {
                 (method, target, AuditDenialReason::PathTooLong)
             }
-            Self::QueryTooLong { method, target } => {
+            AuditDenialKind::QueryTooLong { method, target } => {
                 (method, target, AuditDenialReason::QueryTooLong)
             }
-            Self::RequestBodyReadFailed { method, target } => {
+            AuditDenialKind::RequestBodyReadFailed { method, target } => {
                 (method, target, AuditDenialReason::RequestBodyReadFailed)
             }
-            Self::RequestBodyTimeout { method, target } => {
+            AuditDenialKind::RequestBodyTimeout { method, target } => {
                 (method, target, AuditDenialReason::RequestBodyTimeout)
             }
-            Self::RequestBodyTooLarge { method, target } => {
+            AuditDenialKind::RequestBodyTooLarge { method, target } => {
                 (method, target, AuditDenialReason::RequestBodyTooLarge)
             }
-            Self::RequestHeadersTooLarge { method, target } => {
+            AuditDenialKind::RequestHeadersTooLarge { method, target } => {
                 (method, target, AuditDenialReason::RequestHeadersTooLarge)
             }
-            Self::TooManyRequests { method, target } => {
+            AuditDenialKind::TooManyRequests { method, target } => {
                 (method, target, AuditDenialReason::TooManyRequests)
             }
         }
@@ -1500,7 +1517,7 @@ impl AuditDenial {
     /// Creates an invalid-percent-encoding denial.
     #[must_use]
     pub(crate) const fn invalid_percent_encoding(method: Method, target: AuditTarget) -> Self {
-        Self::InvalidPercentEncoding { method, target }
+        Self::from_kind(AuditDenialKind::InvalidPercentEncoding { method, target })
     }
 
     /// Creates an invalid request `Connection` header denial.
@@ -1509,39 +1526,83 @@ impl AuditDenial {
         method: Method,
         target: AuditTarget,
     ) -> Self {
-        Self::InvalidRequestConnectionHeader { method, target }
+        Self::from_kind(AuditDenialKind::InvalidRequestConnectionHeader { method, target })
     }
 
     /// Creates a method-denied denial.
     #[must_use]
     pub(crate) const fn method_denied(method: Method, target: AuditTarget) -> Self {
-        Self::MethodDenied { method, target }
+        Self::from_kind(AuditDenialKind::MethodDenied { method, target })
     }
 
     /// Creates a non-origin-form denial.
     #[must_use]
     pub(crate) const fn non_origin_form(method: Method, target: AuditTarget) -> Self {
-        Self::NonOriginForm { method, target }
+        Self::from_kind(AuditDenialKind::NonOriginForm { method, target })
     }
 
     /// Creates a path-denied denial.
     #[must_use]
     pub(crate) const fn path_denied(method: Method, target: AuditTarget) -> Self {
-        Self::PathDenied { method, target }
+        Self::from_kind(AuditDenialKind::PathDenied { method, target })
     }
 
     /// Creates a path-too-long denial.
     #[must_use]
     pub(crate) const fn path_too_long(method: Method, target: AuditTarget) -> Self {
-        Self::PathTooLong { method, target }
+        Self::from_kind(AuditDenialKind::PathTooLong { method, target })
     }
 
     /// Creates a query-too-long denial.
     #[must_use]
     pub(crate) const fn query_too_long(method: Method, target: AuditTarget) -> Self {
-        Self::QueryTooLong { method, target }
+        Self::from_kind(AuditDenialKind::QueryTooLong { method, target })
     }
 
+    /// Returns the closed denial reason.
+    #[must_use]
+    const fn reason(&self) -> AuditDenialReason {
+        self.kind.reason()
+    }
+
+    /// Creates a request-body-read-failed denial.
+    #[must_use]
+    pub(crate) const fn request_body_read_failed(method: Method, target: AuditTarget) -> Self {
+        Self::from_kind(AuditDenialKind::RequestBodyReadFailed { method, target })
+    }
+
+    /// Creates a request-body-timeout denial.
+    #[must_use]
+    pub(crate) const fn request_body_timeout(method: Method, target: AuditTarget) -> Self {
+        Self::from_kind(AuditDenialKind::RequestBodyTimeout { method, target })
+    }
+
+    /// Creates a request-body-too-large denial.
+    #[must_use]
+    pub(crate) const fn request_body_too_large(method: Method, target: AuditTarget) -> Self {
+        Self::from_kind(AuditDenialKind::RequestBodyTooLarge { method, target })
+    }
+
+    /// Creates a request-headers-too-large denial.
+    #[must_use]
+    pub(crate) const fn request_headers_too_large(method: Method, target: AuditTarget) -> Self {
+        Self::from_kind(AuditDenialKind::RequestHeadersTooLarge { method, target })
+    }
+
+    /// Returns the response status for this denial.
+    #[must_use]
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.reason().status()
+    }
+
+    /// Creates a too-many-requests denial.
+    #[must_use]
+    pub(crate) const fn too_many_requests(method: Method, target: AuditTarget) -> Self {
+        Self::from_kind(AuditDenialKind::TooManyRequests { method, target })
+    }
+}
+
+impl AuditDenialKind {
     /// Returns the closed denial reason.
     #[must_use]
     const fn reason(&self) -> AuditDenialReason {
@@ -1565,42 +1626,6 @@ impl AuditDenial {
             Self::RequestHeadersTooLarge { .. } => AuditDenialReason::RequestHeadersTooLarge,
             Self::TooManyRequests { .. } => AuditDenialReason::TooManyRequests,
         }
-    }
-
-    /// Creates a request-body-read-failed denial.
-    #[must_use]
-    pub(crate) const fn request_body_read_failed(method: Method, target: AuditTarget) -> Self {
-        Self::RequestBodyReadFailed { method, target }
-    }
-
-    /// Creates a request-body-timeout denial.
-    #[must_use]
-    pub(crate) const fn request_body_timeout(method: Method, target: AuditTarget) -> Self {
-        Self::RequestBodyTimeout { method, target }
-    }
-
-    /// Creates a request-body-too-large denial.
-    #[must_use]
-    pub(crate) const fn request_body_too_large(method: Method, target: AuditTarget) -> Self {
-        Self::RequestBodyTooLarge { method, target }
-    }
-
-    /// Creates a request-headers-too-large denial.
-    #[must_use]
-    pub(crate) const fn request_headers_too_large(method: Method, target: AuditTarget) -> Self {
-        Self::RequestHeadersTooLarge { method, target }
-    }
-
-    /// Returns the response status for this denial.
-    #[must_use]
-    pub(crate) const fn status(&self) -> StatusCode {
-        self.reason().status()
-    }
-
-    /// Creates a too-many-requests denial.
-    #[must_use]
-    pub(crate) const fn too_many_requests(method: Method, target: AuditTarget) -> Self {
-        Self::TooManyRequests { method, target }
     }
 }
 
