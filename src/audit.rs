@@ -1,7 +1,8 @@
 //! Audit event schema and writer.
 
 use crate::allowlist::{
-    AcceptedTarget, AllowedTarget, AllowlistRejectionReason, TargetRejectionReason,
+    AcceptedTarget, AllowedTarget, AllowlistRejectionReason, RejectedAllowedTarget,
+    TargetRejectionReason,
 };
 use crate::body::{
     AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, OversizedResponseBody,
@@ -1574,13 +1575,10 @@ impl AuditDenial {
 
     /// Creates an allowlist rejection denial.
     #[must_use]
-    pub(crate) fn allowlist_rejected(
-        method: Method,
-        accepted_target: AcceptedAuditTarget,
-        rejection: AllowlistRejectionReason,
-    ) -> Self {
-        let target = accepted_target.into_target();
-        match rejection {
+    pub(crate) fn allowlist_rejected(rejection: RejectedAllowedTarget) -> Self {
+        let (method, accepted_target, allowlist_reason) = rejection.into_parts();
+        let target = AcceptedAuditTarget::from_accepted(&accepted_target).into_target();
+        match allowlist_reason {
             AllowlistRejectionReason::MethodDenied => {
                 Self::from_kind(AuditDenialKind::MethodDenied { method, target })
             }
@@ -3243,7 +3241,9 @@ mod tests {
         is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
         write_serialized_event,
     };
-    use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
+    use crate::allowlist::{
+        AcceptedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
+    };
     use crate::body::{
         BodyObservation, NonEmptyBodyObservation, OversizedResponseBody, ResponseAccount,
     };
@@ -4585,6 +4585,20 @@ mod tests {
         NonZeroUsize::new(0x4000).expect("limit should be non-zero")
     }
 
+    /// Builds an accepted audit target for constructor tests.
+    fn accepted_audit_target(path: &str) -> AuditTarget {
+        let target = AcceptedTarget::new(path, None).expect("target should be accepted");
+        AuditTarget::from(&target)
+    }
+
+    /// Builds an allowlist rejection witness for constructor tests.
+    fn rejected_allowed_target(method: &Method, path: &str) -> RejectedAllowedTarget {
+        let config =
+            GatewayConfig::for_test(PathBuf::from("/unused/audit.ndjson"), roomy_event_limit());
+        let target = AcceptedTarget::new(path, None).expect("target should be accepted");
+        allow_target(&config, method, target).expect_err("target should be rejected")
+    }
+
     #[test]
     fn denial_reasons_report_stable_error_classes_and_statuses() {
         let cases = [
@@ -4702,26 +4716,6 @@ mod tests {
                 AuditDenialReason::InvalidRequestConnectionHeader,
             ),
             (
-                AuditDenial::allowlist_rejected(
-                    Method::DELETE,
-                    accepted_target.clone(),
-                    AllowlistRejectionReason::MethodDenied,
-                ),
-                Method::DELETE,
-                target.clone(),
-                AuditDenialReason::MethodDenied,
-            ),
-            (
-                AuditDenial::allowlist_rejected(
-                    Method::GET,
-                    accepted_target.clone(),
-                    AllowlistRejectionReason::PathDenied,
-                ),
-                Method::GET,
-                target.clone(),
-                AuditDenialReason::PathDenied,
-            ),
-            (
                 AuditDenial::request_body_read_failed(Method::POST, accepted_target.clone()),
                 Method::POST,
                 target.clone(),
@@ -4744,6 +4738,29 @@ mod tests {
                 Method::POST,
                 target.clone(),
                 AuditDenialReason::RequestHeadersTooLarge,
+            ),
+        ]
+    }
+
+    fn allowlist_denial_constructor_cases()
+    -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
+        let method_denied = rejected_allowed_target(&Method::DELETE, "/v1/models");
+        let method_denied_target = accepted_audit_target("/v1/models");
+        let path_denied = rejected_allowed_target(&Method::GET, "/v1/other");
+        let path_denied_target = accepted_audit_target("/v1/other");
+
+        vec![
+            (
+                AuditDenial::allowlist_rejected(method_denied),
+                Method::DELETE,
+                method_denied_target,
+                AuditDenialReason::MethodDenied,
+            ),
+            (
+                AuditDenial::allowlist_rejected(path_denied),
+                Method::GET,
+                path_denied_target,
+                AuditDenialReason::PathDenied,
             ),
         ]
     }
@@ -4860,6 +4877,7 @@ mod tests {
         let authority_target_witness = AuthorityAuditTarget::from_request_uri(&authority_uri)
             .expect("absolute URI should carry authority");
         let mut cases = preparsed_denial_constructor_cases(&preparsed_target, &target);
+        cases.extend(allowlist_denial_constructor_cases());
         cases.extend(authority_denial_constructor_cases(
             &authority_target_witness,
             &authority_target,
@@ -6457,7 +6475,9 @@ mod proptests {
         RejectedAuditTarget, RequestId, RunToken, RunTokenError, inspect_audit_log_tail,
         is_existing_request_id,
     };
-    use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
+    use crate::allowlist::{
+        AcceptedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
+    };
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
     use crate::config::{
         GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
@@ -6471,7 +6491,7 @@ mod proptests {
     use proptest::{collection, option};
     use serde_json::{Map, Value, value::to_raw_value};
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::Command;
     use std::time::UNIX_EPOCH;
@@ -6519,6 +6539,14 @@ mod proptests {
         AcceptedAuditTarget::from_accepted(&target)
     }
 
+    /// Returns an allowlist rejection witness for generated denials.
+    fn rejected_allowed_target(method: &Method, path: &str) -> RejectedAllowedTarget {
+        let config =
+            GatewayConfig::for_test(PathBuf::from("/unused/audit.ndjson"), roomy_event_limit());
+        let target = AcceptedTarget::new(path, None).expect("target should be accepted");
+        allow_target(&config, method, target).expect_err("target should be rejected")
+    }
+
     /// Returns one audit denial constructor output by index.
     fn audit_denial(index: u8) -> (AuditDenial, AuditDenialReason) {
         let method = Method::POST;
@@ -6557,11 +6585,10 @@ mod proptests {
                 AuditDenialReason::InvalidRequestConnectionHeader,
             ),
             6 => (
-                AuditDenial::allowlist_rejected(
-                    method,
-                    accepted_audit_target(),
-                    AllowlistRejectionReason::MethodDenied,
-                ),
+                AuditDenial::allowlist_rejected(rejected_allowed_target(
+                    &Method::DELETE,
+                    "/v1/models",
+                )),
                 AuditDenialReason::MethodDenied,
             ),
             7 => (
@@ -6572,11 +6599,7 @@ mod proptests {
                 AuditDenialReason::NonOriginForm,
             ),
             8 => (
-                AuditDenial::allowlist_rejected(
-                    method,
-                    accepted_audit_target(),
-                    AllowlistRejectionReason::PathDenied,
-                ),
+                AuditDenial::allowlist_rejected(rejected_allowed_target(&Method::GET, "/v1/other")),
                 AuditDenialReason::PathDenied,
             ),
             9 => (

@@ -22,6 +22,17 @@ pub(crate) struct AllowedTarget {
     target: AcceptedTarget,
 }
 
+/// Accepted request target proven rejected by the configured allowlist.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedAllowedTarget {
+    /// Rejected request method.
+    method: Method,
+    /// Allowlist rejection reason.
+    reason: AllowlistRejectionReason,
+    /// Accepted target rejected by the allowlist.
+    target: AcceptedTarget,
+}
+
 impl AcceptedTarget {
     /// Creates a target from an origin-form request path and optional query.
     ///
@@ -82,6 +93,14 @@ impl AllowedTarget {
     #[must_use]
     pub(crate) const fn target(&self) -> &AcceptedTarget {
         &self.target
+    }
+}
+
+impl RejectedAllowedTarget {
+    /// Consumes the witness into the rejected method, target, and reason.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (Method, AcceptedTarget, AllowlistRejectionReason) {
+        (self.method, self.target, self.reason)
     }
 }
 
@@ -189,16 +208,19 @@ pub(crate) fn allow_target(
     config: &GatewayConfig,
     method: &Method,
     target: AcceptedTarget,
-) -> Result<AllowedTarget, AllowlistRejectionReason> {
-    allowed_method(config, method, &target).map_or_else(
-        || Err(rejection_for(config, method)),
-        |allowed_method| {
-            Ok(AllowedTarget {
-                method: allowed_method.clone(),
-                target,
-            })
-        },
-    )
+) -> Result<AllowedTarget, RejectedAllowedTarget> {
+    if let Some(allowed_method) = allowed_method(config, method, &target) {
+        Ok(AllowedTarget {
+            method: allowed_method.clone(),
+            target,
+        })
+    } else {
+        Err(RejectedAllowedTarget {
+            method: method.clone(),
+            reason: rejection_for(config, method),
+            target,
+        })
+    }
 }
 
 #[cfg(test)]

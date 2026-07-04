@@ -388,10 +388,9 @@ impl Gateway {
 mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
-    use crate::allowlist::{AcceptedTarget, AllowedTarget, AllowlistRejectionReason, allow_target};
+    use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectedAllowedTarget, allow_target};
     use crate::audit::{
-        AcceptedAuditTarget, AuditDenial, AuditError, AuditWriter, PreparsedAuditTarget, RequestId,
-        RunToken,
+        AuditDenial, AuditError, AuditWriter, PreparsedAuditTarget, RequestId, RunToken,
     };
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes};
@@ -458,6 +457,16 @@ mod tests {
     fn allowed_target(gateway: &Gateway, path: &str, query: Option<&str>) -> AllowedTarget {
         let target = AcceptedTarget::new(path, query).expect("target should parse");
         allow_target(gateway.config(), &Method::GET, target).expect("target should be allowed")
+    }
+
+    /// Builds an allowlist rejection witness for audit tests.
+    fn rejected_allowed_target(
+        config: &GatewayConfig,
+        method: &Method,
+        path: &str,
+    ) -> RejectedAllowedTarget {
+        let target = AcceptedTarget::new(path, None).expect("target should parse");
+        allow_target(config, method, target).expect_err("target should be rejected")
     }
 
     /// Asserts that a required audit failure makes the gateway unavailable.
@@ -585,14 +594,11 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                AuditDenial::allowlist_rejected(
-                    Method::DELETE,
-                    AcceptedAuditTarget::from_accepted(
-                        &AcceptedTarget::new("/v1/models", None)
-                            .expect("target should be accepted"),
-                    ),
-                    AllowlistRejectionReason::MethodDenied,
-                ),
+                AuditDenial::allowlist_rejected(rejected_allowed_target(
+                    gateway.config(),
+                    &Method::DELETE,
+                    "/v1/models",
+                )),
                 Some(&request_body),
             )
             .await
@@ -614,13 +620,11 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                AuditDenial::allowlist_rejected(
-                    Method::POST,
-                    AcceptedAuditTarget::from_accepted(
-                        &AcceptedTarget::new("/v1/other", None).expect("target should be accepted"),
-                    ),
-                    AllowlistRejectionReason::PathDenied,
-                ),
+                AuditDenial::allowlist_rejected(rejected_allowed_target(
+                    gateway.config(),
+                    &Method::POST,
+                    "/v1/other",
+                )),
                 Some(&request_body),
             )
             .await

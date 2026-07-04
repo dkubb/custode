@@ -4,7 +4,7 @@ use crate::adapters::{
     RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
     UpstreamClientBuildError,
 };
-use crate::allowlist::{AcceptedTarget, AllowedTarget, AllowlistRejectionReason, allow_target};
+use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectedAllowedTarget, allow_target};
 use crate::audit::{
     AcceptedAuditTarget, AuditDenial, AuditDenialReason, AuditResponseHeaderError,
     AuditUpstreamError, AuditWriter, AuthorityAuditTarget, PreparsedAuditTarget,
@@ -258,13 +258,13 @@ async fn accept_allowed_target(
         }
     };
 
-    match allow_target(gateway.config(), method, target.clone()) {
+    match allow_target(gateway.config(), method, target) {
         Ok(allowed_target) => Ok(Ok(allowed_target)),
-        Err(reason) => {
+        Err(rejection) => {
             reject_allowed_target(
                 gateway,
                 request_id,
-                audit_denial_from_allowlist_rejection(method.clone(), &target, reason),
+                audit_denial_from_allowlist_rejection(rejection),
             )
             .await
         }
@@ -772,16 +772,8 @@ fn audit_denial_from_target_rejection(
 }
 
 /// Maps allowlist rejection reasons to closed audit denials.
-fn audit_denial_from_allowlist_rejection(
-    method: Method,
-    target: &AcceptedTarget,
-    rejection: AllowlistRejectionReason,
-) -> AuditDenial {
-    AuditDenial::allowlist_rejected(
-        method,
-        AcceptedAuditTarget::from_accepted(target),
-        rejection,
-    )
+fn audit_denial_from_allowlist_rejection(rejection: RejectedAllowedTarget) -> AuditDenial {
+    AuditDenial::allowlist_rejected(rejection)
 }
 
 /// Maps response header errors to closed response-header errors.
@@ -820,12 +812,14 @@ mod tests {
             rejected_audit_target, run_audit_unavailable_scenario,
             run_request_id_exhaustion_scenario, run_scenario,
         };
-        use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
+        use crate::allowlist::{
+            AcceptedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
+        };
         use crate::audit::{
             AuditDenial, AuditDenialReason, AuditEvent, AuditEventInput, AuditRequestInput,
             AuditTimestamp, PreparsedAuditTarget, RequestId, RunToken,
         };
-        use crate::config::UpstreamOrigin;
+        use crate::config::{GatewayConfig, UpstreamOrigin};
         use crate::http::TERMINAL_STREAM_ABORT_ERROR;
         use crate::ports::AuditSink as _;
         use crate::sim::{
@@ -839,6 +833,7 @@ mod tests {
         use http::{Method, StatusCode, Uri};
         use proptest::prelude::*;
         use serde_json::{Map, Value};
+        use std::path::PathBuf;
         use tokio::runtime::Builder;
 
         /// Serialized audit event field names.
@@ -859,20 +854,32 @@ mod tests {
             "version",
         ];
 
-        /// Returns one allowlist rejection reason and its expected denial by index.
-        const fn allowlist_rejection_reason(
-            index: u8,
-        ) -> (AllowlistRejectionReason, AuditDenialReason) {
+        /// Returns one allowlist rejection witness and its expected denial by index.
+        fn allowlist_rejection(index: u8) -> (RejectedAllowedTarget, AuditDenialReason) {
+            let config = GatewayConfig::for_runtime_test(
+                PathBuf::from("unused-audit.ndjson"),
+                "https://api.openai.com",
+            );
             match index {
                 0 => (
-                    AllowlistRejectionReason::MethodDenied,
+                    rejected_allowed_target(&config, &Method::DELETE, "/v1/models"),
                     AuditDenialReason::MethodDenied,
                 ),
                 _ => (
-                    AllowlistRejectionReason::PathDenied,
+                    rejected_allowed_target(&config, &Method::GET, "/v1/other"),
                     AuditDenialReason::PathDenied,
                 ),
             }
+        }
+
+        /// Returns an allowlist rejection witness.
+        fn rejected_allowed_target(
+            config: &GatewayConfig,
+            method: &Method,
+            path: &str,
+        ) -> RejectedAllowedTarget {
+            let target = AcceptedTarget::new(path, None).expect("target should be accepted");
+            allow_target(config, method, target).expect_err("target should be rejected")
         }
 
         /// Returns one target rejection reason and its expected denial by index.
@@ -1472,14 +1479,8 @@ mod tests {
 
             #[test]
             fn allowlist_rejection_mapping_preserves_status(index in 0_u8..2) {
-                let (rejection, reason) = allowlist_rejection_reason(index);
-                let target = AcceptedTarget::new("/v1/models", None)
-                    .expect("test target should be accepted");
-                let denial = audit_denial_from_allowlist_rejection(
-                    Method::POST,
-                    &target,
-                    rejection,
-                );
+                let (rejection, reason) = allowlist_rejection(index);
+                let denial = audit_denial_from_allowlist_rejection(rejection);
 
                 prop_assert_eq!(denial.status(), reason.status());
             }
@@ -1623,8 +1624,7 @@ mod tests {
         UpstreamClientBuildError,
     };
     use crate::allowlist::{
-        AcceptedTarget, AllowedTarget, AllowlistRejectionReason, TargetRejectionReason,
-        allow_target,
+        AcceptedTarget, AllowedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
     };
     use crate::audit::{
         AuditDenial, AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError,
@@ -1982,6 +1982,16 @@ mod tests {
             RejectedAuditTarget::accept_request_uri(&uri).expect_err("target should be rejected");
         assert_eq!(rejection.reason(), reason);
         rejection
+    }
+
+    /// Returns an allowlist rejection witness for test mapping coverage.
+    fn rejected_allowed_target(method: &Method, path: &str) -> RejectedAllowedTarget {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let target = AcceptedTarget::new(path, None).expect("target should be accepted");
+        allow_target(&config, method, target).expect_err("target should be rejected")
     }
 
     /// Builds an upstream client construction error for startup tests.
@@ -3929,21 +3939,18 @@ mod tests {
 
     #[test]
     fn allowlist_rejections_map_to_audit_denials() {
-        let target = AcceptedTarget::new("/v1/models", None).expect("target should be accepted");
         let cases = [
             (
-                AllowlistRejectionReason::MethodDenied,
+                Method::DELETE,
+                "/v1/models",
                 AuditDenialReason::MethodDenied,
             ),
-            (
-                AllowlistRejectionReason::PathDenied,
-                AuditDenialReason::PathDenied,
-            ),
+            (Method::GET, "/v1/other", AuditDenialReason::PathDenied),
         ];
 
-        for (rejection, denial) in cases {
+        for (method, path, denial) in cases {
             let audit_denial =
-                audit_denial_from_allowlist_rejection(Method::POST, &target, rejection);
+                audit_denial_from_allowlist_rejection(rejected_allowed_target(&method, path));
 
             assert_eq!(audit_denial.status(), denial.status());
         }
