@@ -177,23 +177,28 @@ The repository layout is:
 
 ```text
 custode/
-├── Cargo.toml
-├── Cargo.lock
-├── rust-toolchain.toml
-├── justfile
-├── Dockerfile
-├── compose.yaml
-├── README.md
 ├── .cargo/
-│   ├── config.toml
 │   ├── clippy.toml
+│   ├── config.toml
 │   ├── deny.toml
 │   └── mutants.toml
+├── .dockerignore
+├── .gitignore
+├── Cargo.lock
+├── Cargo.toml
+├── Dockerfile
+├── LICENSE
+├── README.md
+├── compose.yaml
 ├── docs/
-│   ├── IDEA.md
-│   └── ARCHITECTURE.md
+│   ├── ARCHITECTURE.md
+│   └── IDEA.md
+├── justfile
+├── rust-toolchain.toml
 ├── scripts/
-│   └── container-test.sh
+│   ├── check-coverage-summary.sh
+│   ├── container-test.sh
+│   └── pinned-cargo.sh
 ├── secrets/
 │   └── env.example
 ├── src/
@@ -210,9 +215,15 @@ custode/
 │   ├── main.rs
 │   ├── ports.rs
 │   ├── process.rs
-│   └── sim.rs
-└── tests/
-    └── gateway.rs
+│   ├── sim.rs
+│   └── target.rs
+├── tests/
+│   ├── coverage_summary/
+│   │   └── tests.rs
+│   ├── coverage_summary.rs
+│   └── gateway.rs
+└── workspace/
+    └── .gitkeep
 ```
 
 The root crate produces one binary, `custode-proxy`, and one library crate.
@@ -240,6 +251,7 @@ src/health.rs          Healthcheck subcommand probe
 src/ports.rs           Runtime port traits and pure request/response values
 src/process.rs         Command-line interface, dispatch, and exit codes
 src/sim.rs             Test-only deterministic runtime adapters
+src/target.rs          Origin-form path and query syntax witnesses
 ```
 
 There is no central error module: each module owns its typed `thiserror`
@@ -248,6 +260,8 @@ error, and HTTP status mapping lives in `http` at the runtime edge.
 Example-based unit tests live inline in each source file's `tests` module,
 and property-based tests live in the same file's `proptests` module.
 End-to-end tests that exercise the binary live in `tests/gateway.rs`.
+Coverage-summary contract tests live in `tests/coverage_summary.rs` and
+`tests/coverage_summary/`.
 
 These module names SHOULD remain stable through the initial product. A module
 name MAY change only when the old name would become misleading after a
