@@ -252,7 +252,22 @@ pub(crate) struct AuditEvent {
     /// Upstream query, when an upstream request was attempted.
     upstream_query: Option<String>,
     /// Audit schema version.
-    version: u8,
+    version: AuditSchemaVersion,
+}
+
+/// Current audit event schema version.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AuditSchemaVersion;
+
+impl AuditSchemaVersion {
+    /// Current schema version value serialized into each event.
+    const CURRENT: Self = Self;
+
+    /// Returns the numeric schema version.
+    #[must_use]
+    const fn as_u8() -> u8 {
+        3
+    }
 }
 
 /// Body accounting summary recorded in audit events.
@@ -517,6 +532,15 @@ impl Serialize for AuditStatus {
         S: Serializer,
     {
         serializer.serialize_u16(self.code.as_u16())
+    }
+}
+
+impl Serialize for AuditSchemaVersion {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(Self::as_u8())
     }
 }
 
@@ -1046,7 +1070,7 @@ impl AuditEvent {
             upstream_origin: upstream_origin.as_str().to_owned(),
             upstream_path,
             upstream_query,
-            version: 3,
+            version: AuditSchemaVersion::CURRENT,
         }
     }
 }
