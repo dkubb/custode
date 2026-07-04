@@ -329,6 +329,10 @@ mod tests {
             AcceptedTarget::new("/v1/models", Some("limit=1#fragment")),
             Err(RejectionReason::NonOriginForm),
         );
+        assert_eq!(
+            AcceptedTarget::new("/v1/models", Some(r"q=\")),
+            Err(RejectionReason::NonOriginForm),
+        );
     }
 
     #[test]

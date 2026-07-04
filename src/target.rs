@@ -142,7 +142,8 @@ impl OriginFormQuery {
     /// # Errors
     ///
     /// Returns an error when the query exceeds the byte limit, contains a
-    /// literal fragment delimiter, or contains invalid percent-encoding.
+    /// literal fragment delimiter, contains a byte outside HTTP request-target
+    /// syntax, or contains invalid percent-encoding.
     pub(crate) fn parse(query: &str) -> Result<Self, OriginFormQueryError> {
         if query.len() > MAX_ORIGIN_FORM_QUERY_BYTES {
             return Err(OriginFormQueryError::TooLong);
@@ -246,6 +247,16 @@ fn has_invalid_query_character(query: &str) -> bool {
 
 /// Returns true when the byte is valid raw origin-form path text.
 const fn is_origin_form_path_byte(byte: u8) -> bool {
+    is_origin_form_text_byte(byte) || byte == b'\\'
+}
+
+/// Returns true when the byte is valid raw origin-form query text.
+const fn is_origin_form_query_byte(byte: u8) -> bool {
+    is_origin_form_text_byte(byte) || byte == b'?'
+}
+
+/// Returns true when the byte is valid raw origin-form path-or-query text.
+const fn is_origin_form_text_byte(byte: u8) -> bool {
     matches!(
         byte,
         b'A'..=b'Z'
@@ -270,13 +281,7 @@ const fn is_origin_form_path_byte(byte: u8) -> bool {
             | b'@'
             | b'/'
             | b'%'
-            | b'\\'
     )
-}
-
-/// Returns true when the byte is valid raw origin-form query text.
-const fn is_origin_form_query_byte(byte: u8) -> bool {
-    is_origin_form_path_byte(byte) || byte == b'?'
 }
 
 /// Returns true when a path segment is a literal or percent-encoded dot segment.
@@ -709,6 +714,7 @@ mod tests {
             "q=\u{7f}",
             "q=\u{80}",
             "q=[models]",
+            r"q=\",
         ] {
             assert_eq!(
                 OriginFormQuery::parse(query),
@@ -891,6 +897,11 @@ mod proptests {
         ]
     }
 
+    /// Bytes that cannot appear as raw query text.
+    fn invalid_query_request_target_character() -> impl Strategy<Value = String> {
+        prop_oneof![invalid_request_target_character(), Just("\\".to_owned()),]
+    }
+
     /// Paths containing one forbidden literal or encoded path separator.
     fn path_with_forbidden_separator() -> impl Strategy<Value = String> {
         (
@@ -956,7 +967,7 @@ mod proptests {
     fn query_with_invalid_request_target_character() -> impl Strategy<Value = String> {
         (
             "[A-Za-z0-9_=&.-]{0,12}",
-            invalid_request_target_character(),
+            invalid_query_request_target_character(),
             "[A-Za-z0-9_=&.-]{0,12}",
         )
             .prop_map(|(prefix, invalid, suffix)| format!("{prefix}{invalid}{suffix}"))
