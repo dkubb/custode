@@ -16,8 +16,8 @@ use crate::headers::{
     ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
 };
 use crate::ports::{
-    UpstreamBodyError, UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind,
-    UpstreamRequest, UpstreamResponse,
+    UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamRequest,
+    UpstreamResponse,
 };
 use ::http::{Method, Uri};
 use axum::body::{Body, Bytes};
@@ -127,11 +127,8 @@ struct ResponseAuditContext {
 
 /// Audit failure observed after response streaming started.
 #[derive(Debug, Error)]
-#[error("{message}")]
-struct ResponseAuditFailure {
-    /// Error message safe to send as a terminal stream error.
-    message: String,
-}
+#[error("audit_failed")]
+struct ResponseAuditFailure;
 
 /// Terminal response stream outcome.
 #[derive(Debug)]
@@ -164,8 +161,8 @@ enum StreamAbortReason {
     ResponseBodyTooLarge,
 
     /// Upstream response body stream failed.
-    #[error("{0}")]
-    UpstreamBody(UpstreamBodyError),
+    #[error("upstream_response_stream_failed")]
+    UpstreamBody,
 }
 
 impl ResponseAuditContext {
@@ -207,9 +204,8 @@ impl ResponseAuditContext {
         match self.audit(outcome).await {
             Ok(()) => Ok(()),
             Err(error) => {
-                let message = error.to_string();
                 report_fatal_error(&fatal_errors, error);
-                Err(ResponseAuditFailure { message })
+                Err(ResponseAuditFailure)
             }
         }
     }
@@ -515,7 +511,7 @@ fn response_stream(
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(upstream_body_error) => {
+                Err(_upstream_body_error) => {
                     if let Some(previous_chunk) = pending.take()
                         && sender.send(Ok(previous_chunk)).await.is_err()
                     {
@@ -534,7 +530,7 @@ fn response_stream(
                                 ResponseStreamOutcome::UpstreamResponseStreamFailed,
                             )
                             .await,
-                        StreamAbortReason::UpstreamBody(upstream_body_error),
+                        StreamAbortReason::UpstreamBody,
                     )
                     .await;
                     return;
@@ -981,9 +977,7 @@ mod tests {
                     ScenarioBounds::TinyResponse,
                     _,
                     ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
-                ) => ScenarioBody::Error(
-                    "failed to write audit event: scripted audit failure".to_owned(),
-                ),
+                ) => ScenarioBody::Error("audit_failed".to_owned()),
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
@@ -1011,7 +1005,7 @@ mod tests {
                     ScenarioBounds::Roomy,
                     _,
                     ScenarioUpstream::StreamError,
-                ) => ScenarioBody::Error("scripted upstream stream failed".to_owned()),
+                ) => ScenarioBody::Error("upstream_response_stream_failed".to_owned()),
             }
         }
 
@@ -2003,7 +1997,7 @@ mod tests {
         assert_eq!(run.status, StatusCode::CREATED);
         assert_eq!(
             run.response_body,
-            ScenarioBody::Error("scripted upstream stream failed".to_owned())
+            ScenarioBody::Error("upstream_response_stream_failed".to_owned())
         );
         assert_eq!(run.fatal_error, None);
         assert_eq!(run.upstream_requests.len(), 1);
@@ -3200,10 +3194,8 @@ mod tests {
 
         send_stream_error(
             &sender,
-            Err(ResponseAuditFailure {
-                message: "audit failed".to_owned(),
-            }),
-            StreamAbortReason::UpstreamBody(UpstreamBodyError::new("stream failed")),
+            Err(ResponseAuditFailure),
+            StreamAbortReason::UpstreamBody,
         )
         .await;
 
@@ -3212,26 +3204,21 @@ mod tests {
             .await
             .expect("terminal error should be sent");
         let error = outcome.expect_err("terminal item should be an error");
-        assert_eq!(error.to_string(), "audit failed");
+        assert_eq!(error.to_string(), "audit_failed");
     }
 
     #[tokio::test]
     async fn send_stream_error_sends_the_stream_error_when_audit_succeeds() {
         let (sender, mut receiver) = mpsc::channel(1);
 
-        send_stream_error(
-            &sender,
-            Ok(()),
-            StreamAbortReason::UpstreamBody(UpstreamBodyError::new("stream failed")),
-        )
-        .await;
+        send_stream_error(&sender, Ok(()), StreamAbortReason::UpstreamBody).await;
 
         let outcome = receiver
             .recv()
             .await
             .expect("terminal error should be sent");
         let error = outcome.expect_err("terminal item should be an error");
-        assert_eq!(error.to_string(), "stream failed");
+        assert_eq!(error.to_string(), "upstream_response_stream_failed");
     }
 
     #[tokio::test]
@@ -3342,7 +3329,7 @@ mod tests {
             .expect("terminal stream error should be sent");
 
         let error = result.expect_err("terminal item should be an error");
-        assert_eq!(error.to_string(), "scripted upstream stream failed");
+        assert_eq!(error.to_string(), "upstream_response_stream_failed");
         assert!(
             response_body.next().await.is_none(),
             "stream should close after terminal error"
@@ -3416,10 +3403,7 @@ mod tests {
             .expect("terminal error should be sent");
         let error = outcome.expect_err("empty completion should report audit failure");
 
-        assert_eq!(
-            error.to_string(),
-            "failed to write audit event: scripted audit failure"
-        );
+        assert_eq!(error.to_string(), "audit_failed");
         assert!(
             response_body.next().await.is_none(),
             "stream should close after terminal error"
