@@ -357,11 +357,14 @@ impl Gateway {
 mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
-    use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
-    use crate::audit::{AuditDenial, AuditError, AuditTarget, AuditWriter, RequestId, RunToken};
+    use crate::allowlist::{AcceptedTarget, AllowedTarget, AllowlistRejectionReason, allow_target};
+    use crate::audit::{
+        AcceptedAuditTarget, AuditDenial, AuditError, AuditWriter, PreparsedAuditTarget, RequestId,
+        RunToken,
+    };
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes};
-    use ::http::{Method, StatusCode};
+    use ::http::{Method, StatusCode, Uri};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
     use pretty_assertions::{assert_eq, assert_ne};
@@ -482,7 +485,9 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                AuditDenial::connect_unsupported(AuditTarget::from_uri_parts("/", None)),
+                AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(
+                    &Uri::from_static("/"),
+                )),
                 None,
             )
             .await
@@ -509,9 +514,13 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                AuditDenial::method_denied(
+                AuditDenial::allowlist_rejected(
                     Method::DELETE,
-                    AuditTarget::from_uri_parts("/v1/models", None),
+                    AcceptedAuditTarget::from_accepted(
+                        &AcceptedTarget::new("/v1/models", None)
+                            .expect("target should be accepted"),
+                    ),
+                    AllowlistRejectionReason::MethodDenied,
                 ),
                 Some(&request_body),
             )
@@ -534,9 +543,12 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                AuditDenial::path_denied(
+                AuditDenial::allowlist_rejected(
                     Method::POST,
-                    AuditTarget::from_uri_parts("/v1/other", None),
+                    AcceptedAuditTarget::from_accepted(
+                        &AcceptedTarget::new("/v1/other", None).expect("target should be accepted"),
+                    ),
+                    AllowlistRejectionReason::PathDenied,
                 ),
                 Some(&request_body),
             )

@@ -4,12 +4,10 @@ use crate::adapters::{
     RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds, SystemClock,
     UpstreamClientBuildError,
 };
-use crate::allowlist::{
-    AcceptedTarget, AllowedTarget, AllowlistRejectionReason, TargetRejectionReason, allow_target,
-};
+use crate::allowlist::{AcceptedTarget, AllowedTarget, AllowlistRejectionReason, allow_target};
 use crate::audit::{
-    AuditDenial, AuditDenialReason, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
-    AuditWriter, RequestId,
+    AcceptedAuditTarget, AuditDenial, AuditDenialReason, AuditResponseHeaderError,
+    AuditUpstreamError, AuditWriter, PreparsedAuditTarget, RejectedAuditTarget, RequestId,
 };
 use crate::body::{AccountedBody, OversizedResponseBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -233,7 +231,7 @@ async fn accept_allowed_target(
         return reject_allowed_target(
             gateway,
             request_id,
-            AuditDenial::connect_unsupported(synthetic_target(uri)),
+            AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(uri)),
         )
         .await;
     }
@@ -242,19 +240,21 @@ async fn accept_allowed_target(
         return reject_allowed_target(
             gateway,
             request_id,
-            AuditDenial::absolute_form_unsupported(method.clone(), synthetic_target(uri)),
+            AuditDenial::absolute_form_unsupported(
+                method.clone(),
+                PreparsedAuditTarget::from_request_uri(uri),
+            ),
         )
         .await;
     }
 
-    let target = match AcceptedTarget::new(uri.path(), uri.query()) {
+    let target = match RejectedAuditTarget::accept_request_uri(uri) {
         Ok(target) => target,
-        Err(reason) => {
-            let target = synthetic_target(uri);
+        Err(rejection) => {
             return reject_allowed_target(
                 gateway,
                 request_id,
-                audit_denial_from_target_rejection(method.clone(), target, reason),
+                audit_denial_from_target_rejection(method.clone(), rejection),
             )
             .await;
         }
@@ -266,7 +266,7 @@ async fn accept_allowed_target(
             reject_allowed_target(
                 gateway,
                 request_id,
-                audit_denial_from_allowlist_rejection(method.clone(), target, reason),
+                audit_denial_from_allowlist_rejection(method.clone(), &target, reason),
             )
             .await
         }
@@ -313,7 +313,10 @@ async fn proxy(
                 }
             };
             let method = request.method().clone();
-            let denial = AuditDenial::too_many_requests(method, synthetic_target(request.uri()));
+            let denial = AuditDenial::too_many_requests(
+                method,
+                PreparsedAuditTarget::from_request_uri(request.uri()),
+            );
             if state
                 .gateway
                 .audit_denial(request_id, denial, None)
@@ -398,7 +401,10 @@ async fn handle_request(
             return audit_denial_status(
                 &gateway,
                 request_id,
-                AuditDenial::request_body_timeout(method, target.target().clone().into()),
+                AuditDenial::request_body_timeout(
+                    method,
+                    AcceptedAuditTarget::from_accepted(target.target()),
+                ),
                 None,
             )
             .await;
@@ -700,23 +706,6 @@ async fn run_until_server_stops(
     }
 }
 
-/// Builds a synthetic target for audit events before target parsing succeeds.
-///
-/// Non-origin-form targets audit the full raw request target as the path so
-/// denial events preserve the requested authority for forensics.
-fn synthetic_target(uri: &Uri) -> AuditTarget {
-    uri.authority().map_or_else(
-        || AuditTarget::from_uri_parts(uri.path(), uri.query()),
-        |authority| {
-            let raw_target = uri.scheme_str().map_or_else(
-                || authority.as_str().to_owned(),
-                |scheme| format!("{scheme}://{authority}{}", uri.path()),
-            );
-            AuditTarget::from_uri_parts(&raw_target, uri.query())
-        },
-    )
-}
-
 /// Builds an empty response with the supplied status.
 fn status_response(status: StatusCode) -> Response<Body> {
     status.into_response()
@@ -728,7 +717,7 @@ fn audit_denial_from_request_body(
     target: &AcceptedTarget,
     error: &RequestBodyError,
 ) -> AuditDenial {
-    let audit_target = AuditTarget::from(target.clone());
+    let audit_target = AcceptedAuditTarget::from_accepted(target);
     if matches!(error, RequestBodyError::Read { .. }) {
         AuditDenial::request_body_read_failed(method, audit_target)
     } else {
@@ -742,7 +731,7 @@ fn audit_denial_from_request_header(
     target: &AcceptedTarget,
     error: HeaderError,
 ) -> AuditDenial {
-    let audit_target = AuditTarget::from(target.clone());
+    let audit_target = AcceptedAuditTarget::from_accepted(target);
     match error {
         HeaderError::InvalidConnectionHeader => {
             AuditDenial::invalid_request_connection_header(method, audit_target)
@@ -752,34 +741,24 @@ fn audit_denial_from_request_header(
 }
 
 /// Maps target parser rejection reasons to closed audit denials.
-const fn audit_denial_from_target_rejection(
+fn audit_denial_from_target_rejection(
     method: Method,
-    target: AuditTarget,
-    rejection: TargetRejectionReason,
+    rejection: RejectedAuditTarget,
 ) -> AuditDenial {
-    match rejection {
-        TargetRejectionReason::DotSegment => AuditDenial::dot_segment(method, target),
-        TargetRejectionReason::EncodedSeparator => AuditDenial::encoded_separator(method, target),
-        TargetRejectionReason::InvalidPercentEncoding => {
-            AuditDenial::invalid_percent_encoding(method, target)
-        }
-        TargetRejectionReason::NonOriginForm => AuditDenial::non_origin_form(method, target),
-        TargetRejectionReason::PathTooLong => AuditDenial::path_too_long(method, target),
-        TargetRejectionReason::QueryTooLong => AuditDenial::query_too_long(method, target),
-    }
+    AuditDenial::target_rejected(method, rejection)
 }
 
 /// Maps allowlist rejection reasons to closed audit denials.
 fn audit_denial_from_allowlist_rejection(
     method: Method,
-    target: AcceptedTarget,
+    target: &AcceptedTarget,
     rejection: AllowlistRejectionReason,
 ) -> AuditDenial {
-    let audit_target = AuditTarget::from(target);
-    match rejection {
-        AllowlistRejectionReason::MethodDenied => AuditDenial::method_denied(method, audit_target),
-        AllowlistRejectionReason::PathDenied => AuditDenial::path_denied(method, audit_target),
-    }
+    AuditDenial::allowlist_rejected(
+        method,
+        AcceptedAuditTarget::from_accepted(target),
+        rejection,
+    )
 }
 
 /// Maps response header errors to closed response-header errors.
@@ -815,12 +794,12 @@ mod tests {
         use super::{
             SCRIPTED_AUDIT_WRITE_ERROR, ScenarioBody, ScenarioFatalError, ScenarioRun,
             audit_denial_from_allowlist_rejection, audit_denial_from_target_rejection,
-            run_request_id_exhaustion_scenario, run_scenario,
+            rejected_audit_target, run_request_id_exhaustion_scenario, run_scenario,
         };
         use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
         use crate::audit::{
             AuditDenial, AuditDenialReason, AuditEvent, AuditEventInput, AuditRequestInput,
-            AuditTarget, AuditTimestamp, RequestId, RunToken,
+            AuditTimestamp, PreparsedAuditTarget, RequestId, RunToken,
         };
         use crate::config::UpstreamOrigin;
         use crate::http::TERMINAL_STREAM_ABORT_ERROR;
@@ -833,7 +812,7 @@ mod tests {
         use crate::target::{OriginFormPath, OriginFormQuery};
         use axum::body::Bytes;
         use core::num::{NonZeroU64, NonZeroUsize};
-        use http::{Method, StatusCode};
+        use http::{Method, StatusCode, Uri};
         use proptest::prelude::*;
         use serde_json::{Map, Value};
         use tokio::runtime::Builder;
@@ -1459,7 +1438,7 @@ mod tests {
             );
             let denial = AuditDenial::too_many_requests(
                 Method::GET,
-                AuditTarget::from_uri_parts("/v1/models", None),
+                PreparsedAuditTarget::from_request_uri(&Uri::from_static("/v1/models")),
             );
             let denied_request = AuditRequestInput::for_denial(
                 denial,
@@ -1494,7 +1473,7 @@ mod tests {
                     .expect("test target should be accepted");
                 let denial = audit_denial_from_allowlist_rejection(
                     Method::POST,
-                    target,
+                    &target,
                     rejection,
                 );
 
@@ -1504,11 +1483,8 @@ mod tests {
             #[test]
             fn target_rejection_mapping_preserves_status(index in 0_u8..6) {
                 let (rejection, reason) = target_rejection_reason(index);
-                let denial = audit_denial_from_target_rejection(
-                    Method::POST,
-                    AuditTarget::from_uri_parts("/v1/models", None),
-                    rejection,
-                );
+                let denial =
+                    audit_denial_from_target_rejection(Method::POST, rejected_audit_target(rejection));
 
                 prop_assert_eq!(denial.status(), reason.status());
             }
@@ -1530,6 +1506,25 @@ mod tests {
                 .append_event(&event)
                 .await
                 .expect("event at exact limit should record");
+
+            assert_eq!(audit.event_count(), 1);
+            assert_eq!(
+                audit_events.lock().expect("audit events should lock").len(),
+                1
+            );
+        }
+
+        #[tokio::test]
+        async fn delayed_memory_audit_sink_failure_records_first_event() {
+            let event = denied_event();
+            let (audit, audit_events) = MemoryAuditSink::failing_on(
+                NonZeroUsize::new(2).expect("event ordinal should be non-zero"),
+            );
+
+            audit
+                .append_event(&event)
+                .await
+                .expect("first event should record before configured failure");
 
             assert_eq!(audit.event_count(), 1);
             assert_eq!(
@@ -1597,7 +1592,7 @@ mod tests {
         audit_denial_from_request_header, audit_denial_from_target_rejection,
         audit_response_header_error, audit_upstream_error, production_gateway, proxy,
         report_fatal_error, response_stream, run_until_server_stops, send_stream_error, serve,
-        serve_with_adapter_result, synthetic_target,
+        serve_with_adapter_result,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -1609,7 +1604,7 @@ mod tests {
     };
     use crate::audit::{
         AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, RequestId, RunToken,
+        AuditUpstreamError, RejectedAuditTarget, RequestId, RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{
@@ -1935,6 +1930,15 @@ mod tests {
         RequestIdSourceBuildError::for_test(io::Error::other("entropy failed"))
     }
 
+    /// Returns a parser-rejected audit target for test mapping coverage.
+    fn rejected_audit_target(reason: TargetRejectionReason) -> RejectedAuditTarget {
+        let uri = uri_for_target_rejection(reason);
+        let rejection =
+            RejectedAuditTarget::accept_request_uri(&uri).expect_err("target should be rejected");
+        assert_eq!(rejection.reason(), reason);
+        rejection
+    }
+
     /// Builds an upstream client construction error for startup tests.
     fn upstream_client_build_error() -> UpstreamClientBuildError {
         let source = Proxy::all("not a proxy URL").expect_err("invalid proxy URL should fail");
@@ -1956,6 +1960,26 @@ mod tests {
         Arc::new(Semaphore::new(1))
             .try_acquire_owned()
             .expect("test permit should be available")
+    }
+
+    /// Returns a URI rejected by the target parser with the requested reason.
+    fn uri_for_target_rejection(reason: TargetRejectionReason) -> Uri {
+        match reason {
+            TargetRejectionReason::DotSegment => Uri::from_static("/v1/../models"),
+            TargetRejectionReason::EncodedSeparator => Uri::from_static("/v1/%2fmodels"),
+            TargetRejectionReason::InvalidPercentEncoding => Uri::from_static("/v1/%zz"),
+            TargetRejectionReason::NonOriginForm => Uri::from_static("*"),
+            TargetRejectionReason::PathTooLong => {
+                format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES))
+                    .parse()
+                    .expect("URI should parse")
+            }
+            TargetRejectionReason::QueryTooLong => {
+                format!("/v1/models?{}", "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1))
+                    .parse()
+                    .expect("URI should parse")
+            }
+        }
     }
 
     /// Builds an allowlist witness for response audit tests.
@@ -3685,11 +3709,8 @@ mod tests {
         ];
 
         for (rejection, denial) in cases {
-            let audit_denial = audit_denial_from_target_rejection(
-                Method::POST,
-                AuditTarget::from_uri_parts("/v1/models", None),
-                rejection,
-            );
+            let audit_denial =
+                audit_denial_from_target_rejection(Method::POST, rejected_audit_target(rejection));
 
             assert_eq!(audit_denial.status(), denial.status());
         }
@@ -3711,7 +3732,7 @@ mod tests {
 
         for (rejection, denial) in cases {
             let audit_denial =
-                audit_denial_from_allowlist_rejection(Method::POST, target.clone(), rejection);
+                audit_denial_from_allowlist_rejection(Method::POST, &target, rejection);
 
             assert_eq!(audit_denial.status(), denial.status());
         }
@@ -3750,30 +3771,30 @@ mod tests {
     }
 
     #[test]
-    fn synthetic_target_preserves_absolute_form_targets() {
+    fn audit_target_preserves_absolute_form_targets() {
         let uri = Uri::from_static("http://evil.example/steal?limit=1");
 
-        let target = synthetic_target(&uri);
+        let target = AuditTarget::from_request_uri(&uri);
 
         assert_eq!(target.path(), "http://evil.example/steal");
         assert_eq!(target.query(), Some("limit=1"));
     }
 
     #[test]
-    fn synthetic_target_preserves_authority_form_targets() {
+    fn audit_target_preserves_authority_form_targets() {
         let uri = Uri::from_static("evil.example:443");
 
-        let target = synthetic_target(&uri);
+        let target = AuditTarget::from_request_uri(&uri);
 
         assert_eq!(target.path(), "evil.example:443");
         assert_eq!(target.query(), None);
     }
 
     #[test]
-    fn synthetic_target_preserves_path_and_query() {
+    fn audit_target_preserves_path_and_query() {
         let uri = Uri::from_static("/v1/models?limit=1");
 
-        let target = synthetic_target(&uri);
+        let target = AuditTarget::from_request_uri(&uri);
 
         assert_eq!(target.path(), "/v1/models");
         assert_eq!(target.query(), Some("limit=1"));

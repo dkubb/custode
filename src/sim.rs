@@ -1008,8 +1008,8 @@ mod tests {
         scenario_headers_any, scripted_stream_error_response,
     };
     use crate::audit::{
-        AuditDenial, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget, AuditTimestamp,
-        RequestId, RunToken,
+        AuditDenial, AuditEvent, AuditEventInput, AuditRequestInput, AuditTimestamp,
+        PreparsedAuditTarget, RequestId, RunToken,
     };
     use crate::config::{RequestTimeout, UpstreamOrigin};
     use crate::ports::{AuditSink as _, UpstreamDeadline};
@@ -1029,6 +1029,27 @@ mod tests {
             .new_tree(runner)
             .expect("strategy should generate")
             .current()
+    }
+
+    fn denied_event() -> AuditEvent {
+        let request_id = RequestId::from_parts(
+            &RunToken::for_test("0000000000007e57-000000000000c0de"),
+            NonZeroU64::new(1).expect("sequence should be non-zero"),
+        );
+        let denial = AuditDenial::too_many_requests(
+            Method::GET,
+            PreparsedAuditTarget::from_request_uri(&http::Uri::from_static("/v1/models")),
+        );
+        let denied_request = AuditRequestInput::for_denial(
+            denial,
+            request_id,
+            None,
+            UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
+        );
+        AuditEvent::new_at(
+            AuditEventInput::denied(denied_request),
+            AuditTimestamp::for_test("2026-07-02T00:00:00.000000000Z"),
+        )
     }
 
     #[test]
@@ -1120,26 +1141,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn memory_audit_sink_records_events_before_configured_failure() {
+        let (audit, audit_events) = MemoryAuditSink::failing_on(
+            NonZeroUsize::new(2).expect("event ordinal should be non-zero"),
+        );
+        let event = denied_event();
+
+        audit
+            .append_event(&event)
+            .await
+            .expect("first event should record before configured failure");
+
+        assert_eq!(audit.event_count(), 1);
+        assert_eq!(
+            audit_events.lock().expect("audit events should lock").len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn memory_audit_sink_reports_too_large_events() {
         let (audit, audit_events) = MemoryAuditSink::from_audit(ScenarioAudit::EventTooLarge);
-        let request_id = RequestId::from_parts(
-            &RunToken::for_test("0000000000007e57-000000000000c0de"),
-            NonZeroU64::new(1).expect("sequence should be non-zero"),
-        );
-        let denial = AuditDenial::too_many_requests(
-            Method::GET,
-            AuditTarget::from_uri_parts("/v1/models", None),
-        );
-        let denied_request = AuditRequestInput::for_denial(
-            denial,
-            request_id,
-            None,
-            UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
-        );
-        let event = AuditEvent::new_at(
-            AuditEventInput::denied(denied_request),
-            AuditTimestamp::for_test("2026-07-02T00:00:00.000000000Z"),
-        );
+        let event = denied_event();
         let event_bytes = serde_json::to_vec(&event)
             .expect("audit event should serialize")
             .len()

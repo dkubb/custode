@@ -1,6 +1,8 @@
 //! Audit event schema and writer.
 
-use crate::allowlist::{AcceptedTarget, AllowedTarget, TargetRejectionReason};
+use crate::allowlist::{
+    AcceptedTarget, AllowedTarget, AllowlistRejectionReason, TargetRejectionReason,
+};
 use crate::body::{
     AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, OversizedResponseBody,
     ResponseAccount,
@@ -245,7 +247,7 @@ enum AuditDenialKind {
     RequestHeadersTooLarge {
         /// Request method.
         method: Method,
-        /// Raw audit target.
+        /// Accepted audit target.
         target: AuditTarget,
     },
 
@@ -256,6 +258,29 @@ enum AuditDenialKind {
         /// Raw audit target.
         target: AuditTarget,
     },
+}
+
+/// Audit target proven to come from an accepted origin-form request target.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AcceptedAuditTarget {
+    /// Accepted audit target.
+    target: AuditTarget,
+}
+
+/// Audit target captured before target parsing or admission succeeds.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PreparsedAuditTarget {
+    /// Raw audit target.
+    target: AuditTarget,
+}
+
+/// Audit target paired with the target parser rejection that produced it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RejectedAuditTarget {
+    /// Target parser rejection.
+    reason: TargetRejectionReason,
+    /// Raw audit target.
+    target: AuditTarget,
 }
 
 /// Closed response-error audit event.
@@ -1513,28 +1538,67 @@ impl ObservedBodySummary {
     }
 }
 
+impl AcceptedAuditTarget {
+    /// Creates an audit target witness from an accepted target witness.
+    #[must_use]
+    pub(crate) fn from_accepted(target: &AcceptedTarget) -> Self {
+        Self {
+            target: AuditTarget::from(target),
+        }
+    }
+
+    /// Consumes the witness into the recorded audit target.
+    #[must_use]
+    fn into_target(self) -> AuditTarget {
+        self.target
+    }
+}
+
 impl AuditDenial {
     /// Creates an absolute-form denial.
     #[must_use]
-    pub(crate) const fn absolute_form_unsupported(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn absolute_form_unsupported(
+        method: Method,
+        preparsed_target: PreparsedAuditTarget,
+    ) -> Self {
+        let target = preparsed_target.into_target();
         Self::from_kind(AuditDenialKind::AbsoluteFormUnsupported { method, target })
+    }
+
+    /// Creates an allowlist rejection denial.
+    #[must_use]
+    pub(crate) fn allowlist_rejected(
+        method: Method,
+        accepted_target: AcceptedAuditTarget,
+        rejection: AllowlistRejectionReason,
+    ) -> Self {
+        let target = accepted_target.into_target();
+        match rejection {
+            AllowlistRejectionReason::MethodDenied => {
+                Self::from_kind(AuditDenialKind::MethodDenied { method, target })
+            }
+            AllowlistRejectionReason::PathDenied => {
+                Self::from_kind(AuditDenialKind::PathDenied { method, target })
+            }
+        }
     }
 
     /// Creates a CONNECT denial.
     #[must_use]
-    pub(crate) const fn connect_unsupported(target: AuditTarget) -> Self {
+    pub(crate) fn connect_unsupported(preparsed_target: PreparsedAuditTarget) -> Self {
+        let target = preparsed_target.into_target();
         Self::from_kind(AuditDenialKind::ConnectUnsupported { target })
     }
 
     /// Creates a dot-segment denial.
     #[must_use]
-    pub(crate) const fn dot_segment(method: Method, target: AuditTarget) -> Self {
+    const fn dot_segment(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::DotSegment { method, target })
     }
 
     /// Creates an encoded-separator denial.
     #[must_use]
-    pub(crate) const fn encoded_separator(method: Method, target: AuditTarget) -> Self {
+    const fn encoded_separator(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::EncodedSeparator { method, target })
     }
 
@@ -1605,46 +1669,35 @@ impl AuditDenial {
 
     /// Creates an invalid-percent-encoding denial.
     #[must_use]
-    pub(crate) const fn invalid_percent_encoding(method: Method, target: AuditTarget) -> Self {
+    const fn invalid_percent_encoding(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::InvalidPercentEncoding { method, target })
     }
 
     /// Creates an invalid request `Connection` header denial.
     #[must_use]
-    pub(crate) const fn invalid_request_connection_header(
+    pub(crate) fn invalid_request_connection_header(
         method: Method,
-        target: AuditTarget,
+        accepted_target: AcceptedAuditTarget,
     ) -> Self {
+        let target = accepted_target.into_target();
         Self::from_kind(AuditDenialKind::InvalidRequestConnectionHeader { method, target })
-    }
-
-    /// Creates a method-denied denial.
-    #[must_use]
-    pub(crate) const fn method_denied(method: Method, target: AuditTarget) -> Self {
-        Self::from_kind(AuditDenialKind::MethodDenied { method, target })
     }
 
     /// Creates a non-origin-form denial.
     #[must_use]
-    pub(crate) const fn non_origin_form(method: Method, target: AuditTarget) -> Self {
+    const fn non_origin_form(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::NonOriginForm { method, target })
-    }
-
-    /// Creates a path-denied denial.
-    #[must_use]
-    pub(crate) const fn path_denied(method: Method, target: AuditTarget) -> Self {
-        Self::from_kind(AuditDenialKind::PathDenied { method, target })
     }
 
     /// Creates a path-too-long denial.
     #[must_use]
-    pub(crate) const fn path_too_long(method: Method, target: AuditTarget) -> Self {
+    const fn path_too_long(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::PathTooLong { method, target })
     }
 
     /// Creates a query-too-long denial.
     #[must_use]
-    pub(crate) const fn query_too_long(method: Method, target: AuditTarget) -> Self {
+    const fn query_too_long(method: Method, target: AuditTarget) -> Self {
         Self::from_kind(AuditDenialKind::QueryTooLong { method, target })
     }
 
@@ -1656,25 +1709,41 @@ impl AuditDenial {
 
     /// Creates a request-body-read-failed denial.
     #[must_use]
-    pub(crate) const fn request_body_read_failed(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn request_body_read_failed(
+        method: Method,
+        accepted_target: AcceptedAuditTarget,
+    ) -> Self {
+        let target = accepted_target.into_target();
         Self::from_kind(AuditDenialKind::RequestBodyReadFailed { method, target })
     }
 
     /// Creates a request-body-timeout denial.
     #[must_use]
-    pub(crate) const fn request_body_timeout(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn request_body_timeout(
+        method: Method,
+        accepted_target: AcceptedAuditTarget,
+    ) -> Self {
+        let target = accepted_target.into_target();
         Self::from_kind(AuditDenialKind::RequestBodyTimeout { method, target })
     }
 
     /// Creates a request-body-too-large denial.
     #[must_use]
-    pub(crate) const fn request_body_too_large(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn request_body_too_large(
+        method: Method,
+        accepted_target: AcceptedAuditTarget,
+    ) -> Self {
+        let target = accepted_target.into_target();
         Self::from_kind(AuditDenialKind::RequestBodyTooLarge { method, target })
     }
 
     /// Creates a request-headers-too-large denial.
     #[must_use]
-    pub(crate) const fn request_headers_too_large(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn request_headers_too_large(
+        method: Method,
+        accepted_target: AcceptedAuditTarget,
+    ) -> Self {
+        let target = accepted_target.into_target();
         Self::from_kind(AuditDenialKind::RequestHeadersTooLarge { method, target })
     }
 
@@ -1684,10 +1753,71 @@ impl AuditDenial {
         self.reason().status()
     }
 
+    /// Creates a target parser rejection denial.
+    #[must_use]
+    pub(crate) fn target_rejected(method: Method, rejection: RejectedAuditTarget) -> Self {
+        let (audit_target, reason) = rejection.into_parts();
+        match reason {
+            TargetRejectionReason::DotSegment => Self::dot_segment(method, audit_target),
+            TargetRejectionReason::EncodedSeparator => {
+                Self::encoded_separator(method, audit_target)
+            }
+            TargetRejectionReason::InvalidPercentEncoding => {
+                Self::invalid_percent_encoding(method, audit_target)
+            }
+            TargetRejectionReason::NonOriginForm => Self::non_origin_form(method, audit_target),
+            TargetRejectionReason::PathTooLong => Self::path_too_long(method, audit_target),
+            TargetRejectionReason::QueryTooLong => Self::query_too_long(method, audit_target),
+        }
+    }
+
     /// Creates a too-many-requests denial.
     #[must_use]
-    pub(crate) const fn too_many_requests(method: Method, target: AuditTarget) -> Self {
+    pub(crate) fn too_many_requests(
+        method: Method,
+        preparsed_target: PreparsedAuditTarget,
+    ) -> Self {
+        let target = preparsed_target.into_target();
         Self::from_kind(AuditDenialKind::TooManyRequests { method, target })
+    }
+}
+
+impl PreparsedAuditTarget {
+    /// Creates a preparsed audit target from the raw request URI.
+    #[must_use]
+    pub(crate) fn from_request_uri(uri: &Uri) -> Self {
+        Self {
+            target: AuditTarget::from_request_uri(uri),
+        }
+    }
+
+    /// Consumes the witness into the recorded audit target.
+    #[must_use]
+    fn into_target(self) -> AuditTarget {
+        self.target
+    }
+}
+
+impl RejectedAuditTarget {
+    /// Parses a request URI into an accepted target or a rejected audit target.
+    pub(crate) fn accept_request_uri(uri: &Uri) -> Result<AcceptedTarget, Self> {
+        AcceptedTarget::new(uri.path(), uri.query()).map_err(|reason| Self {
+            reason,
+            target: AuditTarget::from_request_uri(uri),
+        })
+    }
+
+    /// Consumes the witness into the recorded target and rejection reason.
+    #[must_use]
+    fn into_parts(self) -> (AuditTarget, TargetRejectionReason) {
+        (self.target, self.reason)
+    }
+
+    /// Returns the target parser rejection reason.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) const fn reason(&self) -> TargetRejectionReason {
+        self.reason
     }
 }
 
@@ -2091,6 +2221,24 @@ impl ObservedAuditRequestInput {
 }
 
 impl AuditTarget {
+    /// Creates an audit target from the raw request URI.
+    ///
+    /// Non-origin-form targets audit the full raw request target as the path so
+    /// denial events preserve the requested authority for forensics.
+    #[must_use]
+    pub(crate) fn from_request_uri(uri: &Uri) -> Self {
+        uri.authority().map_or_else(
+            || Self::from_uri_parts(uri.path(), uri.query()),
+            |authority| {
+                let raw_target = uri.scheme_str().map_or_else(
+                    || authority.as_str().to_owned(),
+                    |scheme| format!("{scheme}://{authority}{}", uri.path()),
+                );
+                Self::from_uri_parts(&raw_target, uri.query())
+            },
+        )
+    }
+
     /// Creates an audit target from raw request URI parts.
     #[must_use]
     pub(crate) fn from_uri_parts(path: &str, query: Option<&str>) -> Self {
@@ -3061,17 +3209,18 @@ where
 )]
 mod tests {
     use super::{
-        AuditBodySummary, AuditDecision, AuditDenial, AuditDenialReason, AuditError, AuditEvent,
-        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseError,
-        AuditResponseHeaderError, AuditSchemaVersion, AuditTarget, AuditTimestamp,
-        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ExistingAuditBodySummary,
-        ExistingAuditDecision, ExistingAuditErrorClass, ExistingAuditEventFields,
-        MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES, ObservedBodySummary,
-        RUN_TOKEN_BYTES, RequestId, RequiredOption, RunToken, RunTokenError,
-        classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
-        is_truncated_audit_method, validate_existing_audit_events, write_serialized_event,
+        AcceptedAuditTarget, AuditBodySummary, AuditDecision, AuditDenial, AuditDenialReason,
+        AuditError, AuditEvent, AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput,
+        AuditResponseError, AuditResponseHeaderError, AuditSchemaVersion, AuditTarget,
+        AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
+        ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
+        ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
+        ObservedBodySummary, PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId,
+        RequiredOption, RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
+        is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
+        write_serialized_event,
     };
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
     use crate::body::{
         BodyObservation, NonEmptyBodyObservation, OversizedResponseBody, ResponseAccount,
     };
@@ -3080,7 +3229,7 @@ mod tests {
         ResponseBodyBytes, UpstreamOrigin,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
-    use ::http::{Method, StatusCode};
+    use ::http::{Method, StatusCode, Uri};
     use core::num::{NonZeroU64, NonZeroUsize};
     use core::pin::Pin;
     use core::task::{Context, Poll};
@@ -4504,98 +4653,189 @@ mod tests {
         }
     }
 
-    #[test]
-    fn audit_denial_constructors_pair_method_target_and_reason() {
-        let target = AuditTarget::from_uri_parts("/v1/models", Some("limit=1"));
-        let cases = [
+    fn rejected_audit_target(
+        uri: &Uri,
+        expected: TargetRejectionReason,
+    ) -> (RejectedAuditTarget, AuditTarget) {
+        let rejection =
+            RejectedAuditTarget::accept_request_uri(uri).expect_err("target should be rejected");
+        assert_eq!(rejection.reason(), expected);
+        let target = AuditTarget::from_request_uri(uri);
+        (rejection, target)
+    }
+
+    fn accepted_denial_constructor_cases(
+        accepted_target: &AcceptedAuditTarget,
+        target: &AuditTarget,
+    ) -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
+        vec![
             (
-                AuditDenial::absolute_form_unsupported(Method::GET, target.clone()),
+                AuditDenial::invalid_request_connection_header(
+                    Method::GET,
+                    accepted_target.clone(),
+                ),
                 Method::GET,
-                AuditDenialReason::AbsoluteFormUnsupported,
-            ),
-            (
-                AuditDenial::connect_unsupported(target.clone()),
-                Method::CONNECT,
-                AuditDenialReason::ConnectUnsupported,
-            ),
-            (
-                AuditDenial::dot_segment(Method::GET, target.clone()),
-                Method::GET,
-                AuditDenialReason::DotSegment,
-            ),
-            (
-                AuditDenial::encoded_separator(Method::GET, target.clone()),
-                Method::GET,
-                AuditDenialReason::EncodedSeparator,
-            ),
-            (
-                AuditDenial::invalid_percent_encoding(Method::GET, target.clone()),
-                Method::GET,
-                AuditDenialReason::InvalidPercentEncoding,
-            ),
-            (
-                AuditDenial::invalid_request_connection_header(Method::GET, target.clone()),
-                Method::GET,
+                target.clone(),
                 AuditDenialReason::InvalidRequestConnectionHeader,
             ),
             (
-                AuditDenial::method_denied(Method::DELETE, target.clone()),
+                AuditDenial::allowlist_rejected(
+                    Method::DELETE,
+                    accepted_target.clone(),
+                    AllowlistRejectionReason::MethodDenied,
+                ),
                 Method::DELETE,
+                target.clone(),
                 AuditDenialReason::MethodDenied,
             ),
             (
-                AuditDenial::non_origin_form(Method::GET, target.clone()),
+                AuditDenial::allowlist_rejected(
+                    Method::GET,
+                    accepted_target.clone(),
+                    AllowlistRejectionReason::PathDenied,
+                ),
                 Method::GET,
-                AuditDenialReason::NonOriginForm,
-            ),
-            (
-                AuditDenial::path_denied(Method::GET, target.clone()),
-                Method::GET,
+                target.clone(),
                 AuditDenialReason::PathDenied,
             ),
             (
-                AuditDenial::path_too_long(Method::GET, target.clone()),
-                Method::GET,
-                AuditDenialReason::PathTooLong,
-            ),
-            (
-                AuditDenial::query_too_long(Method::GET, target.clone()),
-                Method::GET,
-                AuditDenialReason::QueryTooLong,
-            ),
-            (
-                AuditDenial::request_body_read_failed(Method::POST, target.clone()),
+                AuditDenial::request_body_read_failed(Method::POST, accepted_target.clone()),
                 Method::POST,
+                target.clone(),
                 AuditDenialReason::RequestBodyReadFailed,
             ),
             (
-                AuditDenial::request_body_timeout(Method::POST, target.clone()),
+                AuditDenial::request_body_timeout(Method::POST, accepted_target.clone()),
                 Method::POST,
+                target.clone(),
                 AuditDenialReason::RequestBodyTimeout,
             ),
             (
-                AuditDenial::request_body_too_large(Method::POST, target.clone()),
+                AuditDenial::request_body_too_large(Method::POST, accepted_target.clone()),
                 Method::POST,
+                target.clone(),
                 AuditDenialReason::RequestBodyTooLarge,
             ),
             (
-                AuditDenial::request_headers_too_large(Method::POST, target.clone()),
+                AuditDenial::request_headers_too_large(Method::POST, accepted_target.clone()),
                 Method::POST,
+                target.clone(),
                 AuditDenialReason::RequestHeadersTooLarge,
             ),
+        ]
+    }
+
+    fn preparsed_denial_constructor_cases(
+        preparsed_target: &PreparsedAuditTarget,
+        target: &AuditTarget,
+    ) -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
+        vec![
             (
-                AuditDenial::too_many_requests(Method::GET, target.clone()),
+                AuditDenial::absolute_form_unsupported(Method::GET, preparsed_target.clone()),
                 Method::GET,
+                target.clone(),
+                AuditDenialReason::AbsoluteFormUnsupported,
+            ),
+            (
+                AuditDenial::connect_unsupported(preparsed_target.clone()),
+                Method::CONNECT,
+                target.clone(),
+                AuditDenialReason::ConnectUnsupported,
+            ),
+            (
+                AuditDenial::too_many_requests(Method::GET, preparsed_target.clone()),
+                Method::GET,
+                target.clone(),
                 AuditDenialReason::TooManyRequests,
             ),
-        ];
+        ]
+    }
 
-        for (denial, method, reason) in cases {
+    fn rejected_denial_constructor_cases()
+    -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
+        let path_too_long_uri = format!("/{}?limit=1", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES))
+            .parse::<Uri>()
+            .expect("URI should parse");
+        let query_too_long_uri =
+            format!("/v1/models?{}", "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1))
+                .parse::<Uri>()
+                .expect("URI should parse");
+        let dot_segment = rejected_audit_target(
+            &Uri::from_static("/v1/../models?limit=1"),
+            TargetRejectionReason::DotSegment,
+        );
+        let encoded_separator = rejected_audit_target(
+            &Uri::from_static("/v1/%2fmodels?limit=1"),
+            TargetRejectionReason::EncodedSeparator,
+        );
+        let invalid_percent_encoding = rejected_audit_target(
+            &Uri::from_static("/v1/%zz?limit=1"),
+            TargetRejectionReason::InvalidPercentEncoding,
+        );
+        let non_origin_form =
+            rejected_audit_target(&Uri::from_static("*"), TargetRejectionReason::NonOriginForm);
+        let path_too_long =
+            rejected_audit_target(&path_too_long_uri, TargetRejectionReason::PathTooLong);
+        let query_too_long =
+            rejected_audit_target(&query_too_long_uri, TargetRejectionReason::QueryTooLong);
+        vec![
+            (
+                AuditDenial::target_rejected(Method::GET, dot_segment.0),
+                Method::GET,
+                dot_segment.1,
+                AuditDenialReason::DotSegment,
+            ),
+            (
+                AuditDenial::target_rejected(Method::GET, encoded_separator.0),
+                Method::GET,
+                encoded_separator.1,
+                AuditDenialReason::EncodedSeparator,
+            ),
+            (
+                AuditDenial::target_rejected(Method::GET, invalid_percent_encoding.0),
+                Method::GET,
+                invalid_percent_encoding.1,
+                AuditDenialReason::InvalidPercentEncoding,
+            ),
+            (
+                AuditDenial::target_rejected(Method::GET, non_origin_form.0),
+                Method::GET,
+                non_origin_form.1,
+                AuditDenialReason::NonOriginForm,
+            ),
+            (
+                AuditDenial::target_rejected(Method::GET, path_too_long.0),
+                Method::GET,
+                path_too_long.1,
+                AuditDenialReason::PathTooLong,
+            ),
+            (
+                AuditDenial::target_rejected(Method::GET, query_too_long.0),
+                Method::GET,
+                query_too_long.1,
+                AuditDenialReason::QueryTooLong,
+            ),
+        ]
+    }
+
+    #[test]
+    fn audit_denial_constructors_pair_method_target_and_reason() {
+        let uri = Uri::from_static("/v1/models?limit=1");
+        let target = AuditTarget::from_request_uri(&uri);
+        let accepted =
+            AcceptedTarget::new("/v1/models", Some("limit=1")).expect("target should be accepted");
+        let accepted_target = AcceptedAuditTarget::from_accepted(&accepted);
+        let preparsed_target = PreparsedAuditTarget::from_request_uri(&uri);
+        let mut cases = preparsed_denial_constructor_cases(&preparsed_target, &target);
+        cases.extend(rejected_denial_constructor_cases());
+        cases.extend(accepted_denial_constructor_cases(&accepted_target, &target));
+
+        for (denial, method, expected_target, reason) in cases {
             let status = denial.status();
             let (actual_method, actual_target, actual_reason) = denial.into_parts();
 
             assert_eq!(actual_method, method);
-            assert_eq!(actual_target, target);
+            assert_eq!(actual_target, expected_target);
             assert_eq!(actual_reason, reason);
             assert_eq!(status, reason.status());
         }
@@ -6146,18 +6386,19 @@ mod proptests {
         truncated_audit_methods_reject_non_writer_shapes,
     };
     use super::{
-        AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent, AuditEventInput,
-        AuditOutcome, AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
+        AcceptedAuditTarget, AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent,
+        AuditEventInput, AuditOutcome, AuditRequestInput, AuditResponseError,
+        AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
+        AuditWriter, ObservedBodySummary, PreparsedAuditTarget, RejectedAuditTarget, RequestId,
         RunToken, RunTokenError, inspect_audit_log_tail, is_existing_request_id,
     };
-    use crate::allowlist::AcceptedTarget;
+    use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
     use crate::config::{
         GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
     };
-    use ::http::Method;
-    use ::http::StatusCode;
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
+    use ::http::{Method, StatusCode, Uri};
     use core::num::NonZeroU64;
     use core::num::NonZeroUsize;
     use core::time::Duration;
@@ -6206,75 +6447,169 @@ mod proptests {
         ]))
     }
 
+    /// Returns an accepted audit target for generated denial constructors.
+    fn accepted_audit_target() -> AcceptedAuditTarget {
+        let target =
+            AcceptedTarget::new("/v1/models", Some("limit=1")).expect("target should be accepted");
+        AcceptedAuditTarget::from_accepted(&target)
+    }
+
     /// Returns one audit denial constructor output by index.
     fn audit_denial(index: u8) -> (AuditDenial, AuditDenialReason) {
         let method = Method::POST;
-        let target = AuditTarget::from_uri_parts("/v1/models", Some("limit=1"));
         match index {
             0 => (
-                AuditDenial::absolute_form_unsupported(method, target),
+                AuditDenial::absolute_form_unsupported(method, preparsed_audit_target()),
                 AuditDenialReason::AbsoluteFormUnsupported,
             ),
             1 => (
-                AuditDenial::connect_unsupported(target),
+                AuditDenial::connect_unsupported(preparsed_audit_target()),
                 AuditDenialReason::ConnectUnsupported,
             ),
             2 => (
-                AuditDenial::dot_segment(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::DotSegment),
+                ),
                 AuditDenialReason::DotSegment,
             ),
             3 => (
-                AuditDenial::encoded_separator(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::EncodedSeparator),
+                ),
                 AuditDenialReason::EncodedSeparator,
             ),
             4 => (
-                AuditDenial::invalid_percent_encoding(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::InvalidPercentEncoding),
+                ),
                 AuditDenialReason::InvalidPercentEncoding,
             ),
             5 => (
-                AuditDenial::invalid_request_connection_header(method, target),
+                AuditDenial::invalid_request_connection_header(method, accepted_audit_target()),
                 AuditDenialReason::InvalidRequestConnectionHeader,
             ),
             6 => (
-                AuditDenial::method_denied(method, target),
+                AuditDenial::allowlist_rejected(
+                    method,
+                    accepted_audit_target(),
+                    AllowlistRejectionReason::MethodDenied,
+                ),
                 AuditDenialReason::MethodDenied,
             ),
             7 => (
-                AuditDenial::non_origin_form(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::NonOriginForm),
+                ),
                 AuditDenialReason::NonOriginForm,
             ),
             8 => (
-                AuditDenial::path_denied(method, target),
+                AuditDenial::allowlist_rejected(
+                    method,
+                    accepted_audit_target(),
+                    AllowlistRejectionReason::PathDenied,
+                ),
                 AuditDenialReason::PathDenied,
             ),
             9 => (
-                AuditDenial::path_too_long(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::PathTooLong),
+                ),
                 AuditDenialReason::PathTooLong,
             ),
             10 => (
-                AuditDenial::query_too_long(method, target),
+                AuditDenial::target_rejected(
+                    method,
+                    rejected_audit_target(TargetRejectionReason::QueryTooLong),
+                ),
                 AuditDenialReason::QueryTooLong,
             ),
             11 => (
-                AuditDenial::request_body_read_failed(method, target),
+                AuditDenial::request_body_read_failed(method, accepted_audit_target()),
                 AuditDenialReason::RequestBodyReadFailed,
             ),
             12 => (
-                AuditDenial::request_body_timeout(method, target),
+                AuditDenial::request_body_timeout(method, accepted_audit_target()),
                 AuditDenialReason::RequestBodyTimeout,
             ),
             13 => (
-                AuditDenial::request_body_too_large(method, target),
+                AuditDenial::request_body_too_large(method, accepted_audit_target()),
                 AuditDenialReason::RequestBodyTooLarge,
             ),
             14 => (
-                AuditDenial::request_headers_too_large(method, target),
+                AuditDenial::request_headers_too_large(method, accepted_audit_target()),
                 AuditDenialReason::RequestHeadersTooLarge,
             ),
             _ => (
-                AuditDenial::too_many_requests(method, target),
+                AuditDenial::too_many_requests(method, preparsed_audit_target()),
                 AuditDenialReason::TooManyRequests,
             ),
+        }
+    }
+
+    /// Returns a preparsed audit target for generated denial constructors.
+    fn preparsed_audit_target() -> PreparsedAuditTarget {
+        PreparsedAuditTarget::from_request_uri(&Uri::from_static("/v1/models?limit=1"))
+    }
+
+    /// Returns a parser-rejected audit target for generated denial constructors.
+    fn rejected_audit_target(reason: TargetRejectionReason) -> RejectedAuditTarget {
+        let uri = uri_for_target_rejection(reason);
+        let rejection =
+            RejectedAuditTarget::accept_request_uri(&uri).expect_err("target should be rejected");
+        assert_eq!(rejection.reason(), reason);
+        rejection
+    }
+
+    /// Returns a URI rejected by the target parser with the requested reason.
+    fn uri_for_target_rejection(reason: TargetRejectionReason) -> Uri {
+        match reason {
+            TargetRejectionReason::DotSegment => Uri::from_static("/v1/../models"),
+            TargetRejectionReason::EncodedSeparator => Uri::from_static("/v1/%2fmodels"),
+            TargetRejectionReason::InvalidPercentEncoding => Uri::from_static("/v1/%zz"),
+            TargetRejectionReason::NonOriginForm => Uri::from_static("*"),
+            TargetRejectionReason::PathTooLong => {
+                format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES))
+                    .parse()
+                    .expect("URI should parse")
+            }
+            TargetRejectionReason::QueryTooLong => {
+                format!("/v1/models?{}", "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1))
+                    .parse()
+                    .expect("URI should parse")
+            }
+        }
+    }
+
+    #[test]
+    fn request_uri_audit_targets_preserve_origin_and_authority_forms() {
+        let cases = [
+            (
+                Uri::from_static("/v1/models?limit=1"),
+                "/v1/models",
+                Some("limit=1"),
+            ),
+            (
+                Uri::from_static("http://evil.example/steal?limit=1"),
+                "http://evil.example/steal",
+                Some("limit=1"),
+            ),
+            (
+                Uri::from_static("evil.example:443"),
+                "evil.example:443",
+                None,
+            ),
+        ];
+
+        for (uri, path, query) in cases {
+            let target = AuditTarget::from_request_uri(&uri);
+
+            assert_eq!(target.path(), path);
+            assert_eq!(target.query(), query);
         }
     }
 
