@@ -9,13 +9,14 @@
 # - the harness is attached only to Docker-internal networks;
 # - the harness cannot reach an external URL directly, tested from inside
 #   the harness container;
-# - the harness can reach the gateway on the internal network.
+# - the harness can reach the gateway on the internal network;
+# - the proxy audit log is valid NDJSON with monotonic request IDs.
 
 export CUSTODE_UPSTREAM_ORIGIN="${CUSTODE_UPSTREAM_ORIGIN:-https://api.anthropic.com}"
 export CUSTODE_ALLOWED_OPERATIONS="${CUSTODE_ALLOWED_OPERATIONS:-POST:prefix:/v1/messages,GET:prefix:/v1/models}"
 export COMPOSE_PROJECT_NAME="custode_container_test_$$"
 
-readonly TAP_TEST_COUNT=7
+readonly TAP_TEST_COUNT=8
 
 test_number=0
 failed=0
@@ -160,6 +161,42 @@ harness_reaches_gateway() {
   esac
 }
 
+proxy_audit_log_is_valid() {
+  local audit_dir=""
+  local audit_log
+  local container_id
+  local event_count
+  local status=0
+
+  if ! container_id=$(docker compose ps --quiet proxy); then
+    return 1
+  fi
+
+  if [[ -z "${container_id}" ]]; then
+    printf "proxy container was not found\n" >&2
+    return 1
+  fi
+
+  if ! audit_dir=$(mktemp -d); then
+    return 1
+  fi
+  audit_log="${audit_dir}/proxy.ndjson"
+
+  if ! docker cp "${container_id}:/var/log/custode/proxy.ndjson" "${audit_log}"; then
+    status=1
+  elif ! scripts/verify-audit-log.sh "${audit_log}"; then
+    status=1
+  elif ! event_count=$(jq -s 'length' <"${audit_log}"); then
+    status=1
+  elif [[ "${event_count}" -lt 1 ]]; then
+    printf "proxy audit log has no events\n" >&2
+    status=1
+  fi
+
+  rm -rf "${audit_dir}"
+  return "${status}"
+}
+
 tap_diag() {
   local line
 
@@ -208,6 +245,8 @@ run_test "harness networks are internal-only" harness_networks_are_internal_only
 run_test "harness cannot reach an external URL directly" harness_cannot_reach_external
 
 run_test "harness reaches the gateway on the internal network" harness_reaches_gateway
+
+run_test "proxy audit log is valid" proxy_audit_log_is_valid
 
 if [[ "${failed}" -ne 0 ]]; then
   exit 1
