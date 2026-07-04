@@ -167,6 +167,18 @@ fn assert_file_line_failure(output: Output, missed: u32, maximum: u32) {
     );
 }
 
+fn assert_file_line_ratchet_failure(output: Output, missed: u32, ratchet: u32) {
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(1_i32));
+    assert!(
+        stderr.contains(&format!(
+            "coverage file fixture.rs metric lines has {missed} missed states; ratchet is {ratchet}"
+        )),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn summary_requires_numeric_totals() {
     let output = run_summary_fixture(r#"{"data":[{"totals":{}}]}"#);
@@ -316,6 +328,18 @@ fn file_ratchet_rejects_new_missed_lines_outside_test_modules() {
     );
 
     assert_file_line_failure(output, 1, 0);
+}
+
+#[test]
+fn file_ratchet_rejects_improved_missed_lines_until_updated() {
+    let output = run_file_ratchet_for_source(
+        Path::new("fixture.rs"),
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[]",
+        "fixture.rs\t0\t0\t1\t0\n",
+    );
+
+    assert_file_line_ratchet_failure(output, 0, 1);
 }
 
 #[test]

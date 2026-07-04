@@ -596,12 +596,17 @@ check_file_ratchet() {
             printf "coverage file %s is missing from ratchet\n",
               file >"/dev/stderr"
             failed = 1
-            continue
           }
+        }
+        for (file in ratchet_files) {
           for (metric_index = 1; metric_index <= 4; metric_index += 1) {
             metric = metrics[metric_index]
             if (actual[file, metric] > maximum[file, metric]) {
               printf "coverage file %s metric %s has %d missed states; max is %d\n",
+                file, metric, actual[file, metric], maximum[file, metric] >"/dev/stderr"
+              failed = 1
+            } else if (actual[file, metric] < maximum[file, metric]) {
+              printf "coverage file %s metric %s has %d missed states; ratchet is %d\n",
                 file, metric, actual[file, metric], maximum[file, metric] >"/dev/stderr"
               failed = 1
             }
