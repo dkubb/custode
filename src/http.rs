@@ -163,6 +163,16 @@ enum ResponseStreamOutcome {
     UpstreamResponseTimeout,
 }
 
+/// Final chunk audit race outcome.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FinalChunkAuditOutcome {
+    /// Allowed audit completed before downstream closure.
+    Allowed,
+
+    /// Downstream closed before allowed audit completed.
+    DownstreamClosed,
+}
+
 /// Server task future shape observed by the shutdown coordinator.
 type ServerFuture = Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>>;
 
@@ -532,6 +542,43 @@ async fn audit_response_status(
     Ok(status_response(status))
 }
 
+/// Maps an upstream response body error to terminal stream and audit outcomes.
+const fn upstream_body_error_outcome(
+    error_kind: UpstreamBodyErrorKind,
+) -> (ResponseStreamOutcome, StreamAbortReason) {
+    match error_kind {
+        UpstreamBodyErrorKind::Stream => (
+            ResponseStreamOutcome::UpstreamResponseStreamFailed,
+            StreamAbortReason::UpstreamBody,
+        ),
+        UpstreamBodyErrorKind::Timeout => (
+            ResponseStreamOutcome::UpstreamResponseTimeout,
+            StreamAbortReason::UpstreamBodyTimeout,
+        ),
+    }
+}
+
+/// Audits final response completion unless downstream closes first.
+async fn audit_final_chunk_completion(
+    context: &ResponseAuditContext,
+    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
+) -> Result<FinalChunkAuditOutcome, ResponseAuditFailure> {
+    let closed = Box::pin(sender.closed());
+    let allowed = Box::pin(context.audit_after_response_started(ResponseStreamOutcome::Allowed));
+    match future::select(closed, allowed).await {
+        Either::Left(((), _allowed)) => {
+            context
+                .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
+                .await?;
+            Ok(FinalChunkAuditOutcome::DownstreamClosed)
+        }
+        Either::Right((audit_result, _closed)) => {
+            audit_result?;
+            Ok(FinalChunkAuditOutcome::Allowed)
+        }
+    }
+}
+
 /// Streams the upstream response and writes exactly one terminal audit event.
 fn response_stream(
     mut context: ResponseAuditContext,
@@ -548,16 +595,8 @@ fn response_stream(
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
                 Err(upstream_body_error) => {
-                    let (outcome, stream_error) = match upstream_body_error.kind() {
-                        UpstreamBodyErrorKind::Stream => (
-                            ResponseStreamOutcome::UpstreamResponseStreamFailed,
-                            StreamAbortReason::UpstreamBody,
-                        ),
-                        UpstreamBodyErrorKind::Timeout => (
-                            ResponseStreamOutcome::UpstreamResponseTimeout,
-                            StreamAbortReason::UpstreamBodyTimeout,
-                        ),
-                    };
+                    let (outcome, stream_error) =
+                        upstream_body_error_outcome(upstream_body_error.kind());
                     if let Some(previous_chunk) = pending.take()
                         && sender.send(Ok(previous_chunk)).await.is_err()
                     {
@@ -625,11 +664,9 @@ fn response_stream(
             return;
         };
 
-        let audit_result = context
-            .audit_after_response_started(ResponseStreamOutcome::Allowed)
-            .await;
-        match audit_result {
-            Ok(()) => final_permit.send(Ok(final_chunk)),
+        match audit_final_chunk_completion(&context, &sender).await {
+            Ok(FinalChunkAuditOutcome::Allowed) => final_permit.send(Ok(final_chunk)),
+            Ok(FinalChunkAuditOutcome::DownstreamClosed) => drop(final_permit),
             Err(error) => {
                 drop(final_permit);
                 send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
@@ -1384,15 +1421,15 @@ mod tests {
     };
     use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason, allow_target};
     use crate::audit::{
-        AuditDenialReason, AuditError, AuditResponseHeaderError, AuditUpstreamError, RequestId,
-        RunToken,
+        AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError, AuditUpstreamError,
+        RequestId, RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs};
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
     use crate::ports::{
-        AuditSink, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline,
+        AuditSink, BoxFuture, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline,
         UpstreamError, UpstreamErrorKind, UpstreamResponse,
     };
     use crate::sim::{
@@ -1421,11 +1458,11 @@ mod tests {
     use serde_json::{Map, Value};
     use std::io;
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
     use tokio::fs::read_to_string;
     use tokio::net::TcpListener;
-    use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+    use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
     use tokio::task::yield_now;
     use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
@@ -1466,6 +1503,103 @@ mod tests {
 
         /// Response body ended with an error.
         Error(String),
+    }
+
+    /// Audit sink that blocks the first audit attempt until it is canceled.
+    #[derive(Clone, Debug)]
+    struct BlockingFirstAuditSink {
+        /// Number of audit events attempted by this sink.
+        event_count: Arc<Mutex<usize>>,
+        /// Captured serialized audit events after the blocked first attempt.
+        events: Arc<Mutex<Vec<Value>>>,
+        /// Audit event ordinal that should fail instead of recording.
+        fail_on_event: Option<NonZeroUsize>,
+        /// First append notification.
+        first_append_started: Arc<Notify>,
+    }
+
+    impl AuditSink for BlockingFirstAuditSink {
+        fn append_event<'future>(
+            &'future self,
+            event: &'future AuditEvent,
+        ) -> BoxFuture<'future, Result<(), AuditError>> {
+            let event_count = Arc::clone(&self.event_count);
+            let events = Arc::clone(&self.events);
+            let fail_on_event = self.fail_on_event;
+            let first_append_started = Arc::clone(&self.first_append_started);
+
+            Box::pin(async move {
+                let event_number = {
+                    let mut count = event_count
+                        .lock()
+                        .expect("blocking audit event count should not be poisoned");
+                    let next = count
+                        .checked_add(1)
+                        .expect("blocking audit event count should not overflow");
+                    *count = next;
+                    next
+                };
+                if event_number == 1 {
+                    first_append_started.notify_one();
+                    future::pending::<()>().await;
+                }
+                if fail_on_event.is_some_and(|fail_on| fail_on.get() == event_number) {
+                    return Err(AuditError::Write(io::Error::other(
+                        "scripted blocking audit failure",
+                    )));
+                }
+
+                let value = serde_json::to_value(event)
+                    .expect("audit events contain only infallible JSON values");
+                events
+                    .lock()
+                    .expect("blocking audit sink should not be poisoned")
+                    .push(value);
+                Ok(())
+            })
+        }
+    }
+
+    impl BlockingFirstAuditSink {
+        /// Returns the number of attempted audit events.
+        #[must_use]
+        fn event_count(&self) -> usize {
+            *self
+                .event_count
+                .lock()
+                .expect("blocking audit event count should not be poisoned")
+        }
+
+        /// Builds a blocking sink that fails on a specific event ordinal.
+        #[must_use]
+        fn failing_on(event: NonZeroUsize) -> (Self, Arc<Mutex<Vec<Value>>>, Arc<Notify>) {
+            Self::with_failure(Some(event))
+        }
+
+        /// Builds a blocking sink and its observers.
+        #[must_use]
+        fn new() -> (Self, Arc<Mutex<Vec<Value>>>, Arc<Notify>) {
+            Self::with_failure(None)
+        }
+
+        /// Builds a blocking sink with optional failure behavior.
+        #[must_use]
+        fn with_failure(
+            fail_on_event: Option<NonZeroUsize>,
+        ) -> (Self, Arc<Mutex<Vec<Value>>>, Arc<Notify>) {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let first_append_started = Arc::new(Notify::new());
+            (
+                Self {
+                    event_count: Arc::new(Mutex::new(0)),
+                    events: Arc::clone(&events),
+                    fail_on_event,
+                    first_append_started: Arc::clone(&first_append_started),
+                },
+                events,
+                first_append_started,
+            )
+        }
     }
 
     /// Request id source that always reports exhaustion.
@@ -3632,6 +3766,79 @@ mod tests {
             .await
             .expect("audit failure should be reported");
         assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_audits_downstream_close_before_allowed_audit_finishes() {
+        let (audit, audit_events, first_append_started) = BlockingFirstAuditSink::new();
+        let audit_observer = audit.clone();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body =
+            stream::once(async { Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")) });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response, test_permit());
+
+        first_append_started.notified().await;
+        drop(response_body);
+        let mut events = Vec::new();
+        for _attempt in 0_u8..10 {
+            events = audit_events
+                .lock()
+                .expect("blocking audit sink should not be poisoned")
+                .clone();
+            if events.len() == 1 {
+                break;
+            }
+            yield_now().await;
+        }
+
+        assert_eq!(audit_observer.event_count(), 2);
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("downstream close should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "downstream_closed");
+        assert_eq!(event["response_body"], non_empty_body_value(b"final"));
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_reports_fatal_when_downstream_close_audit_fails() {
+        let fail_on_second = NonZeroUsize::new(2).expect("literal should be non-zero");
+        let (audit, audit_events, first_append_started) =
+            BlockingFirstAuditSink::failing_on(fail_on_second);
+        let audit_observer = audit.clone();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body =
+            stream::once(async { Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"final")) });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response, test_permit());
+
+        first_append_started.notified().await;
+        drop(response_body);
+
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("audit failure should be reported");
+        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+        assert_eq!(audit_observer.event_count(), 2);
+        assert!(
+            audit_events
+                .lock()
+                .expect("blocking audit sink should not be poisoned")
+                .is_empty()
+        );
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
