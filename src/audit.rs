@@ -2900,10 +2900,19 @@ mod proptests {
             );
             let input = AuditEventInput::new(request, outcome);
 
-            let value = serde_json::to_value(AuditEvent::new(input))
-                .expect("event should serialize");
+            let event = AuditEvent::new(input);
+            let value = serde_json::to_value(&event).expect("event should serialize");
+            let serialized = serde_json::to_vec(&event).expect("event should serialize to bytes");
+            let serialized_value: Value =
+                serde_json::from_slice(&serialized).expect("serialized event should parse");
+            let serialized_text =
+                serde_json::to_string(&event).expect("event should serialize to text");
+            let text_value: Value =
+                serde_json::from_str(&serialized_text).expect("serialized event text should parse");
             let object = value.as_object().expect("event should be a JSON object");
 
+            prop_assert_eq!(&serialized_value, &value);
+            prop_assert_eq!(&text_value, &value);
             prop_assert_eq!(object.len(), 14);
             prop_assert_eq!(object["decision"].as_str(), Some(decision));
             let expected_path = if path.is_empty() { "/" } else { path.as_str() };
