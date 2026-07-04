@@ -2,15 +2,15 @@
 
 use crate::allowlist::AllowedTarget;
 use crate::audit::{
-    AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
-    AuditResponseError, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
-    ObservedAuditRequestInput, ObservedBodySummary, RequestId, ResponseBodyPrefix,
+    AuditDenial, AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditResponseError,
+    AuditResponseHeaderError, AuditUpstreamError, ObservedAuditRequestInput, ObservedBodySummary,
+    RequestId, ResponseBodyPrefix,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdError, RequestIdSource};
-use ::http::{Error as HttpError, Method, StatusCode};
+use ::http::{Error as HttpError, StatusCode};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -245,17 +245,13 @@ impl Gateway {
     pub(crate) async fn audit_denial(
         &self,
         request_id: RequestId,
-        method: &Method,
-        target: AuditTarget,
+        denial: AuditDenial,
         request_body: Option<&AccountedBody>,
-        reason: AuditDenialReason,
     ) -> Result<(), GatewayError> {
         let request = AuditRequestInput::for_denial(
-            method.clone(),
-            target,
+            denial,
             request_id,
             request_body,
-            reason,
             self.config.upstream_origin().clone(),
         );
         let event = AuditEvent::new_at(AuditEventInput::denied(request), self.clock.now());
@@ -366,9 +362,7 @@ mod tests {
     use super::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
     use crate::adapters::{SequentialRequestIds, SystemClock};
     use crate::allowlist::{AcceptedTarget, AllowedTarget, allow_target};
-    use crate::audit::{
-        AuditDenialReason, AuditError, AuditTarget, AuditWriter, RequestId, RunToken,
-    };
+    use crate::audit::{AuditDenial, AuditError, AuditTarget, AuditWriter, RequestId, RunToken};
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes};
     use ::http::{Method, StatusCode};
@@ -492,10 +486,8 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                &Method::CONNECT,
-                AuditTarget::from_uri_parts("/", None),
+                AuditDenial::connect_unsupported(AuditTarget::from_uri_parts("/", None)),
                 None,
-                AuditDenialReason::ConnectUnsupported,
             )
             .await
             .expect("denial audit should be written");
@@ -521,10 +513,11 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                &Method::DELETE,
-                AuditTarget::from_uri_parts("/v1/models", None),
+                AuditDenial::method_denied(
+                    Method::DELETE,
+                    AuditTarget::from_uri_parts("/v1/models", None),
+                ),
                 Some(&request_body),
-                AuditDenialReason::MethodDenied,
             )
             .await
             .expect("denial audit should be written");
@@ -545,10 +538,11 @@ mod tests {
                     &RunToken::for_test("000000000000000a-000000000000000b"),
                     NonZeroU64::new(1).expect("sequence should be non-zero"),
                 ),
-                &Method::POST,
-                AuditTarget::from_uri_parts("/v1/other", None),
+                AuditDenial::path_denied(
+                    Method::POST,
+                    AuditTarget::from_uri_parts("/v1/other", None),
+                ),
                 Some(&request_body),
-                AuditDenialReason::PathDenied,
             )
             .await
             .expect("denial audit should be written");
