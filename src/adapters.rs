@@ -12,9 +12,7 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
 use reqwest::redirect::Policy;
-use std::fs::File;
-use std::io::{self, Read as _};
-use std::path::Path;
+use std::io;
 use thiserror::Error;
 
 /// Production audit timestamp source.
@@ -206,13 +204,8 @@ const fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunTok
 
 /// Reads run-token entropy from the operating system.
 fn read_run_token_entropy() -> io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]> {
-    read_run_token_entropy_from(Path::new("/dev/urandom"))
-}
-
-/// Reads run-token entropy from a path.
-fn read_run_token_entropy_from(path: &Path) -> io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]> {
     let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
-    File::open(path).and_then(|mut random| random.read_exact(&mut entropy))?;
+    getrandom::fill(&mut entropy).map_err(io::Error::other)?;
     Ok(entropy)
 }
 
@@ -299,8 +292,7 @@ mod tests {
 
     use super::{
         RUN_TOKEN_RANDOM_BYTES, ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds,
-        SystemClock, read_run_token_entropy_from, run_token_from_entropy,
-        upstream_error_kind_from_reqwest,
+        SystemClock, run_token_from_entropy, upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
@@ -320,7 +312,6 @@ mod tests {
     use futures_util::StreamExt as _;
     use pretty_assertions::assert_eq;
     use std::io::Error;
-    use std::path::Path;
     use std::path::PathBuf;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -431,14 +422,6 @@ mod tests {
                 NonZeroU64::new(1).expect("literal should be non-zero"),
             ),
         );
-    }
-
-    #[test]
-    fn run_token_entropy_reader_reports_short_reads() {
-        let error = read_run_token_entropy_from(Path::new("/dev/null"))
-            .expect_err("empty device should not produce enough entropy");
-
-        assert_eq!(error.to_string(), "failed to fill whole buffer");
     }
 
     #[test]

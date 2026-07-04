@@ -5,6 +5,7 @@ use blake3 as _;
 use clap::Parser as _;
 use custode::Cli;
 use futures_util as _;
+use getrandom as _;
 use http as _;
 use http_body_util as _;
 use humantime as _;

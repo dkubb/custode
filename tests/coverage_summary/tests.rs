@@ -3,6 +3,7 @@ use blake3 as _;
 use clap as _;
 use custode as _;
 use futures_util as _;
+use getrandom as _;
 use http as _;
 use http_body_util as _;
 use humantime as _;
