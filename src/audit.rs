@@ -558,6 +558,7 @@ impl ExistingAuditEventFields {
     /// Validates cross-field invariants that JSON shape alone cannot encode.
     fn validate(&self) -> Result<(), &'static str> {
         let error_class = self.validate_error_class()?;
+        self.validate_method(error_class)?;
         self.validate_request_body()?;
         self.validate_response_body(error_class)?;
         self.validate_status(error_class)?;
@@ -587,6 +588,23 @@ impl ExistingAuditEventFields {
             }
             (_, None) => Err("failed audit events must have an error class"),
             (_, Some(_error_class)) => Err("audit error class does not match decision"),
+        }
+    }
+
+    /// Validates the method for decision-specific terminal states.
+    fn validate_method(
+        &self,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        let is_connect = self.method == Method::CONNECT.as_str();
+        match error_class {
+            Some(ExistingAuditErrorClass::ConnectUnsupported) if is_connect => Ok(()),
+            Some(ExistingAuditErrorClass::ConnectUnsupported) => {
+                Err("connect denials must record CONNECT")
+            }
+            Some(ExistingAuditErrorClass::TooManyRequests) => Ok(()),
+            _ if is_connect => Err("CONNECT can only be denied before admission"),
+            _ => Ok(()),
         }
     }
 
@@ -2962,7 +2980,7 @@ mod tests {
     }
 
     /// Builds decision-level semantically invalid existing audit event lines.
-    fn semantic_invalid_decision_lines() -> [(&'static str, Vec<u8>); 7] {
+    fn semantic_invalid_decision_lines() -> [(&'static str, Vec<u8>); 9] {
         [
             (
                 "allowed with error class",
@@ -2981,11 +2999,34 @@ mod tests {
                 ]),
             ),
             (
+                "allowed CONNECT",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("allowed".to_owned())),
+                    ("error_class", Value::Null),
+                    ("method", Value::String("CONNECT".to_owned())),
+                    ("request_body", non_empty_body_value()),
+                    ("response_body", non_empty_body_value()),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
                 "denied with response error class",
                 serialized_event_line_with_field(
                     "error_class",
                     Value::String("response_headers_too_large".to_owned()),
                 ),
+            ),
+            (
+                "connect unsupported with GET",
+                serialized_event_line_with_fields([
+                    (
+                        "error_class",
+                        Value::String("connect_unsupported".to_owned()),
+                    ),
+                    ("method", Value::String("GET".to_owned())),
+                    ("status", Value::from(405_u64)),
+                ]),
             ),
             (
                 "failed without error class",
@@ -3947,6 +3988,54 @@ mod tests {
         assert_eq!(first_version, 3_u64);
         assert_eq!(decision, "denied");
         assert_eq!(lines.next(), None);
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_connect_denials() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(
+            &audit_log,
+            serialized_event_line_with_fields([
+                (
+                    "error_class",
+                    Value::String("connect_unsupported".to_owned()),
+                ),
+                ("method", Value::String("CONNECT".to_owned())),
+                ("path", Value::String("evil.example:443".to_owned())),
+                ("status", Value::from(405_u64)),
+            ]),
+        )
+        .expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log, roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(result.is_ok(), "CONNECT denial should be accepted");
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_too_many_requests_denials() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(
+            &audit_log,
+            serialized_event_line_with_fields([
+                ("error_class", Value::String("too_many_requests".to_owned())),
+                ("method", Value::String("CONNECT".to_owned())),
+                ("path", Value::String("evil.example:443".to_owned())),
+                ("status", Value::from(429_u64)),
+            ]),
+        )
+        .expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log, roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(
+            result.is_ok(),
+            "too-many-requests denial should be accepted"
+        );
     }
 
     #[tokio::test]
