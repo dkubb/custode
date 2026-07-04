@@ -2029,6 +2029,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scenario_runner_handles_upstream_stream_errors() {
+        let scenario = Scenario::new(
+            ScenarioRequest::new(
+                b"hello".to_vec(),
+                vec![("authorization".to_owned(), "Bearer harness".to_owned())],
+                Method::GET,
+                "/v1/models?limit=1",
+            ),
+            ScenarioUpstream::StreamError,
+        );
+
+        let run = run_scenario(scenario).await;
+
+        assert_eq!(run.status, StatusCode::CREATED);
+        assert_eq!(
+            run.response_body,
+            ScenarioBody::Error("scripted upstream stream failed".to_owned())
+        );
+        assert_eq!(run.fatal_error, None);
+        assert_eq!(run.upstream_requests.len(), 1);
+        assert_eq!(run.audit_events.len(), 1);
+        let event = run
+            .audit_events
+            .first()
+            .and_then(Value::as_object)
+            .expect("audit event should be an object");
+        assert_eq!(
+            event["decision"],
+            Value::String("response_error".to_owned())
+        );
+        assert_eq!(
+            event["error_class"],
+            Value::String("upstream_response_stream_failed".to_owned())
+        );
+        assert_eq!(event["response_body"], non_empty_body_value(b"first"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_uses_injected_ports_for_allowed_requests() {
         let (audit, audit_events) = MemoryAuditSink::new();
         let (client, upstream_requests) = ScriptedUpstreamClient::new();

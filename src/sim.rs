@@ -791,3 +791,166 @@ fn scenario_target_any() -> impl Strategy<Value = String> {
         )
     })
 }
+
+#[cfg(test)]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline tests keep deterministic test adapter ownership explicit"
+)]
+mod tests {
+    use super::{
+        MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission, ScenarioAudit,
+        ScenarioBounds, ScenarioClass, ScenarioDownstream, ScenarioRequest, ScenarioUpstream,
+        ScriptedUpstreamClient, scenario_any, scenario_body_any, scenario_class_any,
+        scenario_connection_value_any, scenario_header_any, scenario_header_value_any,
+        scenario_header_value_char_any, scenario_headers_any, scenario_query_char_any,
+        scenario_target_any, scripted_stream_error_response,
+    };
+    use crate::config::RequestTimeout;
+    use crate::ports::UpstreamDeadline;
+    use core::time::Duration;
+    use http::Method;
+    use pretty_assertions::assert_eq;
+    use proptest::strategy::{Strategy, ValueTree as _};
+    use proptest::test_runner::TestRunner;
+
+    fn sample<S>(runner: &mut TestRunner, strategy: S) -> S::Value
+    where
+        S: Strategy,
+    {
+        strategy
+            .new_tree(runner)
+            .expect("strategy should generate")
+            .current()
+    }
+
+    #[test]
+    fn recorded_upstream_request_accessors_preserve_parts() {
+        let deadline =
+            UpstreamDeadline::from_timeout(RequestTimeout::from_duration(Duration::from_secs(3)));
+        let request = RecordedUpstreamRequest::new(
+            b"body".to_vec(),
+            deadline,
+            vec![("x-test".to_owned(), "visible".to_owned())],
+            Method::POST,
+            "https://api.openai.com/v1/models",
+        );
+
+        assert_eq!(request.body(), b"body");
+        assert_eq!(request.deadline(), deadline);
+        assert_eq!(
+            request.headers(),
+            [("x-test".to_owned(), "visible".to_owned())]
+        );
+        assert_eq!(request.method(), Method::POST);
+        assert_eq!(request.url(), "https://api.openai.com/v1/models");
+    }
+
+    #[test]
+    fn scenario_classes_cover_every_reachable_combination() {
+        let request = ScenarioRequest::new(Vec::new(), Vec::new(), Method::GET, "/v1/models");
+        let classes = ScenarioClass::all();
+
+        assert_eq!(classes.len(), ScenarioClass::count());
+
+        for class in classes {
+            let scenario = Scenario::with_class(class, request.clone());
+
+            assert_eq!(scenario.request(), &request);
+            match scenario.downstream() {
+                ScenarioDownstream::ConsumeAll
+                | ScenarioDownstream::DropBeforeFirstChunk
+                | ScenarioDownstream::DropBeforeFinalChunk => {}
+            }
+        }
+    }
+
+    #[test]
+    fn scenario_request_and_defaults_preserve_parts() {
+        let request = ScenarioRequest::new(
+            b"body".to_vec(),
+            vec![("authorization".to_owned(), "Bearer token".to_owned())],
+            Method::GET,
+            "/v1/models?limit=1",
+        );
+        let scenario = Scenario::new(request.clone(), ScenarioUpstream::Respond);
+
+        assert_eq!(request.body(), b"body");
+        assert_eq!(
+            request.headers(),
+            [("authorization".to_owned(), "Bearer token".to_owned())],
+        );
+        assert_eq!(request.method(), Method::GET);
+        assert_eq!(request.target(), "/v1/models?limit=1");
+        assert_eq!(scenario.admission(), ScenarioAdmission::Open);
+        assert_eq!(scenario.audit(), ScenarioAudit::Record);
+        assert_eq!(scenario.bounds(), ScenarioBounds::Roomy);
+        assert_eq!(scenario.downstream(), ScenarioDownstream::ConsumeAll);
+        assert_eq!(scenario.request(), &request);
+        assert_eq!(scenario.upstream(), ScenarioUpstream::Respond);
+    }
+
+    #[test]
+    fn scenario_adapters_cover_scripted_fault_variants() {
+        let (audit, audit_events) = MemoryAuditSink::from_audit(ScenarioAudit::FailFirst);
+        let (_stream_client, stream_requests) =
+            ScriptedUpstreamClient::from_upstream(ScenarioUpstream::StreamError);
+        let (_timeout_client, timeout_requests) =
+            ScriptedUpstreamClient::from_upstream(ScenarioUpstream::Timeout);
+
+        assert_eq!(audit.event_count(), 0);
+        assert!(
+            audit_events
+                .lock()
+                .expect("audit events should lock")
+                .is_empty()
+        );
+        assert!(
+            stream_requests
+                .lock()
+                .expect("stream requests should lock")
+                .is_empty()
+        );
+        assert!(
+            timeout_requests
+                .lock()
+                .expect("timeout requests should lock")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scenario_generators_create_valid_samples() {
+        let mut runner = TestRunner::deterministic();
+        let mut saw_query_target = false;
+        let mut saw_bare_target = false;
+
+        for _sample in 0_u8..64 {
+            let body = sample(&mut runner, scenario_body_any());
+            let _class = sample(&mut runner, scenario_class_any());
+            let header = sample(&mut runner, scenario_header_any());
+            let header_value = sample(&mut runner, scenario_header_value_any());
+            let _header_char = sample(&mut runner, scenario_header_value_char_any());
+            let headers = sample(&mut runner, scenario_headers_any());
+            let connection = sample(&mut runner, scenario_connection_value_any());
+            let _query_char = sample(&mut runner, scenario_query_char_any());
+            let target = sample(&mut runner, scenario_target_any());
+            let scenario = sample(&mut runner, scenario_any());
+
+            assert!(body.len() <= 8);
+            assert!(!header.0.is_empty());
+            assert!(header_value.len() <= 16);
+            assert!(headers.len() <= 6);
+            assert!(!connection.is_empty());
+            assert!(target.starts_with("/v1/models"));
+            saw_query_target |= target.contains('?');
+            saw_bare_target |= !target.contains('?');
+            assert_eq!(scenario.request().method(), Method::GET);
+        }
+
+        assert!(saw_query_target);
+        assert!(saw_bare_target);
+        let response = scripted_stream_error_response();
+        assert_eq!(response.status(), http::StatusCode::CREATED);
+    }
+}

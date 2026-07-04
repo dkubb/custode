@@ -982,6 +982,7 @@ mod tests {
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
+    use core::num::NonZeroU64;
     use core::time::Duration;
     use pretty_assertions::assert_eq;
     use std::path::PathBuf;
@@ -1096,6 +1097,14 @@ mod tests {
     }
 
     #[test]
+    fn allowed_prefix_rejects_invalid_path_before_prefix_shape() {
+        assert!(matches!(
+            AllowedPath::prefix("v1/models"),
+            Err(ConfigError::InvalidAllowedPath { path }) if path == "v1/models",
+        ));
+    }
+
+    #[test]
     fn exact_path_accepts_root_and_trailing_slash() {
         for path in ["/", "/v1/"] {
             let allowed = AllowedPath::exact(path).expect("exact path should parse");
@@ -1155,6 +1164,30 @@ mod tests {
 
         assert!(operation.matches(&http::Method::GET, &path));
         assert!(!operation.matches(&http::Method::POST, &path));
+    }
+
+    #[test]
+    fn operation_accepts_exact_and_prefix_kinds() {
+        let exact =
+            AllowedOperation::parse("GET:exact:/v1/models").expect("exact operation should parse");
+        let prefix = AllowedOperation::parse("POST:prefix:/v1/responses")
+            .expect("prefix operation should parse");
+
+        assert!(exact.matches(&http::Method::GET, &origin_form_path("/v1/models")));
+        assert!(!exact.matches(&http::Method::GET, &origin_form_path("/v1/models/extra")));
+        assert!(prefix.matches(&http::Method::POST, &origin_form_path("/v1/responses/1")));
+    }
+
+    #[test]
+    fn operation_reports_exact_and_prefix_path_errors() {
+        assert!(matches!(
+            AllowedOperation::parse("GET:exact:v1/models"),
+            Err(ConfigError::InvalidAllowedPath { path }) if path == "v1/models",
+        ));
+        assert!(matches!(
+            AllowedOperation::parse("POST:prefix:/"),
+            Err(ConfigError::InvalidAllowedPrefix { path }) if path == "/",
+        ));
     }
 
     #[test]
@@ -1247,6 +1280,17 @@ mod tests {
             without_query.as_str(),
             "https://api.example.com:8443/v1/models"
         );
+    }
+
+    #[test]
+    fn response_body_bound_override_preserves_non_zero_value() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("/var/log/custode/proxy.ndjson"),
+            "https://api.openai.com",
+        )
+        .with_max_response_bytes(NonZeroU64::new(4).expect("literal should be non-zero"));
+
+        assert_eq!(config.max_response_bytes().get(), 4);
     }
 
     #[test]

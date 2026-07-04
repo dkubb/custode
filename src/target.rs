@@ -339,6 +339,57 @@ pub mod testing {
                 .prop_map(|atoms| atoms.concat()),
         ]
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::OriginFormQuery;
+        use super::{
+            origin_form_query_valid, percent_escape_valid, url_preserved_origin_form_query_valid,
+        };
+        use proptest::strategy::{Strategy as _, ValueTree as _};
+        use proptest::test_runner::TestRunner;
+
+        #[test]
+        fn percent_escape_generator_formats_both_hex_cases() {
+            let mut runner = TestRunner::deterministic();
+            let mut has_uppercase_escape = false;
+            let mut has_lowercase_escape = false;
+
+            for _sample in 0_u8..64 {
+                let escape = percent_escape_valid()
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
+
+                has_uppercase_escape |= escape.bytes().any(|byte| byte.is_ascii_uppercase());
+                has_lowercase_escape |= escape.bytes().any(|byte| byte.is_ascii_lowercase());
+                OriginFormQuery::parse(&escape).expect("generated escape should parse");
+            }
+
+            assert!(has_uppercase_escape);
+            assert!(has_lowercase_escape);
+        }
+
+        #[test]
+        fn query_generators_create_parseable_samples() {
+            let mut runner = TestRunner::deterministic();
+
+            for _sample in 0_u8..32 {
+                let query = origin_form_query_valid()
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
+                let url_preserved_query = url_preserved_origin_form_query_valid()
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
+
+                OriginFormQuery::parse(&query).expect("generated query should parse");
+                OriginFormQuery::parse(&url_preserved_query)
+                    .expect("generated URL-preserved query should parse");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -411,10 +462,13 @@ mod tests {
 
     #[test]
     fn path_rejects_invalid_percent_encoding() {
-        assert_eq!(
-            OriginFormPath::parse("/v1/%zz"),
-            Err(OriginFormPathError::InvalidPercentEncoding),
-        );
+        for path in ["/v1/%zz", "/v1/%2z"] {
+            assert_eq!(
+                OriginFormPath::parse(path),
+                Err(OriginFormPathError::InvalidPercentEncoding),
+                "path {path} should fail closed",
+            );
+        }
     }
 
     #[test]

@@ -16,6 +16,9 @@ coverage = [
   "0",
   "--fail-uncovered-functions",
   "0",
+  "--",
+  "--skip",
+  "proptests",
 ]
 coverage-proptests = [
   "llvm-cov",

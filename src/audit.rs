@@ -1413,10 +1413,10 @@ where
 mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
-        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditTarget,
-        AuditTimestamp, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RUN_TOKEN_BYTES,
-        RequestId, ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
-        inspect_audit_log_tail, write_serialized_event,
+        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
+        AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
+        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
+        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -1778,6 +1778,51 @@ mod tests {
     }
 
     #[test]
+    fn response_header_errors_report_stable_error_classes_and_statuses() {
+        let cases = [
+            (
+                AuditResponseHeaderError::InvalidConnectionHeader,
+                "invalid_response_connection_header",
+            ),
+            (
+                AuditResponseHeaderError::TooLarge,
+                "response_headers_too_large",
+            ),
+        ];
+
+        for (error, error_class) in cases {
+            assert_eq!(error.error_class(), error_class);
+            assert_eq!(error.status(), StatusCode::BAD_GATEWAY);
+        }
+    }
+
+    #[test]
+    fn upstream_errors_report_stable_error_classes_and_statuses() {
+        let cases = [
+            (
+                AuditUpstreamError::Connect,
+                "upstream_connect_failed",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                AuditUpstreamError::Request,
+                "upstream_request_failed",
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                AuditUpstreamError::Timeout,
+                "upstream_timeout",
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+        ];
+
+        for (error, error_class, status) in cases {
+            assert_eq!(error.error_class(), error_class);
+            assert_eq!(error.status(), status);
+        }
+    }
+
+    #[test]
     fn response_body_prefix_records_accepted_bytes() {
         let mut account = ResponseAccount::new(ResponseBodyBytes::for_test(
             NonZeroU64::new(16).expect("limit should be non-zero"),
@@ -1794,6 +1839,22 @@ mod tests {
                 blake3: BodyDigest::from_bytes(b"accepted"),
                 bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
             },
+        );
+    }
+
+    #[test]
+    fn response_body_prefix_summary_records_accepted_bytes() {
+        let prefix = ResponseBodyPrefix::Accepted {
+            blake3: BodyDigest::from_bytes(b"accepted"),
+            bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
+        };
+
+        assert_eq!(
+            prefix.into_summary(),
+            AuditBodySummary::non_empty(
+                BodyDigest::from_bytes(b"accepted"),
+                NonZeroU64::new(8).expect("accepted body should be non-empty"),
+            )
         );
     }
 
@@ -1820,6 +1881,14 @@ mod tests {
 
         assert_eq!(event.path, "/v1/responses/%2e%2e/models");
         assert_eq!(event.query.as_deref(), Some("limit=1"));
+    }
+
+    #[test]
+    fn upstream_target_test_constructor_preserves_parts() {
+        let target = AuditUpstreamTarget::new("/v1/models".to_owned(), Some("limit=1".to_owned()));
+
+        assert_eq!(target.path, "/v1/models");
+        assert_eq!(target.query.as_deref(), Some("limit=1"));
     }
 
     #[test]
@@ -1853,6 +1922,26 @@ mod tests {
                 "aaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbb-".to_owned(),
                 RunTokenError::InvalidShape,
             ),
+            (
+                "0123456789abcdef*fedcba9876543210".to_owned(),
+                RunTokenError::InvalidCharacter,
+            ),
+            (
+                "0123456789abcdef-fedcba987654321-".to_owned(),
+                RunTokenError::InvalidShape,
+            ),
+            (
+                "0123456789abcdef-fedcba987654321g".to_owned(),
+                RunTokenError::InvalidCharacter,
+            ),
+            (
+                "0g23456789abcdef-fedcba9876543210".to_owned(),
+                RunTokenError::InvalidCharacter,
+            ),
+            (
+                "g123456789abcdef-fedcba9876543210".to_owned(),
+                RunTokenError::InvalidCharacter,
+            ),
             ("a".repeat(RUN_TOKEN_BYTES + 1), RunTokenError::TooLong),
         ]);
 
@@ -1881,6 +1970,43 @@ mod tests {
         let token = RunToken::new(text.clone()).expect("exact-length token should parse");
 
         assert_eq!(token.to_string(), text);
+    }
+
+    #[test]
+    fn run_token_helpers_cover_every_digit_and_invalid_byte() {
+        for (byte, expected) in [
+            (b'0', Some(0)),
+            (b'1', Some(1)),
+            (b'2', Some(2)),
+            (b'3', Some(3)),
+            (b'4', Some(4)),
+            (b'5', Some(5)),
+            (b'6', Some(6)),
+            (b'7', Some(7)),
+            (b'8', Some(8)),
+            (b'9', Some(9)),
+            (b'a', Some(10)),
+            (b'b', Some(11)),
+            (b'c', Some(12)),
+            (b'd', Some(13)),
+            (b'e', Some(14)),
+            (b'f', Some(15)),
+            (b'g', None),
+        ] {
+            assert_eq!(super::token_nibble(byte), expected);
+        }
+
+        assert!(!super::has_invalid_run_token_character("0123-abcd"));
+        assert!(super::has_invalid_run_token_character("0123-abcz"));
+        assert_eq!(super::parse_run_token_byte(b'0', b'f'), Ok(15));
+        assert_eq!(
+            super::parse_run_token_byte(b'g', b'0'),
+            Err(RunTokenError::InvalidCharacter)
+        );
+        assert_eq!(
+            super::parse_run_token_byte(b'0', b'g'),
+            Err(RunTokenError::InvalidCharacter)
+        );
     }
 
     #[test]
