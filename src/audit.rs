@@ -829,7 +829,9 @@ impl ExistingAuditEventFields {
                 "audit target does not match invalid-percent denial",
             ),
             ExistingAuditErrorClass::PathTooLong => {
-                if is_truncated_audit_text(&self.path, MAX_AUDIT_TARGET_PATH_BYTES) {
+                if !self.target_has_authority()
+                    && is_truncated_audit_text(&self.path, MAX_AUDIT_TARGET_PATH_BYTES)
+                {
                     Ok(())
                 } else {
                     Err("audit target does not match path-too-long denial")
@@ -3816,7 +3818,15 @@ mod tests {
     }
 
     /// Builds denial-target semantically invalid existing audit event lines.
-    fn semantic_invalid_denial_shape_lines() -> [(&'static str, Vec<u8>); 6] {
+    fn semantic_invalid_denial_shape_lines() -> [(&'static str, Vec<u8>); 7] {
+        let absolute_form_too_long = AuditTarget::from_uri_parts(
+            &format!(
+                "http://evil.example/{}",
+                "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES)
+            ),
+            None,
+        );
+
         [
             (
                 "method denied with non-origin target",
@@ -3846,6 +3856,17 @@ mod tests {
                 serialized_event_line_with_fields([
                     ("error_class", Value::String("path_too_long".to_owned())),
                     ("path", Value::String("/v1/models".to_owned())),
+                    ("status", Value::from(414_u64)),
+                ]),
+            ),
+            (
+                "path too long with authority target",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("path_too_long".to_owned())),
+                    (
+                        "path",
+                        Value::String(absolute_form_too_long.path().to_owned()),
+                    ),
                     ("status", Value::from(414_u64)),
                 ]),
             ),
