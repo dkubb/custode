@@ -1875,6 +1875,94 @@ mod tests {
         }
 
         #[test]
+        fn scenario_request_parser_rejects_invalid_shapes_under_property_filter() {
+            let too_many_headers = (0..=MAX_SCENARIO_HEADERS)
+                .map(|index| (format!("x-test-{index}"), "value".to_owned()))
+                .collect::<Vec<_>>();
+            let overlong_name = "x".repeat(MAX_SCENARIO_HEADER_NAME_BYTES + 1);
+            let overlong_value = "A".repeat(MAX_SCENARIO_HEADER_VALUE_BYTES + 1);
+
+            assert_eq!(
+                ScenarioRequestBody::try_from_bytes(vec![0; MAX_SCENARIO_BODY_BYTES + 1]),
+                Err(ScenarioRequestError::BodyTooLarge {
+                    bytes: MAX_SCENARIO_BODY_BYTES + 1,
+                    max: MAX_SCENARIO_BODY_BYTES,
+                })
+            );
+            assert_eq!(
+                ScenarioRequest::try_from_parts(
+                    vec![0; MAX_SCENARIO_BODY_BYTES + 1],
+                    Vec::new(),
+                    ScenarioTarget::models(None),
+                ),
+                Err(ScenarioRequestError::BodyTooLarge {
+                    bytes: MAX_SCENARIO_BODY_BYTES + 1,
+                    max: MAX_SCENARIO_BODY_BYTES,
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(too_many_headers),
+                Err(ScenarioRequestError::TooManyHeaders {
+                    count: MAX_SCENARIO_HEADERS + 1,
+                    max: MAX_SCENARIO_HEADERS,
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![(
+                    "not a header".to_owned(),
+                    "value".to_owned(),
+                )]),
+                Err(ScenarioRequestError::InvalidHeaderName {
+                    name: "not a header".to_owned(),
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![(overlong_name.clone(), "value".to_owned())]),
+                Err(ScenarioRequestError::HeaderNameTooLong {
+                    name: overlong_name,
+                    bytes: MAX_SCENARIO_HEADER_NAME_BYTES + 1,
+                    max: MAX_SCENARIO_HEADER_NAME_BYTES,
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![("x-test".to_owned(), "value".to_owned())]),
+                Err(ScenarioRequestError::UnsupportedHeaderName {
+                    name: "x-test".to_owned(),
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![(
+                    "x-visible".to_owned(),
+                    overlong_value.clone(),
+                )]),
+                Err(ScenarioRequestError::HeaderValueTooLong {
+                    name: "x-visible".to_owned(),
+                    value: overlong_value,
+                    bytes: MAX_SCENARIO_HEADER_VALUE_BYTES + 1,
+                    max: MAX_SCENARIO_HEADER_VALUE_BYTES,
+                })
+            );
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![("connection".to_owned(), String::new())]),
+                Err(ScenarioRequestError::InvalidHeaderValue {
+                    name: "connection".to_owned(),
+                    value: String::new(),
+                })
+            );
+            assert_eq!(
+                ScenarioRequest::try_from_parts(
+                    Vec::new(),
+                    vec![("x-visible".to_owned(), "\r\n".to_owned())],
+                    ScenarioTarget::models(None),
+                ),
+                Err(ScenarioRequestError::InvalidHeaderValue {
+                    name: "x-visible".to_owned(),
+                    value: "\r\n".to_owned(),
+                })
+            );
+        }
+
+        #[test]
         fn exhausted_request_ids_fail_closed_for_every_admission_state() {
             for permits in [0, 1] {
                 let run = run_exhaustion_scenario(permits);
