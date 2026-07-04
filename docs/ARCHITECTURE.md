@@ -775,7 +775,7 @@ module and cover the parsers, constructors, and serializers with paired
 accept-every-valid and reject-every-invalid grammars: allowed operation
 parsing, upstream origin parsing, segment-bounded prefix matching, upstream
 URL joining, accepted-target validation (dot segments, percent encoding,
-encoded separators, byte limits, origin form), header filtering
+forbidden separators, byte limits, origin form), header filtering
 (hop-by-hop stripping, byte limits, connection tokens), upstream request
 construction from allowed
 targets (`UpstreamRequest::from_target`), audit event serialization option

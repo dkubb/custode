@@ -18,7 +18,7 @@ pub(crate) enum OriginFormPathError {
     /// Path contained a literal or percent-encoded dot segment.
     DotSegment,
 
-    /// Path contained a percent-encoded path separator.
+    /// Path contained a forbidden literal or percent-encoded separator.
     EncodedSeparator,
 
     /// Path contained invalid percent-encoding.
@@ -89,8 +89,8 @@ impl OriginFormPath {
     /// # Errors
     ///
     /// Returns an error when the path exceeds the byte limit, is not
-    /// origin-form, contains invalid percent-encoding, contains a
-    /// percent-encoded path separator, or contains a literal or
+    /// origin-form, contains invalid percent-encoding, contains a forbidden
+    /// literal or percent-encoded separator, or contains a literal or
     /// percent-encoded dot segment.
     pub(crate) fn parse(path: &str) -> Result<Self, OriginFormPathError> {
         if path.len() > MAX_ORIGIN_FORM_PATH_BYTES {
@@ -102,7 +102,7 @@ impl OriginFormPath {
         if !has_valid_percent_encoding(path) {
             return Err(OriginFormPathError::InvalidPercentEncoding);
         }
-        if has_encoded_separator(path) {
+        if has_forbidden_separator(path) {
             return Err(OriginFormPathError::EncodedSeparator);
         }
         if has_dot_segment(path) {
@@ -166,10 +166,14 @@ fn has_dot_segment(path: &str) -> bool {
     path.split('/').any(segment_is_dot_segment)
 }
 
-/// Returns true when a percent escape decodes to a path separator byte.
-fn has_encoded_separator(path: &str) -> bool {
+/// Returns true when path text includes a separator spelling that would change
+/// segment structure during upstream URL construction.
+fn has_forbidden_separator(path: &str) -> bool {
     let mut bytes = path.as_bytes().iter().copied();
     while let Some(byte) = bytes.next() {
+        if byte == b'\\' {
+            return true;
+        }
         if byte == b'%' {
             let Some(first) = bytes.next() else {
                 return false;
@@ -503,12 +507,13 @@ mod tests {
     }
 
     #[test]
-    fn path_rejects_percent_encoded_separators() {
+    fn path_rejects_forbidden_separators() {
         for path in [
             "/v1/responses/%2fmodels",
             "/v1/responses/%2Fmodels",
             "/v1/responses/%5cmodels",
             "/v1/responses/%5Cmodels",
+            "/v1/responses\\models",
             "/v1/responses/%2e%2e%2fmodels",
         ] {
             assert_eq!(
@@ -616,9 +621,9 @@ mod tests {
         // Truncated and non-hex escapes are rejected by percent-encoding
         // validation before segment checks; the early returns here keep the
         // function total over arbitrary segment inputs.
-        assert!(!super::has_encoded_separator("%"));
-        assert!(!super::has_encoded_separator("%2"));
-        assert!(!super::has_encoded_separator("%zz"));
+        assert!(!super::has_forbidden_separator("%"));
+        assert!(!super::has_forbidden_separator("%2"));
+        assert!(!super::has_forbidden_separator("%zz"));
         assert!(!super::segment_is_dot_segment("%"));
         assert!(!super::segment_is_dot_segment("%2"));
         assert!(!super::segment_is_dot_segment("%zz"));
@@ -729,11 +734,17 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
-    /// Paths containing one encoded path separator.
-    fn path_with_encoded_separator() -> impl Strategy<Value = String> {
+    /// Paths containing one forbidden literal or encoded path separator.
+    fn path_with_forbidden_separator() -> impl Strategy<Value = String> {
         (
             path_valid(),
-            prop_oneof![Just("%2f"), Just("%2F"), Just("%5c"), Just("%5C"),],
+            prop_oneof![
+                Just("%2f"),
+                Just("%2F"),
+                Just("%5c"),
+                Just("%5C"),
+                Just("\\"),
+            ],
             "[A-Za-z0-9_-]{1,8}",
         )
             .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
@@ -796,7 +807,7 @@ mod proptests {
         }
 
         #[test]
-        fn parse_rejects_every_encoded_separator(path in path_with_encoded_separator()) {
+        fn parse_rejects_every_forbidden_separator(path in path_with_forbidden_separator()) {
             prop_assert_eq!(
                 OriginFormPath::parse(&path),
                 Err(OriginFormPathError::EncodedSeparator)

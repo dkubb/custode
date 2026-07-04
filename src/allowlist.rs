@@ -29,7 +29,8 @@ impl AcceptedTarget {
     ///
     /// Returns a rejection when the path is not origin-form, when the path or
     /// query exceeds the byte limit, when the path or query contains invalid
-    /// percent-encoding, or when the path contains a literal or
+    /// percent-encoding, when the path contains a forbidden literal or
+    /// percent-encoded separator, or when the path contains a literal or
     /// percent-encoded dot segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
         let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
@@ -89,7 +90,7 @@ pub(crate) enum RejectionReason {
     /// The path contained a literal or percent-encoded `.` or `..` segment.
     DotSegment,
 
-    /// The path contained a percent-encoded separator.
+    /// The path contained a forbidden literal or percent-encoded separator.
     EncodedSeparator,
 
     /// The path contained invalid percent-encoding.
@@ -268,6 +269,10 @@ mod tests {
         );
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%5cmodels", None),
+            Err(RejectionReason::EncodedSeparator),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/responses\\models", None),
             Err(RejectionReason::EncodedSeparator),
         );
     }
@@ -485,11 +490,17 @@ mod proptests {
             .prop_map(|(path, escape)| format!("{path}%{escape}"))
     }
 
-    /// Paths containing one encoded path separator.
-    fn path_with_encoded_separator() -> impl Strategy<Value = String> {
+    /// Paths containing one forbidden literal or encoded path separator.
+    fn path_with_forbidden_separator() -> impl Strategy<Value = String> {
         (
             path_valid(),
-            prop_oneof![Just("%2f"), Just("%2F"), Just("%5c"), Just("%5C"),],
+            prop_oneof![
+                Just("%2f"),
+                Just("%2F"),
+                Just("%5c"),
+                Just("%5C"),
+                Just("\\"),
+            ],
             "[A-Za-z0-9_-]{1,8}",
         )
             .prop_map(|(prefix, separator, suffix)| format!("{prefix}{separator}{suffix}"))
@@ -542,7 +553,7 @@ mod proptests {
         }
 
         #[test]
-        fn new_rejects_every_encoded_separator(path in path_with_encoded_separator()) {
+        fn new_rejects_every_forbidden_separator(path in path_with_forbidden_separator()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
                 Err(RejectionReason::EncodedSeparator)
