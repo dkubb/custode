@@ -7,7 +7,7 @@ use core::cmp::Ordering;
 use core::net::SocketAddr;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
@@ -764,8 +764,8 @@ impl GatewayConfig {
 
     /// Returns the audit log path.
     #[must_use]
-    pub(crate) const fn audit_log(&self) -> &PathBuf {
-        &self.audit_log
+    pub(crate) fn audit_log(&self) -> &Path {
+        self.audit_log.as_path()
     }
 
     /// Returns the gateway bind address.
