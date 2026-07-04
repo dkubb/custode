@@ -332,10 +332,13 @@ The gateway MUST reject:
 - paths longer than 4,096 bytes;
 - queries longer than 8,192 bytes;
 - paths containing invalid percent-encoding;
+- paths containing literal query delimiters, fragment delimiters, or
+  backslashes;
 - paths containing percent-encoded path separators;
 - paths containing literal or percent-encoded `.` or `..` segments, so the
   allowlist decision and the upstream URL are computed from the same path
   segment structure;
+- queries containing literal fragment delimiters;
 - method-path pairs absent from the configured operation allowlist, where each
   allowed operation binds exactly one method to exactly one exact path or
   segment-bounded path prefix.
@@ -421,8 +424,9 @@ For each request, the gateway performs these steps in order:
    class `too_many_requests` and answered with HTTP 429.
 1. Allocate a request identity.
 1. Parse and validate the method and origin-form target, rejecting overlong
-   path or query components, percent-encoded path separators, and literal or
-   percent-encoded dot segments.
+   path or query components, path or query delimiters inside accepted
+   components, literal backslashes, percent-encoded path separators, and
+   literal or percent-encoded dot segments.
 1. Check the method-path operation allowlist.
 1. Copy end-to-end headers, excluding hop-by-hop headers, the `Host` header,
    and HTTP proxy credential headers such as `Proxy-Authorization`.

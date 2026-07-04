@@ -212,10 +212,12 @@ The gateway MUST reject HTTP `CONNECT` requests.
 
 The gateway MUST reject absolute-form request targets. Incoming request targets
 MUST use origin-form paths such as `/v1/responses`, MUST begin with `/`, and
-MUST NOT contain invalid percent-encoding or percent-encoded path separators.
-Incoming request paths MUST NOT contain literal or percent-encoded `.` or `..`
-segments, so that the allowlist decision and the upstream URL are computed from
-the same path segment structure.
+MUST NOT contain invalid percent-encoding. Incoming request paths MUST NOT
+contain literal query delimiters, literal fragment delimiters, literal
+backslashes, percent-encoded path separators, or literal or percent-encoded `.`
+or `..` segments, so that the allowlist decision and the upstream URL are
+computed from the same path segment structure. Incoming request queries MUST NOT
+contain literal fragment delimiters.
 
 The gateway MUST derive the upstream URL by joining the configured provider
 origin with the incoming origin-form path and query. The incoming `Host` header
