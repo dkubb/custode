@@ -41,6 +41,8 @@ pub(super) struct MemoryAuditSink {
     events: Arc<Mutex<Vec<Value>>>,
     /// Audit event ordinal that should fail instead of recording.
     fail_on_event: Option<NonZeroUsize>,
+    /// Optional serialized audit event byte limit.
+    max_event_bytes: Option<NonZeroUsize>,
 }
 
 /// Request observed by the scripted upstream client.
@@ -148,6 +150,9 @@ pub(super) enum ScenarioAdmission {
 /// Audit sink behavior for a deterministic scenario.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScenarioAudit {
+    /// Reject every audit event larger than one serialized byte.
+    EventTooLarge,
+
     /// Fail the first audit event.
     FailFirst,
 
@@ -261,7 +266,7 @@ enum ScriptedResponseStep {
 
 impl ScenarioAudit {
     /// Every scenario audit variant.
-    const ALL: [Self; 2] = [Self::FailFirst, Self::Record];
+    const ALL: [Self; 3] = [Self::EventTooLarge, Self::FailFirst, Self::Record];
 }
 
 impl ScenarioDisconnect {
@@ -324,6 +329,17 @@ impl AuditSink for MemoryAuditSink {
                 "scripted audit failure",
             )))));
         }
+        if let Some(max_event_bytes) = self.max_event_bytes {
+            let bytes = serde_json::to_vec(event)
+                .expect("audit events contain only infallible JSON values")
+                .len()
+                .checked_add(1)
+                .expect("serialized audit event length should not overflow");
+            let max = max_event_bytes.get();
+            if bytes > max {
+                return Box::pin(future::ready(Err(AuditError::EventTooLarge { bytes, max })));
+            }
+        }
         let value =
             serde_json::to_value(event).expect("audit events contain only infallible JSON values");
         self.events
@@ -359,6 +375,7 @@ impl MemoryAuditSink {
                 event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
                 fail_on_event: Some(event),
+                max_event_bytes: None,
             },
             events,
         )
@@ -368,11 +385,31 @@ impl MemoryAuditSink {
     #[must_use]
     pub(super) fn from_audit(audit: ScenarioAudit) -> (Self, Arc<Mutex<Vec<Value>>>) {
         match audit {
-            ScenarioAudit::Record => Self::new(),
+            ScenarioAudit::EventTooLarge => Self::limiting_event_bytes(
+                NonZeroUsize::new(1).expect("literal should be non-zero"),
+            ),
             ScenarioAudit::FailFirst => {
                 Self::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"))
             }
+            ScenarioAudit::Record => Self::new(),
         }
+    }
+
+    /// Builds an audit sink that rejects events over the supplied byte limit.
+    #[must_use]
+    pub(super) fn limiting_event_bytes(
+        max_event_bytes: NonZeroUsize,
+    ) -> (Self, Arc<Mutex<Vec<Value>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                event_count: Arc::new(Mutex::new(0)),
+                events: Arc::clone(&events),
+                fail_on_event: None,
+                max_event_bytes: Some(max_event_bytes),
+            },
+            events,
+        )
     }
 
     /// Builds an audit sink and its event recorder.
@@ -384,6 +421,7 @@ impl MemoryAuditSink {
                 event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
                 fail_on_event: None,
+                max_event_bytes: None,
             },
             events,
         )
@@ -560,7 +598,10 @@ impl Scenario {
 
 impl ScenarioClass {
     /// Number of reachable deterministic scenario classes.
-    const COUNT: usize = 24;
+    const COUNT: usize = (6 * ScenarioAudit::ALL.len())
+        + (ScenarioAudit::ALL.len()
+            * ScenarioDisconnect::ALL.len()
+            * ScenarioStartedUpstream::ALL.len());
 
     /// Returns every scenario fault-class combination.
     #[must_use]
@@ -956,9 +997,14 @@ mod tests {
         scenario_header_any, scenario_header_value_any, scenario_header_value_char_any,
         scenario_headers_any, scripted_stream_error_response,
     };
-    use crate::config::RequestTimeout;
-    use crate::ports::UpstreamDeadline;
+    use crate::audit::{
+        AuditDenial, AuditEvent, AuditEventInput, AuditRequestInput, AuditTarget, AuditTimestamp,
+        RequestId, RunToken,
+    };
+    use crate::config::{RequestTimeout, UpstreamOrigin};
+    use crate::ports::{AuditSink as _, UpstreamDeadline};
     use crate::target::{OriginFormPath, OriginFormQuery};
+    use core::num::{NonZeroU64, NonZeroUsize};
     use core::time::Duration;
     use http::Method;
     use pretty_assertions::assert_eq;
@@ -1003,7 +1049,6 @@ mod tests {
         let classes = ScenarioClass::all();
 
         assert_eq!(request.target_query(), None);
-        assert_eq!(classes.len(), 24);
         assert_eq!(classes.len(), ScenarioClass::count());
         for audit in ScenarioAudit::ALL {
             assert!(classes.contains(&ScenarioClass::PermitSaturated { audit }));
@@ -1062,6 +1107,64 @@ mod tests {
         assert_eq!(scenario.downstream(), ScenarioDownstream::ConsumeAll);
         assert_eq!(scenario.request(), &request);
         assert_eq!(scenario.upstream(), ScenarioUpstream::Respond);
+    }
+
+    #[tokio::test]
+    async fn memory_audit_sink_reports_too_large_events() {
+        let (audit, audit_events) = MemoryAuditSink::from_audit(ScenarioAudit::EventTooLarge);
+        let request_id = RequestId::from_parts(
+            &RunToken::for_test("0000000000007e57-000000000000c0de"),
+            NonZeroU64::new(1).expect("sequence should be non-zero"),
+        );
+        let denial = AuditDenial::too_many_requests(
+            Method::GET,
+            AuditTarget::from_uri_parts("/v1/models", None),
+        );
+        let denied_request = AuditRequestInput::for_denial(
+            denial,
+            request_id,
+            None,
+            UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
+        );
+        let event = AuditEvent::new_at(
+            AuditEventInput::denied(denied_request),
+            AuditTimestamp::for_test("2026-07-02T00:00:00.000000000Z"),
+        );
+        let event_bytes = serde_json::to_vec(&event)
+            .expect("audit event should serialize")
+            .len()
+            .checked_add(1)
+            .expect("serialized audit event length should not overflow");
+
+        let result = audit.append_event(&event).await;
+
+        let error = result.expect_err("too small limit should reject the event");
+        assert_eq!(
+            error.to_string(),
+            format!("audit event has {event_bytes} bytes, maximum is 1")
+        );
+        assert_eq!(audit.event_count(), 1);
+        assert!(
+            audit_events
+                .lock()
+                .expect("audit events should lock")
+                .is_empty()
+        );
+
+        let (accepted_audit, accepted_events) = MemoryAuditSink::limiting_event_bytes(
+            NonZeroUsize::new(event_bytes).expect("event size should be non-zero"),
+        );
+        let accepted_result = accepted_audit.append_event(&event).await;
+
+        accepted_result.expect("event at exact limit should record");
+        assert_eq!(accepted_audit.event_count(), 1);
+        assert_eq!(
+            accepted_events
+                .lock()
+                .expect("audit events should lock")
+                .len(),
+            1
+        );
     }
 
     #[test]

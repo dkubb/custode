@@ -878,14 +878,20 @@ mod tests {
             run_request_id_exhaustion_scenario, run_scenario,
         };
         use crate::allowlist::RejectionReason;
-        use crate::audit::{AuditDenialReason, AuditTarget};
+        use crate::audit::{
+            AuditDenial, AuditDenialReason, AuditEvent, AuditEventInput, AuditRequestInput,
+            AuditTarget, AuditTimestamp, RequestId, RunToken,
+        };
         use crate::config::UpstreamOrigin;
+        use crate::ports::AuditSink as _;
         use crate::sim::{
-            Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
-            ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream, scenario_any,
+            MemoryAuditSink, Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds,
+            ScenarioClass, ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream,
+            scenario_any,
         };
         use crate::target::{OriginFormPath, OriginFormQuery};
         use axum::body::Bytes;
+        use core::num::{NonZeroU64, NonZeroUsize};
         use http::{Method, StatusCode};
         use proptest::prelude::*;
         use serde_json::{Map, Value};
@@ -1149,7 +1155,7 @@ mod tests {
                 ) => ScenarioBody::Dropped(Bytes::from_static(b"first")),
                 (
                     ScenarioAdmission::Open,
-                    ScenarioAudit::FailFirst,
+                    ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
                     ScenarioBounds::Roomy | ScenarioBounds::TinyResponse,
                     _,
                     ScenarioUpstream::Respond
@@ -1189,27 +1195,81 @@ mod tests {
             }
         }
 
-        /// Returns the exact fatal post-start errors expected for a scenario.
-        fn expected_fatal_errors(scenario: &Scenario) -> Vec<ScenarioFatalError> {
-            if scenario.admission() == ScenarioAdmission::Open
-                && scenario.audit() == ScenarioAudit::FailFirst
-                && scenario.upstream() != ScenarioUpstream::Timeout
-            {
-                vec![ScenarioFatalError::AuditWrite {
-                    message: SCRIPTED_AUDIT_WRITE_ERROR.to_owned(),
-                }]
-            } else {
-                Vec::new()
+        /// Asserts the fatal post-start errors expected for a scenario.
+        fn prop_assert_fatal_errors(
+            scenario: &Scenario,
+            fatal_errors: &[ScenarioFatalError],
+        ) -> Result<(), TestCaseError> {
+            match (scenario.admission(), scenario.audit(), scenario.upstream()) {
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::EventTooLarge,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
+                ) => {
+                    prop_assert_eq!(fatal_errors.len(), 1);
+                    prop_assert!(
+                        matches!(
+                            fatal_errors.first(),
+                            Some(ScenarioFatalError::AuditEventTooLarge { bytes, max: 1 })
+                                if *bytes > 1
+                        ),
+                        "unexpected fatal errors: {fatal_errors:?}"
+                    );
+                }
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::FailFirst,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
+                ) => {
+                    prop_assert_eq!(
+                        fatal_errors,
+                        [ScenarioFatalError::AuditWrite {
+                            message: SCRIPTED_AUDIT_WRITE_ERROR.to_owned(),
+                        }]
+                    );
+                }
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
+                )
+                | (
+                    ScenarioAdmission::Saturated | ScenarioAdmission::Open,
+                    ScenarioAudit::Record | ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
+                    ScenarioUpstream::Timeout,
+                )
+                | (
+                    ScenarioAdmission::Saturated,
+                    ScenarioAudit::Record | ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
+                ) => {
+                    prop_assert!(fatal_errors.is_empty());
+                }
             }
+            Ok(())
         }
 
         /// Returns the expected status for the harness response.
         fn expected_status(scenario: &Scenario) -> StatusCode {
             match (scenario.admission(), scenario.audit(), scenario.upstream()) {
-                (ScenarioAdmission::Saturated, ScenarioAudit::FailFirst, _)
-                | (ScenarioAdmission::Open, ScenarioAudit::FailFirst, ScenarioUpstream::Timeout) => {
-                    StatusCode::INTERNAL_SERVER_ERROR
-                }
+                (
+                    ScenarioAdmission::Saturated,
+                    ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
+                    _,
+                )
+                | (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
+                    ScenarioUpstream::Timeout,
+                ) => StatusCode::INTERNAL_SERVER_ERROR,
                 (ScenarioAdmission::Saturated, ScenarioAudit::Record, _) => {
                     StatusCode::TOO_MANY_REQUESTS
                 }
@@ -1377,8 +1437,7 @@ mod tests {
         ) -> Result<(), TestCaseError> {
             prop_assert_eq!(run.status, expected_status(scenario));
             prop_assert_eq!(&run.response_body, &expected_body(scenario));
-            let expected_fatal_errors = expected_fatal_errors(scenario);
-            prop_assert_eq!(&run.fatal_errors, &expected_fatal_errors);
+            prop_assert_fatal_errors(scenario, &run.fatal_errors)?;
             Ok(())
         }
 
@@ -1450,6 +1509,29 @@ mod tests {
                 .block_on(run_request_id_exhaustion_scenario(permits))
         }
 
+        /// Builds one denied audit event for direct audit-sink coverage.
+        fn denied_event() -> AuditEvent {
+            let request_id = RequestId::from_parts(
+                &RunToken::for_test("0000000000007e57-000000000000c0de"),
+                NonZeroU64::new(1).expect("sequence should be non-zero"),
+            );
+            let denial = AuditDenial::too_many_requests(
+                Method::GET,
+                AuditTarget::from_uri_parts("/v1/models", None),
+            );
+            let denied_request = AuditRequestInput::for_denial(
+                denial,
+                request_id,
+                None,
+                UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
+            );
+
+            AuditEvent::new_at(
+                AuditEventInput::denied(denied_request),
+                AuditTimestamp::for_test("2026-07-02T00:00:00.000000000Z"),
+            )
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 32,
@@ -1488,11 +1570,34 @@ mod tests {
             }
         }
 
+        #[tokio::test]
+        async fn bounded_memory_audit_sink_accepts_exact_limit() {
+            let event = denied_event();
+            let event_bytes = serde_json::to_vec(&event)
+                .expect("audit event should serialize")
+                .len()
+                .checked_add(1)
+                .expect("serialized audit event length should not overflow");
+            let (audit, audit_events) = MemoryAuditSink::limiting_event_bytes(
+                NonZeroUsize::new(event_bytes).expect("event size should be non-zero"),
+            );
+
+            audit
+                .append_event(&event)
+                .await
+                .expect("event at exact limit should record");
+
+            assert_eq!(audit.event_count(), 1);
+            assert_eq!(
+                audit_events.lock().expect("audit events should lock").len(),
+                1
+            );
+        }
+
         #[test]
         fn generated_fault_classes_cover_every_combination() {
             let classes = ScenarioClass::all();
 
-            assert_eq!(classes.len(), 24);
             assert_eq!(classes.len(), ScenarioClass::count());
             for class in classes {
                 let scenario = Scenario::with_class(
