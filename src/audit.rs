@@ -2096,15 +2096,6 @@ impl AuditUpstreamTarget {
     }
 }
 
-impl From<&AcceptedTarget> for AuditUpstreamTarget {
-    fn from(target: &AcceptedTarget) -> Self {
-        Self {
-            path: target.origin_form_path().clone(),
-            query: target.origin_form_query().cloned(),
-        }
-    }
-}
-
 impl From<AcceptedTarget> for AuditTarget {
     fn from(target: AcceptedTarget) -> Self {
         Self {
@@ -5763,7 +5754,10 @@ mod tests {
         let query = "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES);
         let accepted =
             AcceptedTarget::new(&path, Some(&query)).expect("maximum admitted target should parse");
-        let upstream = AuditUpstreamTarget::from(&accepted);
+        let upstream_origin = upstream_origin();
+        let upstream_url = upstream_origin
+            .join_path_query(accepted.origin_form_path(), accepted.origin_form_query());
+        let upstream = AuditUpstreamTarget::from_url(&upstream_url);
         let input = request_input(
             "GET",
             AuditTarget::from(accepted),
