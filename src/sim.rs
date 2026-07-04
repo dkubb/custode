@@ -77,6 +77,8 @@ pub(super) struct Scenario {
 pub(super) enum ScenarioClass {
     /// Reachable downstream disconnect after a response has started.
     DownstreamDisconnect {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
         /// Downstream response consumption behavior.
         downstream: ScenarioDisconnect,
         /// Scripted upstream behavior after response start.
@@ -488,11 +490,12 @@ impl Scenario {
     pub(super) const fn with_class(class: ScenarioClass, request: ScenarioRequest) -> Self {
         match class {
             ScenarioClass::DownstreamDisconnect {
+                audit,
                 downstream,
                 upstream,
             } => Self {
                 admission: ScenarioAdmission::Open,
-                audit: ScenarioAudit::Record,
+                audit,
                 bounds: ScenarioBounds::Roomy,
                 downstream: downstream.into_downstream(),
                 request,
@@ -552,7 +555,7 @@ impl Scenario {
 
 impl ScenarioClass {
     /// Number of reachable deterministic scenario classes.
-    const COUNT: usize = 18;
+    const COUNT: usize = 24;
 
     /// Returns every scenario fault-class combination.
     #[must_use]
@@ -566,12 +569,15 @@ impl ScenarioClass {
             classes.push(Self::UpstreamStreamError { audit });
             classes.push(Self::UpstreamTimeout { audit });
         }
-        for downstream in ScenarioDisconnect::ALL {
-            for upstream in ScenarioStartedUpstream::ALL {
-                classes.push(Self::DownstreamDisconnect {
-                    downstream,
-                    upstream,
-                });
+        for audit in ScenarioAudit::ALL {
+            for downstream in ScenarioDisconnect::ALL {
+                for upstream in ScenarioStartedUpstream::ALL {
+                    classes.push(Self::DownstreamDisconnect {
+                        audit,
+                        downstream,
+                        upstream,
+                    });
+                }
             }
         }
         classes
@@ -1000,7 +1006,7 @@ mod tests {
         let classes = ScenarioClass::all();
 
         assert_eq!(request.target_query(), None);
-        assert_eq!(classes.len(), 18);
+        assert_eq!(classes.len(), 24);
         assert_eq!(classes.len(), ScenarioClass::count());
         for audit in ScenarioAudit::ALL {
             assert!(classes.contains(&ScenarioClass::PermitSaturated { audit }));
@@ -1010,12 +1016,15 @@ mod tests {
             assert!(classes.contains(&ScenarioClass::UpstreamStreamError { audit }));
             assert!(classes.contains(&ScenarioClass::UpstreamTimeout { audit }));
         }
-        for downstream in ScenarioDisconnect::ALL {
-            for upstream in ScenarioStartedUpstream::ALL {
-                assert!(classes.contains(&ScenarioClass::DownstreamDisconnect {
-                    downstream,
-                    upstream,
-                }));
+        for audit in ScenarioAudit::ALL {
+            for downstream in ScenarioDisconnect::ALL {
+                for upstream in ScenarioStartedUpstream::ALL {
+                    assert!(classes.contains(&ScenarioClass::DownstreamDisconnect {
+                        audit,
+                        downstream,
+                        upstream,
+                    }));
+                }
             }
         }
 

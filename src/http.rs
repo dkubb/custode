@@ -1124,6 +1124,29 @@ mod tests {
                 }
                 (
                     ScenarioAdmission::Open,
+                    _,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFirstChunk,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
+                ) => ScenarioBody::Dropped(Bytes::new()),
+                (
+                    ScenarioAdmission::Open,
+                    _,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFinalChunk,
+                    ScenarioUpstream::Respond,
+                ) => ScenarioBody::Dropped(Bytes::from_static(b"script")),
+                (
+                    ScenarioAdmission::Open,
+                    _,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::DropBeforeFinalChunk,
+                    ScenarioUpstream::StreamError | ScenarioUpstream::BodyTimeout,
+                ) => ScenarioBody::Dropped(Bytes::from_static(b"first")),
+                (
+                    ScenarioAdmission::Open,
                     ScenarioAudit::FailFirst,
                     ScenarioBounds::Roomy | ScenarioBounds::TinyResponse,
                     _,
@@ -1147,29 +1170,6 @@ mod tests {
                     | ScenarioUpstream::StreamError
                     | ScenarioUpstream::BodyTimeout,
                 ) => ScenarioBody::Error("response_body_too_large".to_owned()),
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::Record,
-                    ScenarioBounds::Roomy,
-                    ScenarioDownstream::DropBeforeFirstChunk,
-                    ScenarioUpstream::Respond
-                    | ScenarioUpstream::StreamError
-                    | ScenarioUpstream::BodyTimeout,
-                ) => ScenarioBody::Dropped(Bytes::new()),
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::Record,
-                    ScenarioBounds::Roomy,
-                    ScenarioDownstream::DropBeforeFinalChunk,
-                    ScenarioUpstream::Respond,
-                ) => ScenarioBody::Dropped(Bytes::from_static(b"script")),
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::Record,
-                    ScenarioBounds::Roomy,
-                    ScenarioDownstream::DropBeforeFinalChunk,
-                    ScenarioUpstream::StreamError | ScenarioUpstream::BodyTimeout,
-                ) => ScenarioBody::Dropped(Bytes::from_static(b"first")),
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
@@ -1461,7 +1461,7 @@ mod tests {
         fn generated_fault_classes_cover_every_combination() {
             let classes = ScenarioClass::all();
 
-            assert_eq!(classes.len(), 18);
+            assert_eq!(classes.len(), 24);
             assert_eq!(classes.len(), ScenarioClass::count());
             for class in classes {
                 let scenario = Scenario::with_class(
