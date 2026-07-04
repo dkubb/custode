@@ -20,6 +20,15 @@ pub(crate) struct AccountedBody {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BodyDigest(Hash);
 
+/// Observed non-empty body accounting state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct NonEmptyBodyObservation {
+    /// Body digest.
+    blake3: BodyDigest,
+    /// Body byte count.
+    bytes: NonZeroU64,
+}
+
 /// Observed body accounting state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyObservation {
@@ -27,12 +36,7 @@ pub(crate) enum BodyObservation {
     Empty,
 
     /// Body was observed and non-empty.
-    NonEmpty {
-        /// Body digest.
-        blake3: BodyDigest,
-        /// Body byte count.
-        bytes: NonZeroU64,
-    },
+    NonEmpty(NonEmptyBodyObservation),
 }
 
 impl AccountedBody {
@@ -58,10 +62,7 @@ impl AccountedBody {
     #[must_use]
     pub(crate) fn observation(&self) -> BodyObservation {
         NonZeroU64::new(self.byte_count()).map_or(BodyObservation::Empty, |bytes| {
-            BodyObservation::NonEmpty {
-                blake3: BodyDigest::from_non_empty_bytes(&self.bytes, bytes),
-                bytes,
-            }
+            BodyObservation::NonEmpty(NonEmptyBodyObservation::from_bytes(&self.bytes, bytes))
         })
     }
 
@@ -90,20 +91,22 @@ impl AccountedBody {
 }
 
 impl BodyDigest {
+    /// Creates a body digest from complete non-empty test bytes.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(bytes: &[u8]) -> Self {
+        NonEmptyBodyObservation::for_test(bytes).blake3()
+    }
+
     /// Creates a body digest from complete non-empty body bytes.
     #[must_use]
-    pub(crate) fn from_non_empty_bytes(bytes: &[u8], byte_count: NonZeroU64) -> Self {
-        debug_assert_eq!(
-            u64::try_from(bytes.len()).expect("slice length should fit in u64"),
-            byte_count.get(),
-            "body digest byte count should match body length",
-        );
+    fn from_non_empty_bytes(bytes: &[u8]) -> Self {
         Self(blake3::hash(bytes))
     }
 
     /// Creates a body digest from a streaming hasher with non-empty bytes.
     #[must_use]
-    fn from_non_empty_hasher(hasher: &Hasher, _byte_count: NonZeroU64) -> Self {
+    fn from_non_empty_hasher(hasher: &Hasher) -> Self {
         Self(hasher.finalize())
     }
 
@@ -111,6 +114,54 @@ impl BodyDigest {
     #[must_use]
     pub(crate) fn to_hex_string(self) -> String {
         self.0.to_hex().to_string()
+    }
+}
+
+impl NonEmptyBodyObservation {
+    /// Returns the observed BLAKE3 digest.
+    #[must_use]
+    pub(crate) const fn blake3(self) -> BodyDigest {
+        self.blake3
+    }
+
+    /// Returns the observed byte count.
+    #[must_use]
+    pub(crate) const fn bytes(self) -> NonZeroU64 {
+        self.bytes
+    }
+
+    /// Creates a non-empty observation from complete non-empty test bytes.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_test(bytes: &[u8]) -> Self {
+        let byte_count = NonZeroU64::new(
+            u64::try_from(bytes.len()).expect("test body length should fit in u64"),
+        )
+        .expect("test body should be non-empty");
+        Self::from_bytes(bytes, byte_count)
+    }
+
+    /// Creates a non-empty observation from complete body bytes.
+    #[must_use]
+    fn from_bytes(bytes: &[u8], byte_count: NonZeroU64) -> Self {
+        debug_assert_eq!(
+            u64::try_from(bytes.len()).expect("slice length should fit in u64"),
+            byte_count.get(),
+            "body observation byte count should match body length",
+        );
+        Self {
+            blake3: BodyDigest::from_non_empty_bytes(bytes),
+            bytes: byte_count,
+        }
+    }
+
+    /// Creates a non-empty observation from a streaming body hasher.
+    #[must_use]
+    fn from_hasher(hasher: &Hasher, byte_count: NonZeroU64) -> Self {
+        Self {
+            blake3: BodyDigest::from_non_empty_hasher(hasher),
+            bytes: byte_count,
+        }
     }
 }
 
@@ -172,10 +223,7 @@ impl ResponseAccount {
     #[must_use]
     pub(crate) fn observation(&self) -> BodyObservation {
         NonZeroU64::new(self.bytes).map_or(BodyObservation::Empty, |bytes| {
-            BodyObservation::NonEmpty {
-                blake3: BodyDigest::from_non_empty_hasher(&self.hasher, bytes),
-                bytes,
-            }
+            BodyObservation::NonEmpty(NonEmptyBodyObservation::from_hasher(&self.hasher, bytes))
         })
     }
 }
@@ -216,7 +264,8 @@ fn chunk_len_u64(chunk: &[u8]) -> u64 {
 )]
 mod tests {
     use super::{
-        AccountedBody, BodyDigest, BodyError, BodyObservation, RequestBodyError, ResponseAccount,
+        AccountedBody, BodyDigest, BodyError, BodyObservation, NonEmptyBodyObservation,
+        RequestBodyError, ResponseAccount,
     };
     use crate::config::{RequestBodyBytes, ResponseBodyBytes};
     use axum::body::Body;
@@ -228,20 +277,16 @@ mod tests {
     /// BLAKE3 digest of `hello`, computed independently with `b3sum`.
     const HELLO_DIGEST: &str = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
 
-    /// Returns the digest for non-empty test bytes.
-    fn body_digest(bytes: &[u8]) -> BodyDigest {
-        let byte_count = NonZeroU64::new(
-            u64::try_from(bytes.len()).expect("test body length should fit in u64"),
-        )
-        .expect("test body should be non-empty");
-        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+    /// Returns the observation for non-empty test bytes.
+    fn non_empty_body(bytes: &[u8]) -> NonEmptyBodyObservation {
+        NonEmptyBodyObservation::for_test(bytes)
     }
 
     /// Returns digest hex for assertion output.
     fn observation_digest_hex(observation: BodyObservation) -> Option<String> {
         match observation {
             BodyObservation::Empty => None,
-            BodyObservation::NonEmpty { blake3, .. } => Some(blake3.to_hex_string()),
+            BodyObservation::NonEmpty(non_empty) => Some(non_empty.blake3().to_hex_string()),
         }
     }
 
@@ -258,6 +303,11 @@ mod tests {
     /// A roomy request body limit for tests that should not hit the bound.
     fn roomy_limit() -> RequestBodyBytes {
         request_limit(1_024)
+    }
+
+    #[test]
+    fn body_digest_for_test_hashes_non_empty_bytes() {
+        assert_eq!(BodyDigest::for_test(b"hello").to_hex_string(), HELLO_DIGEST);
     }
 
     #[tokio::test]
@@ -312,10 +362,7 @@ mod tests {
         assert_eq!(result, Ok(()));
         assert_eq!(
             account.observation(),
-            BodyObservation::NonEmpty {
-                blake3: body_digest(b"hello"),
-                bytes: NonZeroU64::new(5).expect("literal should be non-zero"),
-            }
+            BodyObservation::NonEmpty(non_empty_body(b"hello"))
         );
     }
 
@@ -341,10 +388,7 @@ mod tests {
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
         assert_eq!(
             account.observation(),
-            BodyObservation::NonEmpty {
-                blake3: body_digest(b"hell"),
-                bytes: NonZeroU64::new(4).expect("literal should be non-zero"),
-            }
+            BodyObservation::NonEmpty(non_empty_body(b"hell"))
         );
     }
 

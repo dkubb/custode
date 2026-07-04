@@ -1,7 +1,9 @@
 //! Audit event schema and writer.
 
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason};
-use crate::body::{AccountedBody, BodyDigest, BodyObservation, ResponseAccount};
+use crate::body::{
+    AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, ResponseAccount,
+};
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{
     MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
@@ -957,24 +959,14 @@ pub(crate) enum ObservedBodySummary {
     Empty,
 
     /// Body was observed and non-empty.
-    NonEmpty {
-        /// Body digest.
-        blake3: BodyDigest,
-        /// Body byte count.
-        bytes: NonZeroU64,
-    },
+    NonEmpty(NonEmptyBodyObservation),
 }
 
 /// Accepted response prefix for oversized response-body failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ResponseBodyPrefix {
     /// A non-empty response prefix was accepted before the limit failure.
-    Accepted {
-        /// Prefix digest.
-        blake3: BodyDigest,
-        /// Prefix byte count.
-        bytes: NonZeroU64,
-    },
+    Accepted(NonEmptyBodyObservation),
 
     /// No response bytes were accepted before the limit failure.
     NoneAccepted,
@@ -1160,7 +1152,7 @@ impl AuditBodySummary {
     const fn from_observation(observation: BodyObservation) -> Self {
         match observation {
             BodyObservation::Empty => Self::empty(),
-            BodyObservation::NonEmpty { blake3, bytes } => Self::non_empty(blake3, bytes),
+            BodyObservation::NonEmpty(non_empty) => Self::non_empty(non_empty),
         }
     }
 
@@ -1172,9 +1164,12 @@ impl AuditBodySummary {
 
     /// Creates a non-empty body summary.
     #[must_use]
-    const fn non_empty(blake3: BodyDigest, bytes: NonZeroU64) -> Self {
+    const fn non_empty(non_empty: NonEmptyBodyObservation) -> Self {
         Self {
-            kind: AuditBodySummaryKind::NonEmpty { blake3, bytes },
+            kind: AuditBodySummaryKind::NonEmpty {
+                blake3: non_empty.blake3(),
+                bytes: non_empty.bytes(),
+            },
         }
     }
 
@@ -1226,7 +1221,7 @@ impl ObservedBodySummary {
     const fn from_observation(observation: BodyObservation) -> Self {
         match observation {
             BodyObservation::Empty => Self::Empty,
-            BodyObservation::NonEmpty { blake3, bytes } => Self::NonEmpty { blake3, bytes },
+            BodyObservation::NonEmpty(non_empty) => Self::NonEmpty(non_empty),
         }
     }
 
@@ -1241,7 +1236,7 @@ impl ObservedBodySummary {
     const fn into_summary(self) -> AuditBodySummary {
         match self {
             Self::Empty => AuditBodySummary::empty(),
-            Self::NonEmpty { blake3, bytes } => AuditBodySummary::non_empty(blake3, bytes),
+            Self::NonEmpty(non_empty) => AuditBodySummary::non_empty(non_empty),
         }
     }
 }
@@ -1252,7 +1247,7 @@ impl ResponseBodyPrefix {
     pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
         match response_account.observation() {
             BodyObservation::Empty => Self::NoneAccepted,
-            BodyObservation::NonEmpty { blake3, bytes } => Self::Accepted { blake3, bytes },
+            BodyObservation::NonEmpty(non_empty) => Self::Accepted(non_empty),
         }
     }
 
@@ -1261,7 +1256,7 @@ impl ResponseBodyPrefix {
     const fn into_summary(self) -> AuditBodySummary {
         match self {
             Self::NoneAccepted => AuditBodySummary::not_observed(),
-            Self::Accepted { blake3, bytes } => AuditBodySummary::non_empty(blake3, bytes),
+            Self::Accepted(non_empty) => AuditBodySummary::non_empty(non_empty),
         }
     }
 }
@@ -2761,7 +2756,7 @@ mod tests {
         is_truncated_audit_method, validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
-    use crate::body::{BodyDigest, ResponseAccount};
+    use crate::body::{NonEmptyBodyObservation, ResponseAccount};
     use crate::config::{
         AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, MIN_AUDIT_EVENT_BYTES,
         ResponseBodyBytes, UpstreamOrigin,
@@ -3046,13 +3041,9 @@ mod tests {
         NonZeroU64::new(value).expect("test request sequence should be non-zero")
     }
 
-    /// Returns the digest for non-empty test body bytes.
-    fn body_digest(bytes: &[u8]) -> BodyDigest {
-        let byte_count = NonZeroU64::new(
-            u64::try_from(bytes.len()).expect("test body length should fit in u64"),
-        )
-        .expect("test body should be non-empty");
-        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+    /// Returns the observation for non-empty test body bytes.
+    fn non_empty_body(bytes: &[u8]) -> NonEmptyBodyObservation {
+        NonEmptyBodyObservation::for_test(bytes)
     }
 
     /// Returns the fixed upstream origin used by unit-test fixtures.
@@ -4135,26 +4126,17 @@ mod tests {
 
         assert_eq!(
             prefix,
-            ResponseBodyPrefix::Accepted {
-                blake3: body_digest(b"accepted"),
-                bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
-            },
+            ResponseBodyPrefix::Accepted(non_empty_body(b"accepted")),
         );
     }
 
     #[test]
     fn response_body_prefix_summary_records_accepted_bytes() {
-        let prefix = ResponseBodyPrefix::Accepted {
-            blake3: body_digest(b"accepted"),
-            bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
-        };
+        let prefix = ResponseBodyPrefix::Accepted(non_empty_body(b"accepted"));
 
         assert_eq!(
             prefix.into_summary(),
-            AuditBodySummary::non_empty(
-                body_digest(b"accepted"),
-                NonZeroU64::new(8).expect("accepted body should be non-empty"),
-            )
+            AuditBodySummary::non_empty(non_empty_body(b"accepted"))
         );
     }
 
@@ -5541,7 +5523,7 @@ mod proptests {
         ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
     };
     use crate::allowlist::AcceptedTarget;
-    use crate::body::{BodyDigest, ResponseAccount};
+    use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
     use crate::config::{
         GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
     };
@@ -5568,25 +5550,22 @@ mod proptests {
 
     /// Returns the digest for non-empty generated body bytes.
     fn body_digest(bytes: &[u8]) -> BodyDigest {
-        let byte_count =
-            NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty");
-        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+        BodyDigest::for_test(bytes)
+    }
+
+    /// Returns the observation for non-empty generated body bytes.
+    fn non_empty_observation(bytes: &[u8]) -> NonEmptyBodyObservation {
+        NonEmptyBodyObservation::for_test(bytes)
     }
 
     /// Returns a non-empty audit body summary for observed bytes.
     fn body_summary(bytes: &[u8]) -> AuditBodySummary {
-        AuditBodySummary::non_empty(
-            body_digest(bytes),
-            NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
-        )
+        AuditBodySummary::non_empty(non_empty_observation(bytes))
     }
 
     /// Returns an observed body summary for observed bytes.
     fn observed_body_summary(bytes: &[u8]) -> ObservedBodySummary {
-        ObservedBodySummary::NonEmpty {
-            blake3: body_digest(bytes),
-            bytes: NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
-        }
+        ObservedBodySummary::NonEmpty(non_empty_observation(bytes))
     }
 
     /// Returns the serialized non-empty body summary for observed bytes.
@@ -6210,11 +6189,9 @@ mod proptests {
                         ),
                         1 => (
                             AuditResponseError::response_body_too_large(
-                                ResponseBodyPrefix::Accepted {
-                                    blake3: body_digest(&response_body_bytes),
-                                    bytes: NonZeroU64::new(response_bytes)
-                                        .expect("generated body should be non-empty"),
-                                },
+                                ResponseBodyPrefix::Accepted(non_empty_observation(
+                                    &response_body_bytes,
+                                )),
                                 status,
                             ),
                             body_value(response_bytes, &response_digest),
