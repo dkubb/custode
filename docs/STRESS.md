@@ -58,7 +58,11 @@ closed when:
 - a non-empty file is not newline terminated;
 - any line is invalid NDJSON or not a JSON object;
 - any event has a missing, malformed, or duplicate `request_id`;
-- request sequences are zero or non-monotonic within one run token.
+- any request sequence is zero.
+
+The verifier does not require request IDs to appear in sequence order. The
+gateway can write response audit events in completion order while requests run
+concurrently.
 
 The fixture suite is:
 

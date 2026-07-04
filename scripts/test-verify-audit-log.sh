@@ -114,8 +114,8 @@ write_log "${invalid_json_log}" "$(event "${RUN_A}" 1)" "{"
 duplicate_log=$(fixture_log "duplicate")
 write_log "${duplicate_log}" "$(event "${RUN_A}" 1)" "$(event "${RUN_A}" 1)"
 
-non_monotonic_log=$(fixture_log "non-monotonic")
-write_log "${non_monotonic_log}" "$(event "${RUN_A}" 2)" "$(event "${RUN_A}" 1)"
+out_of_order_log=$(fixture_log "out-of-order")
+write_log "${out_of_order_log}" "$(event "${RUN_A}" 2)" "$(event "${RUN_A}" 1)"
 
 zero_sequence_log=$(fixture_log "zero-sequence")
 write_log "${zero_sequence_log}" '{"request_id":"req-000000000000000a-000000000000000b-0000000000000000"}'
@@ -123,12 +123,12 @@ write_log "${zero_sequence_log}" '{"request_id":"req-000000000000000a-0000000000
 printf 'TAP version 13\n'
 printf '1..%d\n' "${TAP_TEST_COUNT}"
 
-run_ok "accepts valid monotonic audit logs" scripts/verify-audit-log.sh "${valid_log}"
+run_ok "accepts valid audit logs" scripts/verify-audit-log.sh "${valid_log}"
 run_fails "rejects missing audit logs" scripts/verify-audit-log.sh "${missing_log}"
 run_fails "rejects non-newline-terminated audit logs" scripts/verify-audit-log.sh "${torn_log}"
 run_fails "rejects invalid NDJSON" scripts/verify-audit-log.sh "${invalid_json_log}"
 run_fails "rejects duplicate request IDs" scripts/verify-audit-log.sh "${duplicate_log}"
-run_fails "rejects non-monotonic run sequences" scripts/verify-audit-log.sh "${non_monotonic_log}"
+run_ok "accepts out-of-order run sequences" scripts/verify-audit-log.sh "${out_of_order_log}"
 run_fails "rejects zero request sequences" scripts/verify-audit-log.sh "${zero_sequence_log}"
 
 if [[ "${failed}" -ne 0 ]]; then

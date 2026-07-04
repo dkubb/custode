@@ -80,14 +80,7 @@ require_valid_request_ids() {
     | if (($ids | map(.request_id) | unique | length) != ($ids | length)) then
         error("audit log has duplicate request_id")
       else
-        reduce $ids[] as $id ({};
-          (.[$id.run_token] // "") as $last
-          | if $last != "" and $id.sequence <= $last then
-              error("audit log has non-monotonic request sequence")
-            else
-              .[$id.run_token] = $id.sequence
-            end
-        )
+        true
       end
     | true
   ' <"${audit_log}" >/dev/null; then

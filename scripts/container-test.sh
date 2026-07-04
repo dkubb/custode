@@ -12,7 +12,7 @@
 # - the harness cannot reach an external raw IP over HTTP directly;
 # - the harness cannot open a direct TCP connection to public DNS;
 # - the harness can reach the gateway on the internal network;
-# - the proxy audit log is valid NDJSON with monotonic request IDs.
+# - the proxy audit log is valid NDJSON with unique request IDs.
 
 export CUSTODE_UPSTREAM_ORIGIN="${CUSTODE_UPSTREAM_ORIGIN:-https://api.anthropic.com}"
 export CUSTODE_ALLOWED_OPERATIONS="${CUSTODE_ALLOWED_OPERATIONS:-POST:prefix:/v1/messages,GET:prefix:/v1/models}"
