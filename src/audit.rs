@@ -11,6 +11,7 @@ use core::fmt;
 use core::num::NonZeroU64;
 use serde::de::{Error as SerdeError, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::collections::HashSet;
 use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -719,6 +720,11 @@ impl ExistingAuditEvent {
             upstream_query,
             version,
         ));
+    }
+
+    /// Returns the existing request identity.
+    fn request_id(&self) -> &str {
+        &self.fields.request_id
     }
 }
 
@@ -2145,6 +2151,7 @@ async fn validate_existing_audit_events(
 
     let mut line_number = 1_u64;
     let mut line = Vec::new();
+    let mut request_ids = HashSet::new();
     let mut buffered = BufReader::new(reader);
     loop {
         line.clear();
@@ -2171,6 +2178,13 @@ async fn validate_existing_audit_events(
                 source,
             }
         })?;
+        if !request_ids.insert(event.request_id().to_owned()) {
+            return Err(AuditError::CorruptLog {
+                path: path.to_owned(),
+                line: numbered_line,
+                source: <serde_json::Error as SerdeError>::custom("duplicate audit request id"),
+            });
+        }
         event.consume();
         line_number = line_number
             .checked_add(1)
@@ -4221,6 +4235,31 @@ mod tests {
                     if path == audit_log && line == second_line
             ),
             "corrupt audit logs should report the corrupt line"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_duplicate_existing_request_ids() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let line = serialized_denied_event_line();
+        fs::write(&audit_log, [line.as_slice(), line.as_slice()].concat())
+            .expect("duplicate log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        let second_line = NonZeroU64::new(2).expect("literal should be non-zero");
+        assert!(
+            matches!(
+                result,
+                Err(AuditError::CorruptLog {
+                    path,
+                    line: audit_line,
+                    ..
+                }) if path == audit_log && audit_line == second_line
+            ),
+            "duplicate request ids should be rejected"
         );
     }
 
