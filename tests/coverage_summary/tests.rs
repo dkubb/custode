@@ -225,3 +225,14 @@ fn exclude_test_modules_ignores_missed_lines_inside_test_module() {
         "test module line should be excluded"
     );
 }
+
+#[test]
+fn exclude_test_modules_ignores_braces_inside_raw_strings() {
+    let output = run_coverage_summary_for_source(
+        "fn before() {}\nmod tests {\n    const RAW: &str = r#\"{\"#;\n}\nfn after() {}\n",
+        "[[5,1,0,true,false]]",
+        0,
+    );
+
+    assert_line_failure(output, 1, 0);
+}

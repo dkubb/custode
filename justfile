@@ -48,10 +48,10 @@ coverage-proptests:
         {{cargo}} coverage-proptests
     scripts/check-coverage-summary.sh \
         --exclude-test-mods \
-        --max-missed-regions 602 \
-        --max-missed-functions 98 \
-        --max-missed-lines 375 \
-        --max-missed-branches 34 \
+        --max-missed-regions 910 \
+        --max-missed-functions 121 \
+        --max-missed-lines 521 \
+        --max-missed-branches 41 \
         target/coverage/proptests.json
 
 mutants:

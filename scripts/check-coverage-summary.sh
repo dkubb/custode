@@ -434,23 +434,152 @@ build_exclusion_table() {
       continue
     fi
     line=$(awk '
-      function brace_delta(text, opens, closes) {
-        opens = gsub(/\{/, "{", text)
-        closes = gsub(/\}/, "}", text)
-        return opens - closes
+      function opens_raw_string(text, position, prefix_length, cursor, text_length, char) {
+        prefix_length = 0
+        if (substr(text, position, 2) == "br") {
+          prefix_length = 2
+        } else if (substr(text, position, 1) == "r") {
+          prefix_length = 1
+        } else {
+          return 0
+        }
+
+        cursor = position + prefix_length
+        text_length = length(text)
+        raw_hashes = 0
+        while (cursor <= text_length && substr(text, cursor, 1) == "#") {
+          raw_hashes += 1
+          cursor += 1
+        }
+        char = substr(text, cursor, 1)
+        if (char == "\"") {
+          raw_start = cursor
+          return 1
+        }
+        return 0
+      }
+
+      function closes_raw_string(text, position, cursor, hash_index) {
+        cursor = position + 1
+        for (hash_index = 1; hash_index <= raw_hashes; hash_index += 1) {
+          if (substr(text, cursor, 1) != "#") {
+            return 0
+          }
+          cursor += 1
+        }
+        raw_end = cursor
+        return 1
+      }
+
+      function starts_lifetime(text, position, next_char) {
+        next_char = substr(text, position + 1, 1)
+        return next_char ~ /^[[:alpha:]_]$/
+      }
+
+      function scan_line(text, cursor, text_length, char, next_char) {
+        code_text = ""
+        delta = 0
+        cursor = 1
+        text_length = length(text)
+        while (cursor <= text_length) {
+          char = substr(text, cursor, 1)
+          next_char = substr(text, cursor + 1, 1)
+
+          if (block_comment_depth > 0) {
+            if (char == "/" && next_char == "*") {
+              block_comment_depth += 1
+              cursor += 2
+            } else if (char == "*" && next_char == "/") {
+              block_comment_depth -= 1
+              cursor += 2
+            } else {
+              cursor += 1
+            }
+            continue
+          }
+
+          if (in_raw_string == 1) {
+            if (char == "\"" && closes_raw_string(text, cursor)) {
+              in_raw_string = 0
+              cursor = raw_end
+            } else {
+              cursor += 1
+            }
+            continue
+          }
+
+          if (in_string == 1) {
+            if (char == "\\") {
+              cursor += 2
+            } else if (char == "\"") {
+              in_string = 0
+              cursor += 1
+            } else {
+              cursor += 1
+            }
+            continue
+          }
+
+          if (in_char == 1) {
+            if (char == "\\") {
+              cursor += 2
+            } else if (char == "'\''") {
+              in_char = 0
+              cursor += 1
+            } else {
+              cursor += 1
+            }
+            continue
+          }
+
+          if (char == "/" && next_char == "/") {
+            break
+          }
+          if (char == "/" && next_char == "*") {
+            block_comment_depth += 1
+            cursor += 2
+            continue
+          }
+          if (opens_raw_string(text, cursor)) {
+            in_raw_string = 1
+            cursor = raw_start + 1
+            continue
+          }
+          if (char == "\"") {
+            in_string = 1
+            cursor += 1
+            continue
+          }
+          if (char == "'\''" && starts_lifetime(text, cursor) == 0) {
+            in_char = 1
+            cursor += 1
+            continue
+          }
+          if (char == "{") {
+            delta += 1
+          } else if (char == "}") {
+            delta -= 1
+          }
+          code_text = code_text char
+          cursor += 1
+        }
       }
       in_module == 1 {
-        depth += brace_delta($0)
+        scan_line($0)
+        depth += delta
         if (depth <= 0) {
           printf "%s\t%d\t%d\n", FILENAME, start_line, NR
           in_module = 0
         }
         next
       }
-      /^[[:space:]]*mod[[:space:]]+(tests|proptests)[[:space:]]*\{/ {
+      {
+        scan_line($0)
+      }
+      code_text ~ /^[[:space:]]*mod[[:space:]]+(tests|proptests)[[:space:]]*\{/ {
         in_module = 1
         start_line = NR
-        depth = brace_delta($0)
+        depth = delta
         if (depth <= 0) {
           printf "%s\t%d\t%d\n", FILENAME, start_line, NR
           in_module = 0
