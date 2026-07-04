@@ -15,7 +15,9 @@ lint:
     {{cargo}} clippy-all
 
 test:
-    {{cargo}} test-workspace
+    PROPTEST_DISABLE_FAILURE_PERSISTENCE=1 \
+        PROPTEST_RNG_SEED=00000000000000000000000000000014 \
+        {{cargo}} test-workspace
 
 docs:
     mado check README.md docs/IDEA.md docs/ARCHITECTURE.md
