@@ -1466,6 +1466,7 @@ mod tests {
         fn generated_fault_classes_cover_every_combination() {
             let classes = ScenarioClass::all();
 
+            assert_eq!(classes.len(), 18);
             assert_eq!(classes.len(), ScenarioClass::count());
             for class in classes {
                 let scenario = Scenario::with_class(

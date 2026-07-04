@@ -809,14 +809,16 @@ production adapters replaced by deterministic ports from `src/sim.rs`:
 `/v1/models` requests with bounded generated bodies, generated query strings,
 and generated header sets over both forwarded and stripped header names. The
 current fault grammar covers saturated admission permits, audit write failure
-on the terminal event, provider success, virtual-time upstream stalls past the
-carried deadline, upstream response stream failure after a body chunk, and
-upstream response body timeout after a body chunk, and response byte bounds
-smaller than the scripted response. A deterministic class sweep covers the full
-32-element product of admission, audit, response-bound, and upstream-outcome
-classes every run, plus the six reachable downstream-disconnect classes across
-response-starting upstream outcomes; the property test then randomizes request
-dimensions inside those classes. The oracle asserts
+on terminal non-disconnect events, provider success, virtual-time upstream
+stalls past the carried deadline, upstream response stream failure after a body
+chunk, upstream response body timeout after a body chunk, and response byte
+bounds smaller than the scripted response. A deterministic class sweep covers
+18 reachable classes every run: two audit outcomes across six
+non-disconnect classes, plus six downstream-disconnect classes across the two
+disconnect points and three response-starting upstream outcomes. Audit-failure
+states are omitted from downstream-disconnect classes because audit failure is
+observed before the downstream disconnect can affect the response. The property
+test then randomizes request dimensions inside those classes. The oracle asserts
 invariants over each scenario class: response status and stream outcome,
 fatal-channel behavior after response start, upstream request presence,
 forwarded-header safety, response byte bounds, and the 14-field audit event

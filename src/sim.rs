@@ -77,9 +77,9 @@ pub(super) enum ScenarioClass {
     /// Reachable downstream disconnect after a response has started.
     DownstreamDisconnect {
         /// Downstream response consumption behavior.
-        downstream: ScenarioDownstream,
+        downstream: ScenarioDisconnect,
         /// Scripted upstream behavior after response start.
-        upstream: ScenarioUpstream,
+        upstream: ScenarioStartedUpstream,
     },
 
     /// Gateway admission is saturated before any upstream request starts.
@@ -117,6 +117,16 @@ pub(super) enum ScenarioClass {
         /// Audit sink behavior.
         audit: ScenarioAudit,
     },
+}
+
+/// Reachable downstream disconnect behavior for generated scenario classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioDisconnect {
+    /// Drop the downstream body after the first chunk and before the final chunk.
+    BeforeFinalChunk,
+
+    /// Drop the downstream body before the first chunk can be received.
+    BeforeFirstChunk,
 }
 
 /// Gateway admission state for a deterministic scenario.
@@ -160,6 +170,19 @@ pub(super) enum ScenarioDownstream {
 
     /// Drop the downstream body before the first chunk can be received.
     DropBeforeFirstChunk,
+}
+
+/// Response-starting upstream outcomes for generated disconnect classes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ScenarioStartedUpstream {
+    /// Return a timeout after streaming one response chunk.
+    BodyTimeout,
+
+    /// Return the fixed success response immediately.
+    Respond,
+
+    /// Return an error after streaming one response chunk.
+    StreamError,
 }
 
 /// Harness request shape for a deterministic gateway scenario.
@@ -228,14 +251,31 @@ impl ScenarioAudit {
     const ALL: [Self; 2] = [Self::FailFirst, Self::Record];
 }
 
-impl ScenarioDownstream {
-    /// Reachable downstream disconnect variants.
-    const DISCONNECTS: [Self; 2] = [Self::DropBeforeFirstChunk, Self::DropBeforeFinalChunk];
+impl ScenarioDisconnect {
+    /// Every reachable downstream disconnect variant.
+    const ALL: [Self; 2] = [Self::BeforeFinalChunk, Self::BeforeFirstChunk];
+
+    /// Returns the full downstream behavior represented by this disconnect.
+    const fn into_downstream(self) -> ScenarioDownstream {
+        match self {
+            Self::BeforeFinalChunk => ScenarioDownstream::DropBeforeFinalChunk,
+            Self::BeforeFirstChunk => ScenarioDownstream::DropBeforeFirstChunk,
+        }
+    }
 }
 
-impl ScenarioUpstream {
-    /// Upstream variants that start a response stream.
-    const RESPONSE_STARTED: [Self; 3] = [Self::BodyTimeout, Self::Respond, Self::StreamError];
+impl ScenarioStartedUpstream {
+    /// Every response-starting upstream variant.
+    const ALL: [Self; 3] = [Self::BodyTimeout, Self::Respond, Self::StreamError];
+
+    /// Returns the full upstream behavior represented by this started response.
+    const fn into_upstream(self) -> ScenarioUpstream {
+        match self {
+            Self::BodyTimeout => ScenarioUpstream::BodyTimeout,
+            Self::Respond => ScenarioUpstream::Respond,
+            Self::StreamError => ScenarioUpstream::StreamError,
+        }
+    }
 }
 
 /// Scripted upstream client for deterministic handler tests.
@@ -448,9 +488,9 @@ impl Scenario {
                 admission: ScenarioAdmission::Open,
                 audit: ScenarioAudit::Record,
                 bounds: ScenarioBounds::Roomy,
-                downstream,
+                downstream: downstream.into_downstream(),
                 request,
-                upstream,
+                upstream: upstream.into_upstream(),
             },
             ScenarioClass::PermitSaturated { audit } => Self {
                 admission: ScenarioAdmission::Saturated,
@@ -505,6 +545,9 @@ impl Scenario {
 }
 
 impl ScenarioClass {
+    /// Number of reachable deterministic scenario classes.
+    const COUNT: usize = 18;
+
     /// Returns every scenario fault-class combination.
     #[must_use]
     pub(super) fn all() -> Vec<Self> {
@@ -517,8 +560,8 @@ impl ScenarioClass {
             classes.push(Self::UpstreamStreamError { audit });
             classes.push(Self::UpstreamTimeout { audit });
         }
-        for downstream in ScenarioDownstream::DISCONNECTS {
-            for upstream in ScenarioUpstream::RESPONSE_STARTED {
+        for downstream in ScenarioDisconnect::ALL {
+            for upstream in ScenarioStartedUpstream::ALL {
                 classes.push(Self::DownstreamDisconnect {
                     downstream,
                     upstream,
@@ -530,8 +573,8 @@ impl ScenarioClass {
 
     /// Returns the derived number of reachable scenario classes.
     #[must_use]
-    pub(super) fn count() -> usize {
-        Self::all().len()
+    pub(super) const fn count() -> usize {
+        Self::COUNT
     }
 }
 
@@ -867,11 +910,12 @@ fn scenario_target(query_text: Option<&str>) -> String {
 mod tests {
     use super::{
         MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission, ScenarioAudit,
-        ScenarioBounds, ScenarioClass, ScenarioDownstream, ScenarioRequest, ScenarioUpstream,
-        ScriptedUpstreamClient, scenario_any, scenario_body_any, scenario_class_any,
-        scenario_connection_value_any, scenario_header_any, scenario_header_value_any,
-        scenario_header_value_char_any, scenario_headers_any, scenario_query_char_any,
-        scenario_target, scenario_target_any, scripted_stream_error_response,
+        ScenarioBounds, ScenarioClass, ScenarioDisconnect, ScenarioDownstream, ScenarioRequest,
+        ScenarioStartedUpstream, ScenarioUpstream, ScriptedUpstreamClient, scenario_any,
+        scenario_body_any, scenario_class_any, scenario_connection_value_any, scenario_header_any,
+        scenario_header_value_any, scenario_header_value_char_any, scenario_headers_any,
+        scenario_query_char_any, scenario_target, scenario_target_any,
+        scripted_stream_error_response,
     };
     use crate::config::RequestTimeout;
     use crate::ports::UpstreamDeadline;
@@ -919,7 +963,24 @@ mod tests {
         let request = ScenarioRequest::new(Vec::new(), Vec::new(), Method::GET, "/v1/models");
         let classes = ScenarioClass::all();
 
+        assert_eq!(classes.len(), 18);
         assert_eq!(classes.len(), ScenarioClass::count());
+        for audit in ScenarioAudit::ALL {
+            assert!(classes.contains(&ScenarioClass::PermitSaturated { audit }));
+            assert!(classes.contains(&ScenarioClass::ResponseBodyTooLarge { audit }));
+            assert!(classes.contains(&ScenarioClass::UpstreamBodyTimeout { audit }));
+            assert!(classes.contains(&ScenarioClass::UpstreamRespond { audit }));
+            assert!(classes.contains(&ScenarioClass::UpstreamStreamError { audit }));
+            assert!(classes.contains(&ScenarioClass::UpstreamTimeout { audit }));
+        }
+        for downstream in ScenarioDisconnect::ALL {
+            for upstream in ScenarioStartedUpstream::ALL {
+                assert!(classes.contains(&ScenarioClass::DownstreamDisconnect {
+                    downstream,
+                    upstream,
+                }));
+            }
+        }
 
         for class in classes {
             let scenario = Scenario::with_class(class, request.clone());
