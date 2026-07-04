@@ -109,6 +109,10 @@ no upstream request and no audit event.
 Fuzz-only parser entrypoints live behind `cfg(fuzzing)`. They do not make
 parser internals public in normal builds.
 
+Scoped `cargo-mutants` runs with unit tests do not treat these facades as
+load-bearing evidence. Exclude fuzz-only facade replacements from that gate
+and use the matching `cargo fuzz run` target as the maintained proof.
+
 The current fuzz targets are:
 
 - `accepted_path_set_path`, which checks that accepted origin-form paths are
