@@ -71,34 +71,51 @@ pub(super) struct Scenario {
     upstream: ScenarioUpstream,
 }
 
-/// Product of deterministic scenario fault-class axes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ScenarioClass {
-    /// Reachable scenario fault class.
-    kind: ScenarioClassKind,
-}
-
 /// Reachable deterministic scenario fault classes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ScenarioClassKind {
-    /// Base product over admission, audit, bounds, and upstream behavior.
-    Base {
-        /// Gateway admission state.
-        admission: ScenarioAdmission,
-        /// Audit sink behavior.
-        audit: ScenarioAudit,
-        /// Scenario byte bounds.
-        bounds: ScenarioBounds,
-        /// Scripted upstream behavior.
-        upstream: ScenarioUpstream,
-    },
-
+pub(super) enum ScenarioClass {
     /// Reachable downstream disconnect after a response has started.
     DownstreamDisconnect {
         /// Downstream response consumption behavior.
         downstream: ScenarioDownstream,
         /// Scripted upstream behavior after response start.
         upstream: ScenarioUpstream,
+    },
+
+    /// Gateway admission is saturated before any upstream request starts.
+    PermitSaturated {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+    },
+
+    /// Response body exceeds the configured response byte bound.
+    ResponseBodyTooLarge {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+    },
+
+    /// Upstream response body stalls after the first chunk.
+    UpstreamBodyTimeout {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+    },
+
+    /// Upstream returns a successful response.
+    UpstreamRespond {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+    },
+
+    /// Upstream response stream fails after the first chunk.
+    UpstreamStreamError {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
+    },
+
+    /// Upstream request stalls before response headers arrive.
+    UpstreamTimeout {
+        /// Audit sink behavior.
+        audit: ScenarioAudit,
     },
 }
 
@@ -206,19 +223,9 @@ enum ScriptedResponseStep {
     Second,
 }
 
-impl ScenarioAdmission {
-    /// Every scenario admission variant.
-    const ALL: [Self; 2] = [Self::Open, Self::Saturated];
-}
-
 impl ScenarioAudit {
     /// Every scenario audit variant.
     const ALL: [Self; 2] = [Self::FailFirst, Self::Record];
-}
-
-impl ScenarioBounds {
-    /// Every scenario bounds variant.
-    const ALL: [Self; 2] = [Self::Roomy, Self::TinyResponse];
 }
 
 impl ScenarioDownstream {
@@ -227,14 +234,6 @@ impl ScenarioDownstream {
 }
 
 impl ScenarioUpstream {
-    /// Every scenario upstream variant.
-    const ALL: [Self; 4] = [
-        Self::BodyTimeout,
-        Self::Respond,
-        Self::StreamError,
-        Self::Timeout,
-    ];
-
     /// Upstream variants that start a response stream.
     const RESPONSE_STARTED: [Self; 3] = [Self::BodyTimeout, Self::Respond, Self::StreamError];
 }
@@ -441,21 +440,8 @@ impl Scenario {
     /// Builds a deterministic gateway scenario from a generated class.
     #[must_use]
     pub(super) const fn with_class(class: ScenarioClass, request: ScenarioRequest) -> Self {
-        match class.kind {
-            ScenarioClassKind::Base {
-                admission,
-                audit,
-                bounds,
-                upstream,
-            } => Self {
-                admission,
-                audit,
-                bounds,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream,
-            },
-            ScenarioClassKind::DownstreamDisconnect {
+        match class {
+            ScenarioClass::DownstreamDisconnect {
                 downstream,
                 upstream,
             } => Self {
@@ -466,6 +452,54 @@ impl Scenario {
                 request,
                 upstream,
             },
+            ScenarioClass::PermitSaturated { audit } => Self {
+                admission: ScenarioAdmission::Saturated,
+                audit,
+                bounds: ScenarioBounds::Roomy,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::Respond,
+            },
+            ScenarioClass::ResponseBodyTooLarge { audit } => Self {
+                admission: ScenarioAdmission::Open,
+                audit,
+                bounds: ScenarioBounds::TinyResponse,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::Respond,
+            },
+            ScenarioClass::UpstreamBodyTimeout { audit } => Self {
+                admission: ScenarioAdmission::Open,
+                audit,
+                bounds: ScenarioBounds::Roomy,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::BodyTimeout,
+            },
+            ScenarioClass::UpstreamRespond { audit } => Self {
+                admission: ScenarioAdmission::Open,
+                audit,
+                bounds: ScenarioBounds::Roomy,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::Respond,
+            },
+            ScenarioClass::UpstreamStreamError { audit } => Self {
+                admission: ScenarioAdmission::Open,
+                audit,
+                bounds: ScenarioBounds::Roomy,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::StreamError,
+            },
+            ScenarioClass::UpstreamTimeout { audit } => Self {
+                admission: ScenarioAdmission::Open,
+                audit,
+                bounds: ScenarioBounds::Roomy,
+                downstream: ScenarioDownstream::ConsumeAll,
+                request,
+                upstream: ScenarioUpstream::Timeout,
+            },
         }
     }
 }
@@ -475,29 +509,19 @@ impl ScenarioClass {
     #[must_use]
     pub(super) fn all() -> Vec<Self> {
         let mut classes = Vec::new();
-        for admission in ScenarioAdmission::ALL {
-            for audit in ScenarioAudit::ALL {
-                for bounds in ScenarioBounds::ALL {
-                    for upstream in ScenarioUpstream::ALL {
-                        classes.push(Self {
-                            kind: ScenarioClassKind::Base {
-                                admission,
-                                audit,
-                                bounds,
-                                upstream,
-                            },
-                        });
-                    }
-                }
-            }
+        for audit in ScenarioAudit::ALL {
+            classes.push(Self::PermitSaturated { audit });
+            classes.push(Self::ResponseBodyTooLarge { audit });
+            classes.push(Self::UpstreamBodyTimeout { audit });
+            classes.push(Self::UpstreamRespond { audit });
+            classes.push(Self::UpstreamStreamError { audit });
+            classes.push(Self::UpstreamTimeout { audit });
         }
         for downstream in ScenarioDownstream::DISCONNECTS {
             for upstream in ScenarioUpstream::RESPONSE_STARTED {
-                classes.push(Self {
-                    kind: ScenarioClassKind::DownstreamDisconnect {
-                        downstream,
-                        upstream,
-                    },
+                classes.push(Self::DownstreamDisconnect {
+                    downstream,
+                    upstream,
                 });
             }
         }
