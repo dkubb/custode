@@ -1,6 +1,6 @@
 //! Audit event schema and writer.
 
-use crate::allowlist::{AcceptedTarget, RejectionReason};
+use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason};
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{
@@ -1014,6 +1014,8 @@ pub(crate) struct AuditRequestInput {
 pub(crate) struct ObservedAuditRequestInput {
     /// Request context common to every audit event.
     request: AuditRequestInput,
+    /// Upstream target derived from the same accepted target witness.
+    upstream: AuditUpstreamTarget,
 }
 
 /// Upstream target recorded when upstream I/O was attempted.
@@ -1386,16 +1388,13 @@ impl AuditEventInput {
     /// Creates an allowed audit event input.
     #[must_use]
     pub(crate) fn allowed(
-        request: ObservedAuditRequestInput,
+        observed_request: ObservedAuditRequestInput,
         response_body: ObservedBodySummary,
         status: StatusCode,
-        upstream: AuditUpstreamTarget,
     ) -> Self {
+        let (request, upstream) = observed_request.into_parts();
         let outcome = AuditOutcome::allowed(response_body, status, upstream);
-        Self {
-            outcome,
-            request: request.into_request(),
-        }
+        Self { outcome, request }
     }
 
     /// Creates a denied audit event input.
@@ -1415,29 +1414,23 @@ impl AuditEventInput {
     /// Creates a response-error audit event input.
     #[must_use]
     pub(crate) fn response_error(
-        request: ObservedAuditRequestInput,
+        observed_request: ObservedAuditRequestInput,
         error: AuditResponseError,
-        upstream: AuditUpstreamTarget,
     ) -> Self {
+        let (request, upstream) = observed_request.into_parts();
         let outcome = AuditOutcome::response_error(error, upstream);
-        Self {
-            outcome,
-            request: request.into_request(),
-        }
+        Self { outcome, request }
     }
 
     /// Creates an upstream-error audit event input.
     #[must_use]
     pub(crate) fn upstream_error(
-        request: ObservedAuditRequestInput,
+        observed_request: ObservedAuditRequestInput,
         error: AuditUpstreamError,
-        upstream: AuditUpstreamTarget,
     ) -> Self {
+        let (request, upstream) = observed_request.into_parts();
         let outcome = AuditOutcome::upstream_error(error, upstream);
-        Self {
-            outcome,
-            request: request.into_request(),
-        }
+        Self { outcome, request }
     }
 }
 
@@ -1531,29 +1524,29 @@ impl AuditRequestInput {
 }
 
 impl ObservedAuditRequestInput {
-    /// Consumes the observed wrapper into generic request context.
+    /// Consumes the observed wrapper into request context and upstream target.
     #[must_use]
-    fn into_request(self) -> AuditRequestInput {
-        self.request
+    fn into_parts(self) -> (AuditRequestInput, AuditUpstreamTarget) {
+        (self.request, self.upstream)
     }
 
     /// Creates request context after the request body was observed.
     #[must_use]
     pub(crate) fn new(
-        method: Method,
-        target: AuditTarget,
+        target: &AllowedTarget,
         request_id: RequestId,
         body: &AccountedBody,
         upstream_origin: UpstreamOrigin,
     ) -> Self {
         let request = AuditRequestInput::new(
-            method,
-            target,
+            target.method().clone(),
+            AuditTarget::from(target.target()),
             request_id,
             AuditBodySummary::from_request_body(body),
             upstream_origin,
         );
-        Self { request }
+        let upstream = AuditUpstreamTarget::from(target.target());
+        Self { request, upstream }
     }
 }
 

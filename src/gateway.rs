@@ -4,8 +4,7 @@ use crate::allowlist::AllowedTarget;
 use crate::audit::{
     AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditRequestInput,
     AuditResponseError, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
-    AuditUpstreamTarget, ObservedAuditRequestInput, ObservedBodySummary, RequestId,
-    ResponseBodyPrefix,
+    ObservedAuditRequestInput, ObservedBodySummary, RequestId, ResponseBodyPrefix,
 };
 use crate::body::{AccountedBody, BodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -247,10 +246,8 @@ impl Gateway {
         &self,
         input: ResponseAuditInput,
     ) -> Result<(), GatewayError> {
-        let upstream = AuditUpstreamTarget::from(input.target.target());
         let request = ObservedAuditRequestInput::new(
-            input.target.method().clone(),
-            AuditTarget::from(input.target.target()),
+            &input.target,
             input.request_id,
             &input.request_body,
             self.config.upstream_origin().clone(),
@@ -259,24 +256,24 @@ impl Gateway {
             ResponseAuditOutcomeKind::Allowed {
                 response_body,
                 status,
-            } => AuditEventInput::allowed(request, response_body, status, upstream),
+            } => AuditEventInput::allowed(request, response_body, status),
             ResponseAuditOutcomeKind::DownstreamClosed {
                 response_body,
                 status,
             } => {
                 let error = AuditResponseError::downstream_closed(response_body, status);
-                AuditEventInput::response_error(request, error, upstream)
+                AuditEventInput::response_error(request, error)
             }
             ResponseAuditOutcomeKind::ResponseBodyTooLarge {
                 response_body,
                 status,
             } => {
                 let error = AuditResponseError::response_body_too_large(response_body, status);
-                AuditEventInput::response_error(request, error, upstream)
+                AuditEventInput::response_error(request, error)
             }
             ResponseAuditOutcomeKind::ResponseHeaderError { error } => {
                 let response_error = AuditResponseError::response_header(error);
-                AuditEventInput::response_error(request, response_error, upstream)
+                AuditEventInput::response_error(request, response_error)
             }
             ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
                 response_body,
@@ -284,10 +281,10 @@ impl Gateway {
             } => {
                 let error =
                     AuditResponseError::upstream_response_stream_failed(response_body, status);
-                AuditEventInput::response_error(request, error, upstream)
+                AuditEventInput::response_error(request, error)
             }
             ResponseAuditOutcomeKind::UpstreamError { error } => {
-                AuditEventInput::upstream_error(request, error, upstream)
+                AuditEventInput::upstream_error(request, error)
             }
         };
         let event = AuditEvent::new_at(event_input, self.clock.now());
