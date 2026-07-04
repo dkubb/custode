@@ -160,6 +160,37 @@ summary_report() {
     "${summary_path}"
 }
 
+validate_summary_totals() {
+  local summary_path="${1}"
+
+  jq --exit-status '
+    def require_number($metric; $field):
+      .data[0].totals[$metric][$field] as $value |
+      if ($value | type) == "number" then
+        $value
+      else
+        error("coverage summary missing numeric field: " + $metric + "." + $field)
+      end;
+
+    def require_pair($metric):
+      (require_number($metric; "count")) as $count |
+      (require_number($metric; "covered")) as $covered |
+      if $covered <= $count then
+        true
+      else
+        error("coverage summary has impossible covered count: " + $metric + ".covered > " + $metric + ".count")
+      end;
+
+    [
+      require_pair("regions"),
+      require_pair("functions"),
+      require_pair("lines"),
+      require_pair("branches")
+    ] |
+    all
+  ' "${summary_path}" >/dev/null
+}
+
 detailed_report_excluding_test_modules() {
   local summary_path="${1}"
   local max_regions="${2}"
@@ -168,6 +199,8 @@ detailed_report_excluding_test_modules() {
   local max_branches="${5}"
   local exclusions_path
   local events_path
+
+  validate_summary_totals "${summary_path}"
 
   if ! jq --exit-status '
     .data[0].functions != null

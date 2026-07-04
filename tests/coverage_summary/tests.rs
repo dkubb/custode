@@ -26,12 +26,13 @@ use std::process::{Command, Output};
 use tempfile::tempdir;
 
 const FIXTURE_FILENAME: &str = "/tmp/custode-no-such-source.rs";
+const ZERO_TOTALS: &str = r#""totals":{"regions":{"count":0,"covered":0},"functions":{"count":0,"covered":0},"lines":{"count":0,"covered":0},"branches":{"count":0,"covered":0}}"#;
 
 fn run_coverage_summary(branches: &str, max_missed_branches: u32) -> Output {
     let directory = tempdir().expect("temporary directory should be created");
     let summary = directory.path().join("coverage.json");
     let fixture = format!(
-        r#"{{"data":[{{"functions":[],"files":[{{"filename":"{FIXTURE_FILENAME}","segments":[],"branches":{branches}}}]}}]}}"#
+        r#"{{"data":[{{{ZERO_TOTALS},"functions":[],"files":[{{"filename":"{FIXTURE_FILENAME}","segments":[],"branches":{branches}}}]}}]}}"#
     );
     fs::write(&summary, fixture).expect("coverage fixture should be written");
 
@@ -57,7 +58,7 @@ fn run_coverage_summary_for_source(
     let filename = serde_json::to_string(&source.to_string_lossy())
         .expect("source path should serialize as JSON");
     let fixture = format!(
-        r#"{{"data":[{{"functions":[],"files":[{{"filename":{filename},"segments":{segments},"branches":[]}}]}}]}}"#
+        r#"{{"data":[{{{ZERO_TOTALS},"functions":[],"files":[{{"filename":{filename},"segments":{segments},"branches":[]}}]}}]}}"#
     );
     fs::write(&summary, fixture).expect("coverage fixture should be written");
 
@@ -78,6 +79,19 @@ fn run_summary_fixture(fixture: &str) -> Output {
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-coverage-summary.sh");
     Command::new(script)
+        .arg(summary)
+        .output()
+        .expect("coverage script should run")
+}
+
+fn run_excluded_summary_fixture(fixture: &str) -> Output {
+    let directory = tempdir().expect("temporary directory should be created");
+    let summary = directory.path().join("coverage.json");
+    fs::write(&summary, fixture).expect("coverage fixture should be written");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-coverage-summary.sh");
+    Command::new(script)
+        .arg("--exclude-test-mods")
         .arg(summary)
         .output()
         .expect("coverage script should run")
@@ -123,6 +137,22 @@ fn summary_requires_numeric_totals() {
 fn summary_rejects_covered_totals_above_counts() {
     let output = run_summary_fixture(
         r#"{"data":[{"totals":{"regions":{"count":0,"covered":1},"functions":{"count":0,"covered":0},"lines":{"count":0,"covered":0},"branches":{"count":0,"covered":0}}}]}"#,
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_ne!(output.status.code(), Some(0_i32));
+    assert!(
+        stderr.contains(
+            "coverage summary has impossible covered count: regions.covered > regions.count"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn exclude_test_modules_rejects_covered_totals_above_counts() {
+    let output = run_excluded_summary_fixture(
+        r#"{"data":[{"totals":{"regions":{"count":0,"covered":1},"functions":{"count":0,"covered":0},"lines":{"count":0,"covered":0},"branches":{"count":0,"covered":0}},"functions":[],"files":[{"filename":"/tmp/custode-no-such-source.rs","segments":[],"branches":[]}]}]}"#,
     );
     let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
 
