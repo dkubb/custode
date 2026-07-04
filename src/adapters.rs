@@ -12,7 +12,6 @@ use core::num::NonZeroU64;
 use core::sync::atomic::{AtomicU64, Ordering};
 use futures_util::StreamExt as _;
 use reqwest::redirect::Policy;
-use std::io;
 use thiserror::Error;
 
 /// Production audit timestamp source.
@@ -56,13 +55,13 @@ impl UpstreamClientBuildError {
 #[error("failed to read request id run-token entropy: {source}")]
 pub(crate) struct RequestIdSourceBuildError {
     /// Entropy read source.
-    source: io::Error,
+    source: getrandom::Error,
 }
 
 impl RequestIdSourceBuildError {
     /// Creates a build error for tests.
     #[cfg(test)]
-    pub(crate) const fn for_test(source: io::Error) -> Self {
+    pub(crate) const fn for_test(source: getrandom::Error) -> Self {
         Self { source }
     }
 }
@@ -132,7 +131,7 @@ impl RequestIdSource for SequentialRequestIds {
 impl SequentialRequestIds {
     /// Creates a sequence source from an entropy read result.
     fn from_entropy_result(
-        result: io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]>,
+        result: Result<[u8; RUN_TOKEN_RANDOM_BYTES], getrandom::Error>,
     ) -> Result<Self, RequestIdSourceBuildError> {
         let entropy = result.map_err(request_id_source_build_error)?;
         Ok(Self::new(run_token_from_entropy(entropy)))
@@ -203,14 +202,14 @@ const fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunTok
 }
 
 /// Reads run-token entropy from the operating system.
-fn read_run_token_entropy() -> io::Result<[u8; RUN_TOKEN_RANDOM_BYTES]> {
+fn read_run_token_entropy() -> Result<[u8; RUN_TOKEN_RANDOM_BYTES], getrandom::Error> {
     let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
-    getrandom::fill(&mut entropy).map_err(io::Error::other)?;
+    getrandom::fill(&mut entropy)?;
     Ok(entropy)
 }
 
 /// Creates a request id source build error from an entropy read error.
-const fn request_id_source_build_error(source: io::Error) -> RequestIdSourceBuildError {
+const fn request_id_source_build_error(source: getrandom::Error) -> RequestIdSourceBuildError {
     RequestIdSourceBuildError { source }
 }
 
@@ -311,7 +310,6 @@ mod tests {
     use core::time::Duration;
     use futures_util::StreamExt as _;
     use pretty_assertions::assert_eq;
-    use std::io::Error;
     use std::path::PathBuf;
     use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpListener;
@@ -392,16 +390,16 @@ mod tests {
 
     #[test]
     fn request_id_source_build_error_display_includes_context() {
-        let error = SequentialRequestIds::from_entropy_result(Err(Error::other("boom")))
+        let error = SequentialRequestIds::from_entropy_result(Err(getrandom::Error::UNSUPPORTED))
             .expect_err("entropy read failures should be mapped");
 
         assert_eq!(
             error.to_string(),
-            "failed to read request id run-token entropy: boom"
+            "failed to read request id run-token entropy: getrandom: this target is not supported"
         );
         assert!(
             error.source().is_some(),
-            "display error should expose the I/O source"
+            "display error should expose the getrandom source"
         );
     }
 

@@ -2481,7 +2481,7 @@ mod tests {
 
     /// Builds a request id source construction error for startup tests.
     fn request_id_source_build_error() -> RequestIdSourceBuildError {
-        RequestIdSourceBuildError::for_test(io::Error::other("entropy failed"))
+        RequestIdSourceBuildError::for_test(getrandom::Error::UNSUPPORTED)
     }
 
     /// Returns a parser-rejected audit target for test mapping coverage.
