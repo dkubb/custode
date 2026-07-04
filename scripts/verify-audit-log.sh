@@ -74,15 +74,11 @@ require_valid_request_ids() {
         elif $request_id[38:54] == "0000000000000000" then
           error("audit event has zero request sequence")
         else
-          {
-            request_id: $request_id,
-            run_token: $request_id[4:37],
-            sequence: $request_id[38:54]
-          }
+          $request_id
         end;
 
     [ .[] | audit_id ] as $ids
-    | if (($ids | map(.request_id) | unique | length) != ($ids | length)) then
+    | if (($ids | unique | length) != ($ids | length)) then
         error("audit log has duplicate request_id")
       else
         true
