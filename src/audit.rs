@@ -2219,12 +2219,8 @@ impl ObservedAuditRequestInput {
 
     /// Creates request context after the request body was observed.
     #[must_use]
-    pub(crate) fn new(
-        target: &AllowedTarget,
-        request_id: RequestId,
-        body: &AccountedBody,
-        upstream_origin: UpstreamOrigin,
-    ) -> Self {
+    pub(crate) fn new(target: &AllowedTarget, request_id: RequestId, body: &AccountedBody) -> Self {
+        let upstream_origin = target.upstream_origin().clone();
         let upstream_url = upstream_origin.join_path_query(
             target.target().origin_form_path(),
             target.target().origin_form_query(),

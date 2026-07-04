@@ -1,6 +1,6 @@
 //! Method and path allowlist decisions.
 
-use crate::config::{AllowedMethod, AllowedOperation, GatewayConfig};
+use crate::config::{AllowedMethod, AllowedOperation, GatewayConfig, UpstreamOrigin};
 use crate::target::{OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError};
 use ::http::Method;
 
@@ -20,6 +20,8 @@ pub(crate) struct AllowedTarget {
     method: AllowedMethod,
     /// Accepted target matched by the method.
     target: AcceptedTarget,
+    /// Upstream origin from the configuration that accepted this target.
+    upstream_origin: UpstreamOrigin,
 }
 
 /// Accepted request target proven rejected by the configured allowlist.
@@ -93,6 +95,12 @@ impl AllowedTarget {
     #[must_use]
     pub(crate) const fn target(&self) -> &AcceptedTarget {
         &self.target
+    }
+
+    /// Returns the upstream origin paired with the allowlist decision.
+    #[must_use]
+    pub(crate) const fn upstream_origin(&self) -> &UpstreamOrigin {
+        &self.upstream_origin
     }
 }
 
@@ -213,6 +221,7 @@ pub(crate) fn allow_target(
         Ok(AllowedTarget {
             method: allowed_method.clone(),
             target,
+            upstream_origin: config.upstream_origin().clone(),
         })
     } else {
         Err(RejectedAllowedTarget {
@@ -231,7 +240,8 @@ pub(crate) fn allow_target(
 )]
 mod tests {
     use super::{
-        AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason, is_allowed, rejection_for,
+        AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason, allow_target, is_allowed,
+        rejection_for,
     };
     use crate::config::{AllowedPath, GatewayConfig};
     use crate::target::{
@@ -250,6 +260,11 @@ mod tests {
         )
     }
 
+    /// Builds a config allowing only `GET:exact:/v1/models` for one origin.
+    fn config_with_origin(origin: &str) -> GatewayConfig {
+        GatewayConfig::for_runtime_test(PathBuf::from("/unused/audit.ndjson"), origin)
+    }
+
     /// Parses a test origin-form path.
     fn origin_form_path(path: &str) -> OriginFormPath {
         OriginFormPath::parse(path).expect("test path should parse")
@@ -262,6 +277,20 @@ mod tests {
         assert!(allowed.matches(&origin_form_path("/v1/responses")));
         assert!(allowed.matches(&origin_form_path("/v1/responses/abc")));
         assert!(!allowed.matches(&origin_form_path("/v1/responses-abc")));
+    }
+
+    #[test]
+    fn allowed_targets_carry_the_accepting_config_origin() {
+        let config = config_with_origin("https://api.anthropic.com");
+        let target = AcceptedTarget::new("/v1/models", None).expect("target should parse");
+
+        let allowed =
+            allow_target(&config, &Method::GET, target).expect("target should be allowed");
+
+        assert_eq!(
+            allowed.upstream_origin().as_str(),
+            "https://api.anthropic.com",
+        );
     }
 
     #[test]

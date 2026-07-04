@@ -3,7 +3,7 @@
 use crate::allowlist::AllowedTarget;
 use crate::audit::{AuditError, AuditEvent, AuditTimestamp, RequestId};
 use crate::body::AccountedBody;
-use crate::config::{RequestTimeout, UpstreamOrigin};
+use crate::config::RequestTimeout;
 use crate::headers::ForwardedRequestHeaders;
 use axum::body::Bytes;
 use core::fmt;
@@ -239,7 +239,6 @@ impl UpstreamRequest {
     /// Creates an upstream request from proof-carrying forwarding inputs.
     #[must_use]
     pub(crate) fn from_target(
-        origin: &UpstreamOrigin,
         target: &AllowedTarget,
         headers: ForwardedRequestHeaders,
         body: &AccountedBody,
@@ -250,7 +249,7 @@ impl UpstreamRequest {
             deadline,
             headers: headers.into_header_map(),
             method: target.method().clone(),
-            url: origin.join_path_query(
+            url: target.upstream_origin().join_path_query(
                 target.target().origin_form_path(),
                 target.target().origin_form_query(),
             ),
@@ -580,7 +579,6 @@ mod proptests {
                 .expect("headers should be forwarded");
 
             let request = UpstreamRequest::from_target(
-                &origin,
                 &allowed,
                 headers,
                 &body,

@@ -305,9 +305,7 @@ mod tests {
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
     use crate::body::AccountedBody;
-    use crate::config::{
-        GatewayConfig, RequestBodyBytes, RequestHeaderBytes, RequestTimeout, UpstreamOrigin,
-    };
+    use crate::config::{GatewayConfig, RequestBodyBytes, RequestHeaderBytes, RequestTimeout};
     use crate::headers::forward_request_headers;
     use crate::ports::{
         Clock as _, RequestIdError, RequestIdSource as _, UpstreamBodyErrorKind,
@@ -353,7 +351,6 @@ mod tests {
     }
 
     async fn empty_upstream_request(origin_text: &str, timeout: RequestTimeout) -> UpstreamRequest {
-        let origin = UpstreamOrigin::parse(origin_text).expect("test origin should parse");
         let config =
             GatewayConfig::for_runtime_test(PathBuf::from("/unused/audit.ndjson"), origin_text);
         let accepted_target = AcceptedTarget::new("/v1/models", None).expect("target should parse");
@@ -365,7 +362,6 @@ mod tests {
             .await
             .expect("request body should be accounted");
         UpstreamRequest::from_target(
-            &origin,
             &allowed_target,
             headers,
             &request_body,

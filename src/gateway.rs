@@ -286,12 +286,8 @@ impl Gateway {
         &self,
         input: ResponseAuditInput<'_>,
     ) -> Result<(), GatewayError> {
-        let request = ObservedAuditRequestInput::new(
-            input.target,
-            input.request_id,
-            input.request_body,
-            self.config.upstream_origin().clone(),
-        );
+        let request =
+            ObservedAuditRequestInput::new(input.target, input.request_id, input.request_body);
         let event_input = match input.outcome.into_kind() {
             ResponseAuditOutcomeKind::Allowed {
                 response_body,

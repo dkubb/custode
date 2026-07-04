@@ -453,7 +453,6 @@ async fn forward_request(
     gateway.require_audit_available()?;
 
     let upstream_request = UpstreamRequest::from_target(
-        gateway.config().upstream_origin(),
         &target,
         request_headers,
         &request_body,
