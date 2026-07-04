@@ -880,8 +880,9 @@ mod tests {
         use crate::audit::{AuditDenialReason, AuditTarget};
         use crate::sim::{
             Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
-            ScenarioDownstream, ScenarioRequest, ScenarioUpstream, scenario_any,
+            ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream, scenario_any,
         };
+        use crate::target::OriginFormQuery;
         use axum::body::Bytes;
         use http::{Method, StatusCode};
         use proptest::prelude::*;
@@ -1224,13 +1225,11 @@ mod tests {
             }
         }
 
-        /// Returns the request query field from a generated target.
-        fn query_value(target: &str) -> Value {
-            target
-                .split_once('?')
-                .map_or(Value::Null, |(_path, query)| {
-                    Value::String(query.to_owned())
-                })
+        /// Returns the request query field from a generated query.
+        fn query_value(query: Option<&str>) -> Value {
+            query.map_or(Value::Null, |query_text| {
+                Value::String(query_text.to_owned())
+            })
         }
 
         /// Returns true when a generated request header should be forwarded.
@@ -1274,11 +1273,6 @@ mod tests {
             )]))
         }
 
-        /// Returns the request path from a generated target.
-        fn request_path(target: &str) -> &str {
-            target.split_once('?').map_or(target, |(path, _query)| path)
-        }
-
         /// Asserts the audit event invariants for one generated scenario.
         fn prop_assert_audit_event(
             scenario: &Scenario,
@@ -1305,13 +1299,13 @@ mod tests {
 
             let (decision, error_class, status, response_bytes, response_body, has_upstream) =
                 expected_audit_outcome(scenario)?;
-            let path = request_path(scenario.request().target());
-            let query = query_value(scenario.request().target());
+            let path = ScenarioTarget::path();
+            let query = query_value(scenario.request().target_query());
             prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
             prop_assert_eq!(&object["error_class"], &error_class);
             prop_assert_eq!(
                 &object["method"],
-                &Value::String(scenario.request().method().as_str().to_owned())
+                &Value::String(ScenarioRequest::method().as_str().to_owned())
             );
             prop_assert_eq!(&object["path"], &Value::String(path.to_owned()));
             prop_assert_eq!(&object["query"], &query);
@@ -1375,7 +1369,8 @@ mod tests {
                 request.headers(),
                 expected_forwarded_headers(scenario.request().headers())
             );
-            prop_assert_eq!(request.method(), scenario.request().method());
+            let expected_method = ScenarioRequest::method();
+            prop_assert_eq!(request.method(), &expected_method);
             prop_assert_eq!(
                 request.url(),
                 format!("https://api.openai.com{}", scenario.request().target())
@@ -1482,8 +1477,9 @@ mod tests {
                             ("x-request-id".to_owned(), "trace-1".to_owned()),
                             ("x-visible".to_owned(), "ok".to_owned()),
                         ],
-                        Method::GET,
-                        "/v1/models?limit=1",
+                        ScenarioTarget::models(Some(
+                            OriginFormQuery::parse("limit=1").expect("test query should parse"),
+                        )),
                     ),
                 );
                 let run = run_generated_scenario(scenario.clone());
@@ -1542,10 +1538,10 @@ mod tests {
     };
     use crate::sim::{
         FixedClock, MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission,
-        ScenarioBounds, ScenarioDownstream, ScenarioRequest, ScenarioUpstream,
+        ScenarioBounds, ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream,
         ScriptedUpstreamClient,
     };
-    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
+    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormQuery};
     use ::http::{Method, Uri};
     use axum::body::{Body, Bytes, to_bytes};
     use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -2057,7 +2053,7 @@ mod tests {
         };
         let router = Router::new().fallback(any(proxy)).with_state(state);
         let mut builder = Request::builder()
-            .method(request_shape.method().clone())
+            .method(ScenarioRequest::method())
             .uri(request_shape.target());
         for header in request_shape.headers() {
             builder = builder.header(header.0.as_str(), header.1.as_str());
@@ -2265,8 +2261,9 @@ mod tests {
                     ("proxy-authorization".to_owned(), "Basic leak".to_owned()),
                     ("x-request-id".to_owned(), "trace-1".to_owned()),
                 ],
-                Method::GET,
-                "/v1/models?limit=1",
+                ScenarioTarget::models(Some(
+                    OriginFormQuery::parse("limit=1").expect("test query should parse"),
+                )),
             ),
             ScenarioUpstream::Respond,
         );
@@ -2301,8 +2298,9 @@ mod tests {
             ScenarioRequest::new(
                 b"hello".to_vec(),
                 vec![("authorization".to_owned(), "Bearer harness".to_owned())],
-                Method::GET,
-                "/v1/models?limit=1",
+                ScenarioTarget::models(Some(
+                    OriginFormQuery::parse("limit=1").expect("test query should parse"),
+                )),
             ),
             ScenarioUpstream::StreamError,
         );
@@ -2339,8 +2337,9 @@ mod tests {
             ScenarioRequest::new(
                 b"hello".to_vec(),
                 vec![("authorization".to_owned(), "Bearer harness".to_owned())],
-                Method::GET,
-                "/v1/models?limit=1",
+                ScenarioTarget::models(Some(
+                    OriginFormQuery::parse("limit=1").expect("test query should parse"),
+                )),
             ),
             ScenarioUpstream::BodyTimeout,
         );

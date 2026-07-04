@@ -10,6 +10,7 @@ use crate::ports::{
     AuditSink, BoxFuture, Clock, UpstreamBodyError, UpstreamClient, UpstreamDeadline,
     UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
+use crate::target::OriginFormQuery;
 use axum::body::Bytes;
 use core::future;
 use core::num::NonZeroUsize;
@@ -192,10 +193,15 @@ pub(super) struct ScenarioRequest {
     body: Vec<u8>,
     /// Request headers.
     headers: Vec<(String, String)>,
-    /// Request method.
-    method: Method,
     /// Request target.
-    target: String,
+    target: ScenarioTarget,
+}
+
+/// Allowed request target for deterministic gateway scenarios.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ScenarioTarget {
+    /// Optional request query.
+    query: Option<OriginFormQuery>,
 }
 
 /// Scripted upstream outcome for a deterministic gateway scenario.
@@ -593,8 +599,8 @@ impl ScenarioRequest {
 
     /// Returns the request method.
     #[must_use]
-    pub(super) const fn method(&self) -> &Method {
-        &self.method
+    pub(super) fn method() -> Method {
+        Method::GET
     }
 
     /// Builds a harness request shape.
@@ -602,21 +608,54 @@ impl ScenarioRequest {
     pub(super) fn new(
         body: Vec<u8>,
         headers: Vec<(String, String)>,
-        method: Method,
-        target: impl Into<String>,
+        target: ScenarioTarget,
     ) -> Self {
         Self {
             body,
             headers,
-            method,
-            target: target.into(),
+            target,
         }
     }
 
     /// Returns the request target.
     #[must_use]
-    pub(super) fn target(&self) -> &str {
-        &self.target
+    pub(super) fn target(&self) -> String {
+        self.target.to_uri_target()
+    }
+
+    /// Returns the request target query.
+    #[must_use]
+    pub(super) fn target_query(&self) -> Option<&str> {
+        self.target.query()
+    }
+}
+
+impl ScenarioTarget {
+    /// Builds the allowed scenario target.
+    #[must_use]
+    pub(super) const fn models(query: Option<OriginFormQuery>) -> Self {
+        Self { query }
+    }
+
+    /// Returns the fixed request path.
+    #[must_use]
+    pub(super) const fn path() -> &'static str {
+        "/v1/models"
+    }
+
+    /// Returns the optional request query.
+    #[must_use]
+    fn query(&self) -> Option<&str> {
+        self.query.as_ref().map(OriginFormQuery::as_str)
+    }
+
+    /// Returns the request target text accepted by `http::Request`.
+    #[must_use]
+    pub(super) fn to_uri_target(&self) -> String {
+        self.query().map_or_else(
+            || Self::path().to_owned(),
+            |query| format!("{}?{query}", Self::path()),
+        )
     }
 }
 
@@ -782,10 +821,7 @@ pub(super) fn scenario_any() -> impl Strategy<Value = Scenario> {
             scenario_target_any(),
         )
             .prop_map(|(generated_class, body, headers, target)| {
-                Scenario::with_class(
-                    generated_class,
-                    ScenarioRequest::new(body, headers, Method::GET, target),
-                )
+                Scenario::with_class(generated_class, ScenarioRequest::new(body, headers, target))
             })
     })
 }
@@ -883,23 +919,23 @@ fn scenario_query_char_any() -> impl Strategy<Value = char> {
 }
 
 /// Generates allowed request targets.
-fn scenario_target_any() -> impl Strategy<Value = String> {
+fn scenario_target_any() -> impl Strategy<Value = ScenarioTarget> {
     prop_oneof![
         Just(None),
         collection::vec(scenario_query_char_any(), 1..17).prop_map(Some),
     ]
     .prop_map(|query_chars| {
-        let query_text = query_chars.map(|chars| chars.into_iter().collect::<String>());
-        scenario_target(query_text.as_deref())
+        let query = query_chars.map(|chars| {
+            let query_text = chars.into_iter().collect::<String>();
+            OriginFormQuery::parse(&query_text).expect("generated query should parse")
+        });
+        scenario_target(query)
     })
 }
 
 /// Builds a scenario request target from an optional query.
-fn scenario_target(query_text: Option<&str>) -> String {
-    query_text.map_or_else(
-        || "/v1/models".to_owned(),
-        |query_value| format!("/v1/models?{query_value}"),
-    )
+fn scenario_target(query: Option<OriginFormQuery>) -> ScenarioTarget {
+    ScenarioTarget::models(query)
 }
 
 #[cfg(test)]
@@ -911,10 +947,10 @@ mod tests {
     use super::{
         MemoryAuditSink, RecordedUpstreamRequest, Scenario, ScenarioAdmission, ScenarioAudit,
         ScenarioBounds, ScenarioClass, ScenarioDisconnect, ScenarioDownstream, ScenarioRequest,
-        ScenarioStartedUpstream, ScenarioUpstream, ScriptedUpstreamClient, scenario_any,
-        scenario_body_any, scenario_class_any, scenario_connection_value_any, scenario_header_any,
-        scenario_header_value_any, scenario_header_value_char_any, scenario_headers_any,
-        scenario_query_char_any, scenario_target, scenario_target_any,
+        ScenarioStartedUpstream, ScenarioTarget, ScenarioUpstream, ScriptedUpstreamClient,
+        scenario_any, scenario_body_any, scenario_class_any, scenario_connection_value_any,
+        scenario_header_any, scenario_header_value_any, scenario_header_value_char_any,
+        scenario_headers_any, scenario_query_char_any, scenario_target, scenario_target_any,
         scripted_stream_error_response,
     };
     use crate::config::RequestTimeout;
@@ -960,9 +996,10 @@ mod tests {
 
     #[test]
     fn scenario_classes_cover_every_reachable_combination() {
-        let request = ScenarioRequest::new(Vec::new(), Vec::new(), Method::GET, "/v1/models");
+        let request = ScenarioRequest::new(Vec::new(), Vec::new(), scenario_target(None));
         let classes = ScenarioClass::all();
 
+        assert_eq!(request.target_query(), None);
         assert_eq!(classes.len(), 18);
         assert_eq!(classes.len(), ScenarioClass::count());
         for audit in ScenarioAudit::ALL {
@@ -999,8 +1036,9 @@ mod tests {
         let request = ScenarioRequest::new(
             b"body".to_vec(),
             vec![("authorization".to_owned(), "Bearer token".to_owned())],
-            Method::GET,
-            "/v1/models?limit=1",
+            scenario_target(Some(
+                OriginFormQuery::parse("limit=1").expect("test query should parse"),
+            )),
         );
         let scenario = Scenario::new(request.clone(), ScenarioUpstream::Respond);
 
@@ -1009,8 +1047,9 @@ mod tests {
             request.headers(),
             [("authorization".to_owned(), "Bearer token".to_owned())],
         );
-        assert_eq!(request.method(), Method::GET);
+        assert_eq!(ScenarioRequest::method(), Method::GET);
         assert_eq!(request.target(), "/v1/models?limit=1");
+        assert_eq!(request.target_query(), Some("limit=1"));
         assert_eq!(scenario.admission(), ScenarioAdmission::Open);
         assert_eq!(scenario.audit(), ScenarioAudit::Record);
         assert_eq!(scenario.bounds(), ScenarioBounds::Roomy);
@@ -1058,8 +1097,14 @@ mod tests {
 
     #[test]
     fn scenario_target_formats_bare_and_query_targets() {
-        assert_eq!(scenario_target(None), "/v1/models");
-        assert_eq!(scenario_target(Some("limit=1")), "/v1/models?limit=1");
+        assert_eq!(scenario_target(None).to_uri_target(), "/v1/models");
+        assert_eq!(
+            scenario_target(Some(
+                OriginFormQuery::parse("limit=1").expect("test query should parse")
+            ))
+            .to_uri_target(),
+            "/v1/models?limit=1"
+        );
     }
 
     #[test]
@@ -1077,15 +1122,18 @@ mod tests {
             let _query_char = sample(&mut runner, scenario_query_char_any());
             let target = sample(&mut runner, scenario_target_any());
             let scenario = sample(&mut runner, scenario_any());
+            let target_text = target.to_uri_target();
 
             assert!(body.len() <= 8);
             assert!(!header.0.is_empty());
             assert!(header_value.len() <= 16);
             assert!(headers.len() <= 6);
             assert!(!connection.is_empty());
-            let (path, query_text) = target
+            let (path, query_text) = target_text
                 .split_once('?')
-                .map_or((target.as_str(), None), |(path, query)| (path, Some(query)));
+                .map_or((target_text.as_str(), None), |(path, query)| {
+                    (path, Some(query))
+                });
             assert_eq!(
                 OriginFormPath::parse(path)
                     .expect("path should parse")
@@ -1095,7 +1143,14 @@ mod tests {
             if let Some(query_value) = query_text {
                 OriginFormQuery::parse(query_value).expect("query should parse");
             }
-            assert_eq!(scenario.request().method(), Method::GET);
+            assert_eq!(ScenarioTarget::path(), "/v1/models");
+            assert!(
+                scenario
+                    .request()
+                    .target()
+                    .starts_with(ScenarioTarget::path())
+            );
+            assert_eq!(ScenarioRequest::method(), Method::GET);
         }
 
         let response = scripted_stream_error_response();
