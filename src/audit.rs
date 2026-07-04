@@ -7,7 +7,8 @@ use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
 use ::http::{Method, StatusCode};
 use core::fmt;
 use core::num::NonZeroU64;
-use serde::{Serialize, Serializer};
+use serde::de::{Error as SerdeError, Unexpected};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io;
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
@@ -287,6 +288,213 @@ pub(crate) struct AuditEvent {
     upstream_query: Option<String>,
     /// Audit schema version.
     version: AuditSchemaVersion,
+}
+
+/// Existing audit event parsed at startup before appending.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingAuditEvent {
+    /// Final audit decision.
+    decision: ExistingAuditDecision,
+    /// Stable error class for failed decisions.
+    #[serde(deserialize_with = "deserialize_required_option")]
+    error_class: Option<ExistingAuditErrorClass>,
+    /// Request method.
+    #[serde(deserialize_with = "deserialize_existing_method")]
+    method: String,
+    /// Accepted request path, or bounded raw target for denied requests.
+    #[serde(deserialize_with = "deserialize_existing_path")]
+    path: String,
+    /// Request query string without `?`.
+    #[serde(deserialize_with = "deserialize_existing_query")]
+    query: Option<String>,
+    /// Request body summary.
+    request_body: ExistingAuditBodySummary,
+    /// Request identity.
+    #[serde(deserialize_with = "deserialize_existing_request_id")]
+    request_id: String,
+    /// Response body summary.
+    response_body: ExistingAuditBodySummary,
+    /// Response status returned to the harness.
+    #[serde(deserialize_with = "deserialize_existing_status")]
+    status: StatusCode,
+    /// RFC 3339 UTC timestamp.
+    #[serde(deserialize_with = "deserialize_existing_timestamp")]
+    timestamp: String,
+    /// Configured upstream origin.
+    #[serde(deserialize_with = "deserialize_existing_upstream_origin")]
+    upstream_origin: String,
+    /// Upstream path, when an upstream request was attempted.
+    #[serde(deserialize_with = "deserialize_existing_upstream_path")]
+    upstream_path: Option<String>,
+    /// Upstream query, when an upstream request was attempted.
+    #[serde(deserialize_with = "deserialize_existing_upstream_query")]
+    upstream_query: Option<String>,
+    /// Audit schema version.
+    #[serde(deserialize_with = "deserialize_existing_version")]
+    version: AuditSchemaVersion,
+}
+
+/// Existing audit body summary parsed at startup.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case", tag = "state")]
+enum ExistingAuditBodySummary {
+    /// Body was observed and empty.
+    Empty,
+
+    /// Body was observed and non-empty.
+    NonEmpty {
+        /// Body digest.
+        #[serde(deserialize_with = "deserialize_blake3_hex")]
+        blake3: String,
+        /// Body byte count.
+        bytes: NonZeroU64,
+    },
+
+    /// Body bytes were not observed.
+    NotObserved,
+}
+
+/// Existing audit decision parsed at startup.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExistingAuditDecision {
+    /// Request was allowed and completed normally.
+    Allowed,
+
+    /// Request was denied before upstream I/O.
+    Denied,
+
+    /// Response handling failed.
+    ResponseError,
+
+    /// Upstream request failed before a response completed.
+    UpstreamError,
+}
+
+/// Existing audit error class parsed at startup.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ExistingAuditErrorClass {
+    /// Absolute-form request target was rejected.
+    AbsoluteFormUnsupported,
+
+    /// CONNECT request was rejected.
+    ConnectUnsupported,
+
+    /// Dot segment was rejected.
+    DotSegment,
+
+    /// Downstream closed before the response completed.
+    DownstreamClosed,
+
+    /// Encoded separator was rejected.
+    EncodedSeparator,
+
+    /// Invalid percent encoding was rejected.
+    InvalidPercentEncoding,
+
+    /// Request `Connection` header contained an invalid dynamic header name.
+    InvalidRequestConnectionHeader,
+
+    /// Response `Connection` header contained an invalid dynamic header name.
+    InvalidResponseConnectionHeader,
+
+    /// Method was outside the allowlist.
+    MethodDenied,
+
+    /// Request target was not origin-form.
+    NonOriginForm,
+
+    /// Path was outside the allowlist.
+    PathDenied,
+
+    /// Path exceeded the supported byte limit.
+    PathTooLong,
+
+    /// Query exceeded the supported byte limit.
+    QueryTooLong,
+
+    /// Request body read failed.
+    RequestBodyReadFailed,
+
+    /// Request body read timed out.
+    RequestBodyTimeout,
+
+    /// Request body exceeded the supported byte limit.
+    RequestBodyTooLarge,
+
+    /// Request headers exceeded the supported byte limit.
+    RequestHeadersTooLarge,
+
+    /// Response body exceeded the supported byte limit.
+    ResponseBodyTooLarge,
+
+    /// Response headers exceeded the supported byte limit.
+    ResponseHeadersTooLarge,
+
+    /// Concurrency limit rejected the request.
+    TooManyRequests,
+
+    /// Gateway could not connect to the upstream.
+    UpstreamConnectFailed,
+
+    /// Upstream request failed after connection setup.
+    UpstreamRequestFailed,
+
+    /// Upstream response stream failed after upstream I/O started.
+    UpstreamResponseStreamFailed,
+
+    /// Upstream request timed out.
+    UpstreamTimeout,
+}
+
+impl ExistingAuditBodySummary {
+    /// Consumes all validated body-summary fields.
+    fn consume(self) {
+        match self {
+            Self::Empty | Self::NotObserved => {}
+            Self::NonEmpty { blake3, bytes } => drop((blake3, bytes)),
+        }
+    }
+}
+
+impl ExistingAuditEvent {
+    /// Consumes all validated event fields.
+    fn consume(self) {
+        let Self {
+            decision,
+            error_class,
+            method,
+            path,
+            query,
+            request_body,
+            request_id,
+            response_body,
+            status,
+            timestamp,
+            upstream_origin,
+            upstream_path,
+            upstream_query,
+            version,
+        } = self;
+        request_body.consume();
+        response_body.consume();
+        drop((
+            decision,
+            error_class,
+            method,
+            path,
+            query,
+            request_id,
+            status,
+            timestamp,
+            upstream_origin,
+            upstream_path,
+            upstream_query,
+            version,
+        ));
+    }
 }
 
 /// Current audit event schema version.
@@ -1403,6 +1611,223 @@ async fn classify_audit_log_tail(reader: &mut dyn AuditLogTailReader) -> io::Res
     }
 }
 
+/// Deserializes a lowercase BLAKE3 hex digest.
+fn deserialize_blake3_hex<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.len() == 64 && value.bytes().all(is_lower_hex_byte) {
+        Ok(value)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Str(&value),
+            &"a 64-byte lowercase hexadecimal BLAKE3 digest",
+        ))
+    }
+}
+
+/// Deserializes and validates the existing audit method string.
+fn deserialize_existing_method<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value.is_empty() {
+        return Err(D::Error::invalid_value(
+            Unexpected::Str(&value),
+            &"a non-empty audited method string",
+        ));
+    }
+    deserialize_existing_string_bounded(value, MAX_ALLOWED_METHOD_BYTES, "audited method")
+}
+
+/// Deserializes and validates the existing audit path string.
+fn deserialize_existing_path<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    deserialize_existing_string_bounded(value, MAX_AUDIT_TARGET_PATH_BYTES, "audit path")
+}
+
+/// Deserializes and validates the existing audit query field.
+fn deserialize_existing_query<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|query| {
+            deserialize_existing_string_bounded(query, MAX_AUDIT_TARGET_QUERY_BYTES, "audit query")
+        })
+        .transpose()
+}
+
+/// Deserializes and validates the existing audit request identity.
+fn deserialize_existing_request_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if is_existing_request_id(&value) {
+        Ok(value)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Str(&value),
+            &"a request id formatted as req-<16 hex>-<16 hex>-<16 hex>",
+        ))
+    }
+}
+
+/// Deserializes and validates the existing audit status code.
+fn deserialize_existing_status<'de, D>(deserializer: D) -> Result<StatusCode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u16::deserialize(deserializer)?;
+    StatusCode::from_u16(value).map_err(|_error| {
+        D::Error::invalid_value(
+            Unexpected::Unsigned(u64::from(value)),
+            &"a valid HTTP status",
+        )
+    })
+}
+
+/// Deserializes and validates the existing audit timestamp.
+fn deserialize_existing_timestamp<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if humantime::parse_rfc3339(&value).is_ok() {
+        Ok(value)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Str(&value),
+            &"an RFC 3339 timestamp",
+        ))
+    }
+}
+
+/// Deserializes and validates the existing audit upstream origin.
+fn deserialize_existing_upstream_origin<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if UpstreamOrigin::parse(&value).is_ok() {
+        Ok(value)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Str(&value),
+            &"a supported upstream origin",
+        ))
+    }
+}
+
+/// Deserializes and validates the existing audit upstream path field.
+fn deserialize_existing_upstream_path<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|path| {
+            deserialize_existing_string_bounded(path, MAX_AUDIT_TARGET_PATH_BYTES, "upstream path")
+        })
+        .transpose()
+}
+
+/// Deserializes and validates the existing audit upstream query field.
+fn deserialize_existing_upstream_query<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|query| {
+            deserialize_existing_string_bounded(
+                query,
+                MAX_AUDIT_TARGET_QUERY_BYTES,
+                "upstream query",
+            )
+        })
+        .transpose()
+}
+
+/// Deserializes and validates the existing audit schema version.
+fn deserialize_existing_version<'de, D>(deserializer: D) -> Result<AuditSchemaVersion, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = u8::deserialize(deserializer)?;
+    if value == AuditSchemaVersion::as_u8() {
+        Ok(AuditSchemaVersion::CURRENT)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Unsigned(u64::from(value)),
+            &"the current audit schema version",
+        ))
+    }
+}
+
+/// Deserializes a required nullable field.
+fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+/// Validates bounded audit text from an existing log line.
+fn deserialize_existing_string_bounded<E>(
+    value: String,
+    max_bytes: usize,
+    field_name: &'static str,
+) -> Result<String, E>
+where
+    E: SerdeError,
+{
+    if value.len() <= max_bytes {
+        Ok(value)
+    } else {
+        Err(E::custom(format!(
+            "{field_name} must be at most {max_bytes} bytes"
+        )))
+    }
+}
+
+/// Returns true for lowercase hexadecimal bytes.
+const fn is_lower_hex_byte(byte: u8) -> bool {
+    matches!(byte, b'0'..=b'9' | b'a'..=b'f')
+}
+
+/// Returns true for request ids emitted by the current audit schema.
+fn is_existing_request_id(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("req-") else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let first = parts
+        .next()
+        .expect("str::split yields at least one segment");
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    let Some(sequence) = parts.next() else {
+        return false;
+    };
+    if parts.next().is_some() {
+        return false;
+    }
+
+    [first, second, sequence]
+        .into_iter()
+        .all(|part| part.len() == 16 && part.bytes().all(is_lower_hex_byte))
+}
+
 /// Validates newline-terminated events in an existing audit log.
 async fn validate_existing_audit_events(
     path: &Path,
@@ -1437,13 +1862,14 @@ async fn validate_existing_audit_events(
 
         let numbered_line =
             NonZeroU64::new(line_number).expect("audit log line numbering starts at one");
-        serde_json::from_slice::<serde_json::Value>(&line).map_err(|source| {
+        let event = serde_json::from_slice::<ExistingAuditEvent>(&line).map_err(|source| {
             AuditError::CorruptLog {
                 path: path.to_owned(),
                 line: numbered_line,
                 source,
             }
         })?;
+        event.consume();
         line_number = line_number
             .checked_add(1)
             .expect("audit log line count should not overflow");
@@ -1637,7 +2063,7 @@ mod tests {
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
         AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
         ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
-        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
+        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
         validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
@@ -1963,6 +2389,139 @@ mod tests {
             AuditTarget::from_uri_parts("/v1/models", None),
             AuditDenialReason::MethodDenied,
         ))
+    }
+
+    /// Builds one valid serialized audit event line.
+    pub(super) fn serialized_denied_event_line() -> Vec<u8> {
+        let mut line = serde_json::to_vec(&denied_event()).expect("event should serialize");
+        line.push(b'\n');
+        line
+    }
+
+    /// Builds one valid serialized audit event value.
+    pub(super) fn serialized_denied_event_value() -> Value {
+        serde_json::from_slice(&serialized_denied_event_line())
+            .expect("serialized event line should parse as JSON")
+    }
+
+    /// Builds one valid serialized audit event line from a JSON value.
+    pub(super) fn serialized_event_value_line(value: &Value) -> Vec<u8> {
+        let mut line = serde_json::to_vec(value).expect("event value should serialize");
+        line.push(b'\n');
+        line
+    }
+
+    /// Builds one valid non-empty body summary JSON value.
+    pub(super) fn non_empty_body_value() -> Value {
+        Value::Object(Map::from_iter([
+            ("blake3".to_owned(), Value::String("0".repeat(64))),
+            ("bytes".to_owned(), Value::from(1_u64)),
+            ("state".to_owned(), Value::String("non_empty".to_owned())),
+        ]))
+    }
+
+    /// Builds one serialized audit event line with one field replaced.
+    pub(super) fn serialized_event_line_with_field(field: &'static str, value: Value) -> Vec<u8> {
+        let mut event = serialized_denied_event_value();
+        let object = event
+            .as_object_mut()
+            .expect("serialized event should be an object");
+        object.insert(field.to_owned(), value);
+        serialized_event_value_line(&event)
+    }
+
+    /// Builds one valid non-empty body summary with a custom digest.
+    fn non_empty_body_value_with_digest(digest: String) -> Value {
+        let mut body = non_empty_body_value();
+        body.as_object_mut()
+            .expect("body summary should be an object")
+            .insert("blake3".to_owned(), Value::String(digest));
+        body
+    }
+
+    /// Builds schema-invalid existing audit event lines.
+    pub(super) fn schema_invalid_existing_event_lines() -> [(&'static str, Vec<u8>); 14] {
+        let too_long_method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
+        let too_long_path = "x".repeat(MAX_ORIGIN_FORM_PATH_BYTES + 1);
+        let too_long_query = "x".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+        [
+            (
+                "empty method",
+                serialized_event_line_with_field("method", Value::String(String::new())),
+            ),
+            (
+                "too-long method",
+                serialized_event_line_with_field("method", Value::String(too_long_method)),
+            ),
+            (
+                "too-long path",
+                serialized_event_line_with_field("path", Value::String(too_long_path.clone())),
+            ),
+            (
+                "too-long query",
+                serialized_event_line_with_field("query", Value::String(too_long_query.clone())),
+            ),
+            (
+                "invalid body digest",
+                serialized_event_line_with_field(
+                    "request_body",
+                    non_empty_body_value_with_digest("g".repeat(64)),
+                ),
+            ),
+            (
+                "short body digest",
+                serialized_event_line_with_field(
+                    "request_body",
+                    non_empty_body_value_with_digest("0".repeat(63)),
+                ),
+            ),
+            (
+                "invalid request id",
+                serialized_event_line_with_field(
+                    "request_id",
+                    Value::String("req-not-a-request-id".to_owned()),
+                ),
+            ),
+            (
+                "short request id part",
+                serialized_event_line_with_field(
+                    "request_id",
+                    Value::String(
+                        "req-00000000000000-000000000000000b-0000000000000001".to_owned(),
+                    ),
+                ),
+            ),
+            (
+                "invalid status",
+                serialized_event_line_with_field("status", Value::from(99_u64)),
+            ),
+            (
+                "invalid timestamp",
+                serialized_event_line_with_field(
+                    "timestamp",
+                    Value::String("not-a-timestamp".to_owned()),
+                ),
+            ),
+            (
+                "invalid upstream origin",
+                serialized_event_line_with_field(
+                    "upstream_origin",
+                    Value::String("ftp://api.openai.com".to_owned()),
+                ),
+            ),
+            (
+                "too-long upstream path",
+                serialized_event_line_with_field("upstream_path", Value::String(too_long_path)),
+            ),
+            (
+                "too-long upstream query",
+                serialized_event_line_with_field("upstream_query", Value::String(too_long_query)),
+            ),
+            (
+                "invalid version",
+                serialized_event_line_with_field("version", Value::from(4_u64)),
+            ),
+        ]
     }
 
     /// Expected serialized empty body summary.
@@ -2522,7 +3081,8 @@ mod tests {
     async fn open_accepts_newline_terminated_audit_logs() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
-        fs::write(&audit_log, b"{\"version\":3}\n").expect("existing log should be written");
+        fs::write(&audit_log, serialized_denied_event_line())
+            .expect("existing log should be written");
         let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
         let writer = AuditWriter::open(&config)
             .await
@@ -2537,14 +3097,20 @@ mod tests {
         let mut lines = contents.lines();
         let first = lines.next().expect("existing audit line should remain");
         let second = lines.next().expect("appended audit line should exist");
+        let first_value: serde_json::Value =
+            serde_json::from_str(first).expect("existing audit line should remain valid JSON");
         let value: serde_json::Value =
             serde_json::from_str(second).expect("appended audit line should be valid JSON");
         let object = value
             .as_object()
             .expect("appended audit line should be an object");
         let decision = object.get("decision").expect("decision should exist");
+        let first_object = first_value
+            .as_object()
+            .expect("existing audit line should be an object");
+        let first_version = first_object.get("version").expect("version should exist");
 
-        assert_eq!(first, "{\"version\":3}");
+        assert_eq!(first_version, 3_u64);
         assert_eq!(decision, "denied");
         assert_eq!(lines.next(), None);
     }
@@ -2570,11 +3136,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_rejects_schema_invalid_audit_logs() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(&audit_log, b"{\"version\":3}\n").expect("schema-invalid log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        let first_line = NonZeroU64::new(1).expect("literal should be non-zero");
+        assert!(
+            matches!(
+                result,
+                Err(AuditError::CorruptLog { path, line, .. })
+                    if path == audit_log && line == first_line
+            ),
+            "schema-invalid logs should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_logs_with_non_empty_body_summaries() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let mut event = serialized_denied_event_value();
+        let object = event
+            .as_object_mut()
+            .expect("serialized event should be an object");
+        object.insert("request_body".to_owned(), non_empty_body_value());
+        object.insert("response_body".to_owned(), non_empty_body_value());
+        fs::write(&audit_log, serialized_event_value_line(&event))
+            .expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(
+            result.is_ok(),
+            "non-empty body summaries should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_rejects_schema_invalid_existing_audit_fields() {
+        for (case_name, contents) in schema_invalid_existing_event_lines() {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("schema-invalid log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            let first_line = NonZeroU64::new(1).expect("literal should be non-zero");
+            assert!(
+                matches!(
+                    result,
+                    Err(AuditError::CorruptLog {
+                        path,
+                        line: audit_line,
+                        ..
+                    }) if path == audit_log && audit_line == first_line
+                ),
+                "{case_name} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_type_invalid_existing_audit_fields() {
+        let mut invalid_request_body = non_empty_body_value();
+        invalid_request_body
+            .as_object_mut()
+            .expect("body summary should be an object")
+            .insert("blake3".to_owned(), Value::Bool(false));
+        let cases = [
+            (
+                "typed-invalid body digest",
+                serialized_event_line_with_field("request_body", invalid_request_body),
+            ),
+            (
+                "typed-invalid method",
+                serialized_event_line_with_field("method", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid path",
+                serialized_event_line_with_field("path", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid query",
+                serialized_event_line_with_field("query", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid request id",
+                serialized_event_line_with_field("request_id", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid status",
+                serialized_event_line_with_field("status", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid timestamp",
+                serialized_event_line_with_field("timestamp", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid upstream origin",
+                serialized_event_line_with_field("upstream_origin", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid upstream path",
+                serialized_event_line_with_field("upstream_path", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid upstream query",
+                serialized_event_line_with_field("upstream_query", Value::Bool(false)),
+            ),
+            (
+                "typed-invalid version",
+                serialized_event_line_with_field("version", Value::Bool(false)),
+            ),
+        ];
+
+        for (case_name, contents) in cases {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("type-invalid log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            assert!(
+                matches!(result, Err(AuditError::CorruptLog { path, .. }) if path == audit_log),
+                "{case_name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_request_ids_accept_only_emitted_shape() {
+        let accepted = "req-000000000000000a-000000000000000b-0000000000000001";
+        let rejected = [
+            "",
+            "req-",
+            "req-000000000000000a",
+            "req-000000000000000a-000000000000000b",
+            "req-00000000000000-000000000000000b-0000000000000001",
+            "req-000000000000000a-000000000000000b-0000000000000001-extra",
+            "req-000000000000000g-000000000000000b-0000000000000001",
+        ];
+
+        assert!(is_existing_request_id(accepted));
+        for value in rejected {
+            assert!(!is_existing_request_id(value));
+        }
+    }
+
+    #[tokio::test]
     async fn open_reports_the_corrupt_audit_log_line_number() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
-        fs::write(&audit_log, b"{\"version\":3}\nnot-json\n")
-            .expect("corrupt log should be written");
+        let mut contents = serialized_denied_event_line();
+        contents.extend_from_slice(b"not-json\n");
+        fs::write(&audit_log, contents).expect("corrupt log should be written");
         let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
 
         let result = AuditWriter::open(&config).await;
@@ -2693,11 +3415,14 @@ mod tests {
     #[tokio::test]
     async fn validate_existing_audit_events_reports_reader_errors() {
         let path = Path::new("audit.ndjson");
-        let mut initial_seek_reader =
-            TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::InitialSeek);
-        let mut read_reader = TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::Read);
+        let mut initial_seek_reader = TailReader::failing(
+            serialized_denied_event_line(),
+            TailReaderFailure::InitialSeek,
+        );
+        let mut read_reader =
+            TailReader::failing(serialized_denied_event_line(), TailReaderFailure::Read);
         let mut final_seek_reader =
-            TailReader::failing(*b"{\"version\":3}\n", TailReaderFailure::FinalSeek);
+            TailReader::failing(serialized_denied_event_line(), TailReaderFailure::FinalSeek);
 
         let initial_seek_result =
             validate_existing_audit_events(path, &mut initial_seek_reader).await;
@@ -2889,7 +3614,10 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::tests::{TailReader, TailReaderFailure};
+    use super::tests::{
+        TailReader, TailReaderFailure, non_empty_body_value, schema_invalid_existing_event_lines,
+        serialized_denied_event_line, serialized_denied_event_value, serialized_event_value_line,
+    };
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
@@ -3086,6 +3814,24 @@ mod proptests {
         UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse")
     }
 
+    /// Returns a denied audit event for writer proptests.
+    fn denied_audit_event() -> AuditEvent {
+        let request = AuditRequestInput::new(
+            Method::GET,
+            AuditTarget::from_uri_parts("/v1/models", None),
+            RequestId::from_parts(
+                &RunToken::for_test("000000000000000a-000000000000000b"),
+                NonZeroU64::new(1).expect("literal should be non-zero"),
+            ),
+            AuditBodySummary::empty(),
+            upstream_origin(),
+        );
+        AuditEvent::new(AuditEventInput::new(
+            request,
+            AuditOutcome::denied(AuditDenialReason::MethodDenied),
+        ))
+    }
+
     /// Returns an audit event byte limit large enough for open-only tests.
     fn roomy_event_limit() -> NonZeroUsize {
         NonZeroUsize::new(4096).expect("event limit should be non-zero")
@@ -3141,7 +3887,8 @@ mod proptests {
         let empty_log = directory.path().join("empty.ndjson");
         let complete_log = directory.path().join("complete.ndjson");
         let torn_log = directory.path().join("torn.ndjson");
-        fs::write(&complete_log, b"{\"version\":3}\n").expect("complete log should be written");
+        fs::write(&complete_log, serialized_denied_event_line())
+            .expect("complete log should be written");
         fs::write(&torn_log, b"{\"version\":3}").expect("torn log should be written");
 
         let empty_result = open_writer(&GatewayConfig::for_test(empty_log, roomy_event_limit()));
@@ -3157,6 +3904,80 @@ mod proptests {
         assert!(matches!(
             torn_result,
             Err(super::AuditError::TornLog { path }) if path == torn_log
+        ));
+    }
+
+    #[test]
+    fn existing_audit_log_schema_rejects_invalid_field_states() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let valid_log = directory.path().join("valid.ndjson");
+        let mut event = serialized_denied_event_value();
+        let object = event
+            .as_object_mut()
+            .expect("serialized event should be an object");
+        object.insert("request_body".to_owned(), non_empty_body_value());
+        fs::write(&valid_log, serialized_event_value_line(&event))
+            .expect("valid log should be written");
+
+        open_writer(&GatewayConfig::for_test(valid_log, roomy_event_limit()))
+            .expect("valid existing log should open");
+
+        for (index, (case_name, contents)) in schema_invalid_existing_event_lines()
+            .into_iter()
+            .enumerate()
+        {
+            let audit_log = directory.path().join(format!("invalid-{index}.ndjson"));
+            fs::write(&audit_log, contents).expect("invalid log should be written");
+
+            let result = open_writer(&GatewayConfig::for_test(
+                audit_log.clone(),
+                roomy_event_limit(),
+            ));
+
+            assert!(
+                matches!(
+                    result,
+                    Err(super::AuditError::CorruptLog { path, .. }) if path == audit_log
+                ),
+                "{case_name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn write_event_checks_serialized_size_bound_under_property_filter() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let accepted_log = directory.path().join("accepted.ndjson");
+        let rejected_log = directory.path().join("rejected.ndjson");
+        let event = denied_audit_event();
+        let exact_size = serde_json::to_vec(&event)
+            .expect("event should serialize")
+            .len()
+            .checked_add(1)
+            .expect("test event length should fit usize");
+        let exact_limit = NonZeroUsize::new(exact_size).expect("event length should be non-zero");
+        let too_small = exact_size
+            .checked_sub(1)
+            .and_then(NonZeroUsize::new)
+            .expect("test event should be longer than one byte");
+        let accepted_config = GatewayConfig::for_test(accepted_log, exact_limit);
+        let rejected_config = GatewayConfig::for_test(rejected_log, too_small);
+        let runtime = audit_runtime();
+
+        let accepted_writer = runtime
+            .block_on(AuditWriter::open(&accepted_config))
+            .expect("accepted writer should open");
+        let rejected_writer = runtime
+            .block_on(AuditWriter::open(&rejected_config))
+            .expect("rejected writer should open");
+        let accepted = runtime.block_on(accepted_writer.write_event(&event));
+        let rejected = runtime.block_on(rejected_writer.write_event(&event));
+
+        accepted.expect("event at exact limit should be accepted");
+        assert!(matches!(
+            rejected,
+            Err(super::AuditError::EventTooLarge { bytes, max })
+                if bytes == exact_size && max == too_small.get()
         ));
     }
 
