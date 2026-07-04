@@ -1565,10 +1565,49 @@ mod tests {
                 let run = run_generated_scenario(scenario.clone());
                 let result = prop_assert_scenario(&scenario, &run);
 
+                assert_eq!(scenario.class(), class);
                 assert!(
                     result.is_ok(),
                     "fault class {class:?} should satisfy invariants: {result:?}"
                 );
+            }
+
+            let request = ScenarioRequest::new(
+                b"default".to_vec(),
+                Vec::new(),
+                ScenarioTarget::models(None),
+            );
+            for (upstream, expected_class) in [
+                (
+                    ScenarioUpstream::BodyTimeout,
+                    ScenarioClass::UpstreamBodyTimeout {
+                        audit: ScenarioAudit::Record,
+                    },
+                ),
+                (
+                    ScenarioUpstream::Respond,
+                    ScenarioClass::UpstreamRespond {
+                        audit: ScenarioAudit::Record,
+                    },
+                ),
+                (
+                    ScenarioUpstream::StreamError,
+                    ScenarioClass::UpstreamStreamError {
+                        audit: ScenarioAudit::Record,
+                    },
+                ),
+                (
+                    ScenarioUpstream::Timeout,
+                    ScenarioClass::UpstreamTimeout {
+                        audit: ScenarioAudit::Record,
+                    },
+                ),
+            ] {
+                let scenario = Scenario::new(request.clone(), upstream);
+
+                assert_eq!(scenario.class(), expected_class);
+                assert_eq!(scenario.request(), &request);
+                assert_eq!(scenario.upstream(), upstream);
             }
         }
 

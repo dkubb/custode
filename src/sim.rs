@@ -74,18 +74,10 @@ pub(super) struct RecordedUpstreamRequest {
 /// One deterministic gateway scenario.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct Scenario {
-    /// Gateway admission state.
-    admission: ScenarioAdmission,
-    /// Audit sink behavior.
-    audit: ScenarioAudit,
-    /// Scenario byte bounds.
-    bounds: ScenarioBounds,
-    /// Downstream response consumption behavior.
-    downstream: ScenarioDownstream,
+    /// Reachable scenario fault class.
+    class: ScenarioClass,
     /// Harness request shape.
     request: ScenarioRequest,
-    /// Scripted upstream behavior.
-    upstream: ScenarioUpstream,
 }
 
 /// Reachable deterministic scenario fault classes.
@@ -492,38 +484,51 @@ impl Scenario {
     /// Returns the gateway admission state.
     #[must_use]
     pub(super) const fn admission(&self) -> ScenarioAdmission {
-        self.admission
+        self.class.admission()
     }
 
     /// Returns the audit sink behavior.
     #[must_use]
     pub(super) const fn audit(&self) -> ScenarioAudit {
-        self.audit
+        self.class.audit()
     }
 
     /// Returns the scenario byte bounds.
     #[must_use]
     pub(super) const fn bounds(&self) -> ScenarioBounds {
-        self.bounds
+        self.class.bounds()
+    }
+
+    /// Returns the reachable scenario fault class.
+    #[must_use]
+    pub(super) const fn class(&self) -> ScenarioClass {
+        self.class
     }
 
     /// Returns the downstream response consumption behavior.
     #[must_use]
     pub(super) const fn downstream(&self) -> ScenarioDownstream {
-        self.downstream
+        self.class.downstream()
     }
 
     /// Builds a deterministic gateway scenario.
     #[must_use]
     pub(super) const fn new(request: ScenarioRequest, upstream: ScenarioUpstream) -> Self {
-        Self {
-            admission: ScenarioAdmission::Open,
-            audit: ScenarioAudit::Record,
-            bounds: ScenarioBounds::Roomy,
-            downstream: ScenarioDownstream::ConsumeAll,
-            request,
-            upstream,
-        }
+        let class = match upstream {
+            ScenarioUpstream::BodyTimeout => ScenarioClass::UpstreamBodyTimeout {
+                audit: ScenarioAudit::Record,
+            },
+            ScenarioUpstream::Respond => ScenarioClass::UpstreamRespond {
+                audit: ScenarioAudit::Record,
+            },
+            ScenarioUpstream::StreamError => ScenarioClass::UpstreamStreamError {
+                audit: ScenarioAudit::Record,
+            },
+            ScenarioUpstream::Timeout => ScenarioClass::UpstreamTimeout {
+                audit: ScenarioAudit::Record,
+            },
+        };
+        Self { class, request }
     }
 
     /// Returns the harness request shape.
@@ -535,74 +540,13 @@ impl Scenario {
     /// Returns the scripted upstream behavior.
     #[must_use]
     pub(super) const fn upstream(&self) -> ScenarioUpstream {
-        self.upstream
+        self.class.upstream()
     }
 
     /// Builds a deterministic gateway scenario from a generated class.
     #[must_use]
     pub(super) const fn with_class(class: ScenarioClass, request: ScenarioRequest) -> Self {
-        match class {
-            ScenarioClass::DownstreamDisconnect {
-                audit,
-                downstream,
-                upstream,
-            } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: downstream.into_downstream(),
-                request,
-                upstream: upstream.into_upstream(),
-            },
-            ScenarioClass::PermitSaturated { audit } => Self {
-                admission: ScenarioAdmission::Saturated,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::Respond,
-            },
-            ScenarioClass::ResponseBodyTooLarge { audit } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::TinyResponse,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::Respond,
-            },
-            ScenarioClass::UpstreamBodyTimeout { audit } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::BodyTimeout,
-            },
-            ScenarioClass::UpstreamRespond { audit } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::Respond,
-            },
-            ScenarioClass::UpstreamStreamError { audit } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::StreamError,
-            },
-            ScenarioClass::UpstreamTimeout { audit } => Self {
-                admission: ScenarioAdmission::Open,
-                audit,
-                bounds: ScenarioBounds::Roomy,
-                downstream: ScenarioDownstream::ConsumeAll,
-                request,
-                upstream: ScenarioUpstream::Timeout,
-            },
-        }
+        Self { class, request }
     }
 }
 
@@ -612,6 +556,19 @@ impl ScenarioClass {
         + (ScenarioAudit::ALL.len()
             * ScenarioDisconnect::ALL.len()
             * ScenarioStartedUpstream::ALL.len());
+
+    /// Returns the derived gateway admission state.
+    const fn admission(self) -> ScenarioAdmission {
+        match self {
+            Self::DownstreamDisconnect { .. }
+            | Self::ResponseBodyTooLarge { .. }
+            | Self::UpstreamBodyTimeout { .. }
+            | Self::UpstreamRespond { .. }
+            | Self::UpstreamStreamError { .. }
+            | Self::UpstreamTimeout { .. } => ScenarioAdmission::Open,
+            Self::PermitSaturated { .. } => ScenarioAdmission::Saturated,
+        }
+    }
 
     /// Returns every scenario fault-class combination.
     #[must_use]
@@ -639,10 +596,62 @@ impl ScenarioClass {
         classes
     }
 
+    /// Returns the derived audit sink behavior.
+    const fn audit(self) -> ScenarioAudit {
+        match self {
+            Self::DownstreamDisconnect { audit, .. }
+            | Self::PermitSaturated { audit }
+            | Self::ResponseBodyTooLarge { audit }
+            | Self::UpstreamBodyTimeout { audit }
+            | Self::UpstreamRespond { audit }
+            | Self::UpstreamStreamError { audit }
+            | Self::UpstreamTimeout { audit } => audit,
+        }
+    }
+
+    /// Returns the derived response byte bounds.
+    const fn bounds(self) -> ScenarioBounds {
+        match self {
+            Self::ResponseBodyTooLarge { .. } => ScenarioBounds::TinyResponse,
+            Self::DownstreamDisconnect { .. }
+            | Self::PermitSaturated { .. }
+            | Self::UpstreamBodyTimeout { .. }
+            | Self::UpstreamRespond { .. }
+            | Self::UpstreamStreamError { .. }
+            | Self::UpstreamTimeout { .. } => ScenarioBounds::Roomy,
+        }
+    }
+
     /// Returns the derived number of reachable scenario classes.
     #[must_use]
     pub(super) const fn count() -> usize {
         Self::COUNT
+    }
+
+    /// Returns the derived downstream response consumption behavior.
+    const fn downstream(self) -> ScenarioDownstream {
+        match self {
+            Self::DownstreamDisconnect { downstream, .. } => downstream.into_downstream(),
+            Self::PermitSaturated { .. }
+            | Self::ResponseBodyTooLarge { .. }
+            | Self::UpstreamBodyTimeout { .. }
+            | Self::UpstreamRespond { .. }
+            | Self::UpstreamStreamError { .. }
+            | Self::UpstreamTimeout { .. } => ScenarioDownstream::ConsumeAll,
+        }
+    }
+
+    /// Returns the derived scripted upstream behavior.
+    const fn upstream(self) -> ScenarioUpstream {
+        match self {
+            Self::DownstreamDisconnect { upstream, .. } => upstream.into_upstream(),
+            Self::PermitSaturated { .. }
+            | Self::ResponseBodyTooLarge { .. }
+            | Self::UpstreamRespond { .. } => ScenarioUpstream::Respond,
+            Self::UpstreamBodyTimeout { .. } => ScenarioUpstream::BodyTimeout,
+            Self::UpstreamStreamError { .. } => ScenarioUpstream::StreamError,
+            Self::UpstreamTimeout { .. } => ScenarioUpstream::Timeout,
+        }
     }
 }
 
@@ -1103,13 +1112,75 @@ mod tests {
 
         for class in classes {
             let scenario = Scenario::with_class(class, request.clone());
+            let (
+                expected_admission,
+                expected_audit,
+                expected_bounds,
+                expected_downstream,
+                expected_upstream,
+            ) = match class {
+                ScenarioClass::DownstreamDisconnect {
+                    audit,
+                    downstream,
+                    upstream,
+                } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    downstream.into_downstream(),
+                    upstream.into_upstream(),
+                ),
+                ScenarioClass::PermitSaturated { audit } => (
+                    ScenarioAdmission::Saturated,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Respond,
+                ),
+                ScenarioClass::ResponseBodyTooLarge { audit } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::TinyResponse,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Respond,
+                ),
+                ScenarioClass::UpstreamBodyTimeout { audit } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::BodyTimeout,
+                ),
+                ScenarioClass::UpstreamRespond { audit } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Respond,
+                ),
+                ScenarioClass::UpstreamStreamError { audit } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::StreamError,
+                ),
+                ScenarioClass::UpstreamTimeout { audit } => (
+                    ScenarioAdmission::Open,
+                    audit,
+                    ScenarioBounds::Roomy,
+                    ScenarioDownstream::ConsumeAll,
+                    ScenarioUpstream::Timeout,
+                ),
+            };
 
+            assert_eq!(scenario.admission(), expected_admission);
+            assert_eq!(scenario.audit(), expected_audit);
+            assert_eq!(scenario.bounds(), expected_bounds);
+            assert_eq!(scenario.class(), class);
+            assert_eq!(scenario.downstream(), expected_downstream);
             assert_eq!(scenario.request(), &request);
-            match scenario.downstream() {
-                ScenarioDownstream::ConsumeAll
-                | ScenarioDownstream::DropBeforeFirstChunk
-                | ScenarioDownstream::DropBeforeFinalChunk => {}
-            }
+            assert_eq!(scenario.upstream(), expected_upstream);
         }
     }
 
@@ -1135,9 +1206,48 @@ mod tests {
         assert_eq!(scenario.admission(), ScenarioAdmission::Open);
         assert_eq!(scenario.audit(), ScenarioAudit::Record);
         assert_eq!(scenario.bounds(), ScenarioBounds::Roomy);
+        assert_eq!(
+            scenario.class(),
+            ScenarioClass::UpstreamRespond {
+                audit: ScenarioAudit::Record,
+            },
+        );
         assert_eq!(scenario.downstream(), ScenarioDownstream::ConsumeAll);
         assert_eq!(scenario.request(), &request);
         assert_eq!(scenario.upstream(), ScenarioUpstream::Respond);
+
+        for (upstream, expected_class) in [
+            (
+                ScenarioUpstream::BodyTimeout,
+                ScenarioClass::UpstreamBodyTimeout {
+                    audit: ScenarioAudit::Record,
+                },
+            ),
+            (
+                ScenarioUpstream::Respond,
+                ScenarioClass::UpstreamRespond {
+                    audit: ScenarioAudit::Record,
+                },
+            ),
+            (
+                ScenarioUpstream::StreamError,
+                ScenarioClass::UpstreamStreamError {
+                    audit: ScenarioAudit::Record,
+                },
+            ),
+            (
+                ScenarioUpstream::Timeout,
+                ScenarioClass::UpstreamTimeout {
+                    audit: ScenarioAudit::Record,
+                },
+            ),
+        ] {
+            let mapped_scenario = Scenario::new(request.clone(), upstream);
+
+            assert_eq!(mapped_scenario.class(), expected_class);
+            assert_eq!(mapped_scenario.request(), &request);
+            assert_eq!(mapped_scenario.upstream(), upstream);
+        }
     }
 
     #[tokio::test]
