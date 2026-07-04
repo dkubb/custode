@@ -12,7 +12,7 @@ use crate::ports::{
 };
 use crate::target::{
     OriginFormPath, OriginFormQuery,
-    testing::{origin_form_path_valid, origin_form_query_valid},
+    testing::{origin_form_path_valid, short_origin_form_query_valid},
 };
 use axum::body::Bytes;
 use core::future;
@@ -932,7 +932,7 @@ fn scenario_connection_value_any() -> impl Strategy<Value = String> {
 fn scenario_target_any() -> impl Strategy<Value = ScenarioTarget> {
     (
         origin_form_path_valid(),
-        prop_oneof![Just(None), origin_form_query_valid().prop_map(Some),],
+        prop_oneof![Just(None), short_origin_form_query_valid().prop_map(Some),],
     )
         .prop_map(|(path_text, query_chars)| {
             let path = OriginFormPath::parse(&path_text).expect("generated path should parse");

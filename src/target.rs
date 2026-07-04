@@ -356,6 +356,7 @@ const fn hex_value(byte: u8) -> Option<u8> {
 pub mod testing {
     //! Test-only generators for origin-form targets.
 
+    use super::MAX_ORIGIN_FORM_QUERY_BYTES;
     use proptest::collection;
     use proptest::prelude::*;
 
@@ -469,6 +470,11 @@ pub mod testing {
         ]
     }
 
+    /// Plain query strings spanning every accepted byte length.
+    fn query_length_valid() -> impl Strategy<Value = String> {
+        (1..=MAX_ORIGIN_FORM_QUERY_BYTES).prop_map(|len| "a".repeat(len))
+    }
+
     /// Valid path strings accepted as origin-form path witnesses.
     pub(crate) fn origin_form_path_valid() -> impl Strategy<Value = String> {
         prop_oneof![
@@ -479,20 +485,35 @@ pub mod testing {
         ]
     }
 
-    /// Valid query strings accepted as origin-form query witnesses.
-    pub(crate) fn origin_form_query_valid() -> impl Strategy<Value = String> {
+    /// Short valid query strings for scenarios that must stay compact.
+    pub(crate) fn short_origin_form_query_valid() -> impl Strategy<Value = String> {
         prop_oneof![
             Just(String::new()),
             collection::vec(query_atom_valid(), 1..=8).prop_map(|atoms| atoms.concat()),
         ]
     }
 
+    /// Valid query strings accepted as origin-form query witnesses.
+    pub(crate) fn origin_form_query_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => short_origin_form_query_valid(),
+            1 => query_length_valid(),
+            1 => Just("a".repeat(65)),
+            1 => Just("a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES)),
+        ]
+    }
+
     /// Accepted query strings whose raw spelling is preserved by `url::Url`.
     pub(crate) fn url_preserved_origin_form_query_valid() -> impl Strategy<Value = String> {
         prop_oneof![
-            Just(String::new()),
-            collection::vec(url_preserved_query_atom_valid(), 1..=8)
-                .prop_map(|atoms| atoms.concat()),
+            4 => prop_oneof![
+                Just(String::new()),
+                collection::vec(url_preserved_query_atom_valid(), 1..=8)
+                    .prop_map(|atoms| atoms.concat()),
+            ],
+            1 => query_length_valid(),
+            1 => Just("a".repeat(65)),
+            1 => Just("a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES)),
         ]
     }
 
@@ -501,7 +522,8 @@ pub mod testing {
         use super::super::{OriginFormPath, OriginFormQuery};
         use super::{
             format_percent_escape, origin_form_path_valid, origin_form_query_valid,
-            percent_escape_valid, url_preserved_origin_form_query_valid,
+            percent_escape_valid, short_origin_form_query_valid,
+            url_preserved_origin_form_query_valid,
         };
         use proptest::strategy::{Strategy as _, ValueTree as _};
         use proptest::test_runner::TestRunner;
@@ -526,6 +548,10 @@ pub mod testing {
             let mut runner = TestRunner::deterministic();
 
             for _sample in 0_u8..32 {
+                let short_query = short_origin_form_query_valid()
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
                 let query = origin_form_query_valid()
                     .new_tree(&mut runner)
                     .expect("strategy should generate")
@@ -535,6 +561,7 @@ pub mod testing {
                     .expect("strategy should generate")
                     .current();
 
+                OriginFormQuery::parse(&short_query).expect("generated short query should parse");
                 OriginFormQuery::parse(&query).expect("generated query should parse");
                 OriginFormQuery::parse(&url_preserved_query)
                     .expect("generated URL-preserved query should parse");
