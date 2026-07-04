@@ -646,10 +646,7 @@ async fn stream_upstream_response(
 
 /// Sends one generic terminal stream error without waiting for downstream space.
 fn try_send_terminal_stream_error(sender: &mpsc::Sender<Result<Bytes, io::Error>>) {
-    let send_result = sender.try_send(Err(io::Error::other(TERMINAL_STREAM_ABORT_ERROR)));
-    if send_result.is_err() {
-        tracing::debug!("failed to send terminal stream error");
-    }
+    let _send_result = sender.try_send(Err(io::Error::other(TERMINAL_STREAM_ABORT_ERROR)));
 }
 
 /// Logs a downstream-close audit failure.
@@ -2050,9 +2047,9 @@ mod tests {
         TERMINAL_STREAM_ABORT_ERROR, audit_denial_from_allowlist_rejection,
         audit_denial_from_request_body, audit_denial_from_request_header,
         audit_denial_from_target_rejection, audit_response_header_error, audit_upstream_error,
-        forward_request, is_fatal_request_failure, production_gateway, proxy, report_fatal_error,
-        response_stream, run_until_server_stops, send_stream_error, serve,
-        serve_with_adapter_result,
+        forward_request, is_fatal_request_failure, log_response_stream_timeout_audit_error,
+        production_gateway, proxy, report_fatal_error, response_stream, run_until_server_stops,
+        send_stream_error, serve, serve_with_adapter_result, try_send_terminal_stream_error,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -4683,6 +4680,24 @@ mod tests {
         send_stream_error(&sender, Ok(())).await;
 
         assert!(sender.is_closed(), "receiver should be gone");
+    }
+
+    #[test]
+    fn try_send_terminal_stream_error_tolerates_a_closed_receiver() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+
+        try_send_terminal_stream_error(&sender);
+
+        assert!(sender.is_closed(), "receiver should be gone");
+    }
+
+    #[test]
+    fn response_stream_timeout_audit_error_logger_accepts_failure() {
+        let _subscriber_guard: DefaultGuard =
+            set_default(fmt().with_max_level(Level::ERROR).finish());
+
+        log_response_stream_timeout_audit_error(&ResponseAuditFailure);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

@@ -203,9 +203,18 @@ const fn run_token_from_entropy(entropy: [u8; RUN_TOKEN_RANDOM_BYTES]) -> RunTok
 
 /// Reads run-token entropy from the operating system.
 fn read_run_token_entropy() -> Result<[u8; RUN_TOKEN_RANDOM_BYTES], getrandom::Error> {
+    read_run_token_entropy_with(getrandom::fill)
+}
+
+/// Reads run-token entropy with an injected fill function.
+fn read_run_token_entropy_with(
+    fill: fn(&mut [u8]) -> Result<(), getrandom::Error>,
+) -> Result<[u8; RUN_TOKEN_RANDOM_BYTES], getrandom::Error> {
     let mut entropy = [0; RUN_TOKEN_RANDOM_BYTES];
-    getrandom::fill(&mut entropy)?;
-    Ok(entropy)
+    match fill(&mut entropy) {
+        Ok(()) => Ok(entropy),
+        Err(error) => Err(error),
+    }
 }
 
 /// Creates a request id source build error from an entropy read error.
@@ -291,7 +300,8 @@ mod tests {
 
     use super::{
         RUN_TOKEN_RANDOM_BYTES, ReqwestErrorView, ReqwestUpstreamClient, SequentialRequestIds,
-        SystemClock, run_token_from_entropy, upstream_error_kind_from_reqwest,
+        SystemClock, read_run_token_entropy_with, run_token_from_entropy,
+        upstream_error_kind_from_reqwest,
     };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::audit::{RequestId, RunToken};
@@ -420,6 +430,25 @@ mod tests {
                 NonZeroU64::new(1).expect("literal should be non-zero"),
             ),
         );
+    }
+
+    #[test]
+    fn read_run_token_entropy_returns_filled_bytes() {
+        let entropy = read_run_token_entropy_with(|entropy| {
+            entropy.fill(0xA5);
+            Ok(())
+        })
+        .expect("entropy fill should succeed");
+
+        assert_eq!(entropy, [0xA5; RUN_TOKEN_RANDOM_BYTES]);
+    }
+
+    #[test]
+    fn read_run_token_entropy_reports_fill_errors() {
+        let error = read_run_token_entropy_with(|_entropy| Err(getrandom::Error::UNSUPPORTED))
+            .expect_err("entropy fill errors should be returned");
+
+        assert_eq!(error, getrandom::Error::UNSUPPORTED);
     }
 
     #[test]
