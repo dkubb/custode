@@ -2037,7 +2037,7 @@ mod tests {
             PathBuf::from("unused-audit.ndjson"),
             "https://api.openai.com",
         )
-        .with_allowed_operations(vec![allowed_operation]);
+        .with_allowed_operation(allowed_operation);
         if scenario.bounds() == ScenarioBounds::TinyResponse {
             config = config
                 .with_max_response_bytes(NonZeroU64::new(4).expect("literal should be non-zero"));

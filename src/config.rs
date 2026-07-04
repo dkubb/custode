@@ -782,14 +782,11 @@ impl GatewayConfig {
         &self.upstream_origin
     }
 
-    /// Returns this config with a replacement allowlist.
+    /// Returns this config with a singleton replacement allowlist.
     #[cfg(test)]
     #[must_use]
-    pub(crate) fn with_allowed_operations(
-        mut self,
-        allowed_operations: Vec<AllowedOperation>,
-    ) -> Self {
-        self.allowed_operations = allowed_operations;
+    pub(crate) fn with_allowed_operation(mut self, allowed_operation: AllowedOperation) -> Self {
+        self.allowed_operations = vec![allowed_operation];
         self
     }
 
