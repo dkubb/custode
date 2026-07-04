@@ -829,14 +829,15 @@ mod tests {
         use crate::http::TERMINAL_STREAM_ABORT_ERROR;
         use crate::ports::AuditSink as _;
         use crate::sim::{
-            MemoryAuditSink, Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds,
-            ScenarioClass, ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream,
-            scenario_any,
+            MAX_SCENARIO_BODY_BYTES, MemoryAuditSink, Scenario, ScenarioAdmission, ScenarioAudit,
+            ScenarioBody as ScenarioRequestBody, ScenarioBounds, ScenarioClass, ScenarioDownstream,
+            ScenarioRequest, ScenarioRequestError, ScenarioTarget, ScenarioUpstream, scenario_any,
         };
         use crate::target::{OriginFormPath, OriginFormQuery};
         use axum::body::Bytes;
         use core::num::{NonZeroU64, NonZeroUsize};
         use http::{Method, StatusCode, Uri};
+        use proptest::collection;
         use proptest::prelude::*;
         use serde_json::{Map, Value};
         use std::path::PathBuf;
@@ -1471,6 +1472,11 @@ mod tests {
             )
         }
 
+        /// Generates valid deterministic scenario body bytes.
+        fn valid_scenario_body_bytes_any() -> impl Strategy<Value = Vec<u8>> {
+            collection::vec(any::<u8>(), 0..(MAX_SCENARIO_BODY_BYTES + 1))
+        }
+
         proptest! {
             #![proptest_config(ProptestConfig {
                 cases: 32,
@@ -1500,6 +1506,35 @@ mod tests {
 
                 prop_assert_eq!(denial.status(), reason.status());
             }
+
+            #[test]
+            fn scenario_body_parser_accepts_valid_lengths(
+                bytes in valid_scenario_body_bytes_any(),
+            ) {
+                let body = ScenarioRequestBody::try_from_bytes(bytes.clone())
+                    .expect("valid body bytes should parse");
+
+                prop_assert_eq!(body.as_slice(), bytes.as_slice());
+            }
+
+            #[test]
+            fn scenario_body_parser_rejects_overlarge_lengths(
+                bytes in collection::vec(
+                    any::<u8>(),
+                    (MAX_SCENARIO_BODY_BYTES + 1)..(MAX_SCENARIO_BODY_BYTES + 33),
+                ),
+            ) {
+                let byte_count = bytes.len();
+
+                prop_assert_eq!(
+                    ScenarioRequestBody::try_from_bytes(bytes),
+                    Err(ScenarioRequestError::BodyTooLarge {
+                        bytes: byte_count,
+                        max: MAX_SCENARIO_BODY_BYTES,
+                    })
+                );
+            }
+
         }
 
         #[tokio::test]
