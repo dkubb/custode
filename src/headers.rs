@@ -185,7 +185,7 @@ fn request_header_is_forwarded(
     name: &HeaderName,
     connection_headers: &HashSet<HeaderName>,
 ) -> bool {
-    !is_hop_by_hop(name, connection_headers) && *name != HOST
+    !is_hop_by_hop(name, connection_headers) && *name != HOST && *name != CONTENT_LENGTH
 }
 
 /// Returns true when a response header is safe to forward downstream.
@@ -286,6 +286,22 @@ mod tests {
         );
         assert_eq!(forwarded.as_header_map().get(HOST), None);
         assert_eq!(forwarded.as_header_map().get(PROXY_AUTHORIZATION), None);
+    }
+
+    #[test]
+    fn request_headers_strip_content_length() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        headers.insert("x-visible", HeaderValue::from_static("ok"));
+
+        let forwarded =
+            forward_request_headers(&headers, request_limit(1024)).expect("headers should fit");
+
+        assert_eq!(forwarded.as_header_map().get(CONTENT_LENGTH), None);
+        assert_eq!(
+            forwarded.as_header_map().get("x-visible"),
+            Some(&HeaderValue::from_static("ok"))
+        );
     }
 
     #[test]
