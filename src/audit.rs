@@ -2000,12 +2000,16 @@ where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    if humantime::parse_rfc3339(&value).is_ok() {
+    let instant = humantime::parse_rfc3339(&value).map_err(|_error| {
+        D::Error::invalid_value(Unexpected::Str(&value), &"an RFC 3339 timestamp")
+    })?;
+    let canonical = humantime::format_rfc3339_nanos(instant).to_string();
+    if value == canonical {
         Ok(value)
     } else {
         Err(D::Error::invalid_value(
             Unexpected::Str(&value),
-            &"an RFC 3339 timestamp",
+            &"an RFC 3339 timestamp in audit nanosecond format",
         ))
     }
 }
@@ -2841,7 +2845,7 @@ mod tests {
     fn schema_invalid_existing_metadata_lines(
         too_long_path: String,
         too_long_query: String,
-    ) -> [(&'static str, Vec<u8>); 8] {
+    ) -> [(&'static str, Vec<u8>); 10] {
         [
             (
                 "invalid status",
@@ -2852,6 +2856,20 @@ mod tests {
                 serialized_event_line_with_field(
                     "timestamp",
                     Value::String("not-a-timestamp".to_owned()),
+                ),
+            ),
+            (
+                "non-canonical timestamp without nanos",
+                serialized_event_line_with_field(
+                    "timestamp",
+                    Value::String("1970-01-01T00:00:00Z".to_owned()),
+                ),
+            ),
+            (
+                "non-canonical timestamp with short fraction",
+                serialized_event_line_with_field(
+                    "timestamp",
+                    Value::String("1970-01-01T00:00:00.1Z".to_owned()),
                 ),
             ),
             (
