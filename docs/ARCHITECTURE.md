@@ -458,7 +458,9 @@ field is the failed allocation.
 If a bound is exceeded before response streaming starts, the gateway writes a
 denied or failure audit event and returns a typed HTTP error. If a bound is
 exceeded after response streaming starts, the gateway terminates the stream,
-writes a `response_error` audit event, and fails closed.
+writes a `response_error` audit event, and fails closed. Every post-start
+stream abort uses the same harness-visible stream error; the exact failure
+class is visible only in the audit event.
 
 If a required audit event cannot be written before a response to the harness
 has started, the gateway returns an HTTP 500 instead of an unaudited harness
