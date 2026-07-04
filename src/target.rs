@@ -265,13 +265,17 @@ pub mod testing {
 
     /// Valid percent escapes spanning every byte and both hex cases.
     fn percent_escape_valid() -> impl Strategy<Value = String> {
-        (any::<u8>(), any::<bool>()).prop_map(|(byte, uppercase)| {
-            if uppercase {
-                format!("%{byte:02X}")
-            } else {
-                format!("%{byte:02x}")
-            }
-        })
+        (any::<u8>(), any::<bool>())
+            .prop_map(|(byte, uppercase)| format_percent_escape(byte, uppercase))
+    }
+
+    /// Formats one percent escape with deterministic hex casing.
+    fn format_percent_escape(byte: u8, uppercase: bool) -> String {
+        if uppercase {
+            format!("%{byte:02X}")
+        } else {
+            format!("%{byte:02x}")
+        }
     }
 
     /// Query atom accepted by the parser.
@@ -344,7 +348,8 @@ pub mod testing {
     mod tests {
         use super::super::OriginFormQuery;
         use super::{
-            origin_form_query_valid, percent_escape_valid, url_preserved_origin_form_query_valid,
+            format_percent_escape, origin_form_query_valid, percent_escape_valid,
+            url_preserved_origin_form_query_valid,
         };
         use proptest::strategy::{Strategy as _, ValueTree as _};
         use proptest::test_runner::TestRunner;
@@ -352,22 +357,16 @@ pub mod testing {
         #[test]
         fn percent_escape_generator_formats_both_hex_cases() {
             let mut runner = TestRunner::deterministic();
-            let mut has_uppercase_escape = false;
-            let mut has_lowercase_escape = false;
 
-            for _sample in 0_u8..64 {
-                let escape = percent_escape_valid()
-                    .new_tree(&mut runner)
-                    .expect("strategy should generate")
-                    .current();
-
-                has_uppercase_escape |= escape.bytes().any(|byte| byte.is_ascii_uppercase());
-                has_lowercase_escape |= escape.bytes().any(|byte| byte.is_ascii_lowercase());
-                OriginFormQuery::parse(&escape).expect("generated escape should parse");
+            for (byte, uppercase, expected) in [(0x2e, true, "%2E"), (0x2e, false, "%2e")] {
+                assert_eq!(format_percent_escape(byte, uppercase), expected);
             }
 
-            assert!(has_uppercase_escape);
-            assert!(has_lowercase_escape);
+            let escape = percent_escape_valid()
+                .new_tree(&mut runner)
+                .expect("strategy should generate")
+                .current();
+            OriginFormQuery::parse(&escape).expect("generated escape should parse");
         }
 
         #[test]

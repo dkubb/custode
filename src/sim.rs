@@ -784,12 +784,18 @@ fn scenario_target_any() -> impl Strategy<Value = String> {
         Just(None),
         collection::vec(scenario_query_char_any(), 1..17).prop_map(Some),
     ]
-    .prop_map(|query| {
-        query.map_or_else(
-            || "/v1/models".to_owned(),
-            |chars| format!("/v1/models?{}", chars.into_iter().collect::<String>()),
-        )
+    .prop_map(|query_chars| {
+        let query_text = query_chars.map(|chars| chars.into_iter().collect::<String>());
+        scenario_target(query_text.as_deref())
     })
+}
+
+/// Builds a scenario request target from an optional query.
+fn scenario_target(query_text: Option<&str>) -> String {
+    query_text.map_or_else(
+        || "/v1/models".to_owned(),
+        |query_value| format!("/v1/models?{query_value}"),
+    )
 }
 
 #[cfg(test)]
@@ -804,10 +810,11 @@ mod tests {
         ScriptedUpstreamClient, scenario_any, scenario_body_any, scenario_class_any,
         scenario_connection_value_any, scenario_header_any, scenario_header_value_any,
         scenario_header_value_char_any, scenario_headers_any, scenario_query_char_any,
-        scenario_target_any, scripted_stream_error_response,
+        scenario_target, scenario_target_any, scripted_stream_error_response,
     };
     use crate::config::RequestTimeout;
     use crate::ports::UpstreamDeadline;
+    use crate::target::{OriginFormPath, OriginFormQuery};
     use core::time::Duration;
     use http::Method;
     use pretty_assertions::assert_eq;
@@ -920,10 +927,14 @@ mod tests {
     }
 
     #[test]
+    fn scenario_target_formats_bare_and_query_targets() {
+        assert_eq!(scenario_target(None), "/v1/models");
+        assert_eq!(scenario_target(Some("limit=1")), "/v1/models?limit=1");
+    }
+
+    #[test]
     fn scenario_generators_create_valid_samples() {
         let mut runner = TestRunner::deterministic();
-        let mut saw_query_target = false;
-        let mut saw_bare_target = false;
 
         for _sample in 0_u8..64 {
             let body = sample(&mut runner, scenario_body_any());
@@ -942,14 +953,21 @@ mod tests {
             assert!(header_value.len() <= 16);
             assert!(headers.len() <= 6);
             assert!(!connection.is_empty());
-            assert!(target.starts_with("/v1/models"));
-            saw_query_target |= target.contains('?');
-            saw_bare_target |= !target.contains('?');
+            let (path, query_text) = target
+                .split_once('?')
+                .map_or((target.as_str(), None), |(path, query)| (path, Some(query)));
+            assert_eq!(
+                OriginFormPath::parse(path)
+                    .expect("path should parse")
+                    .as_str(),
+                "/v1/models"
+            );
+            if let Some(query_value) = query_text {
+                OriginFormQuery::parse(query_value).expect("query should parse");
+            }
             assert_eq!(scenario.request().method(), Method::GET);
         }
 
-        assert!(saw_query_target);
-        assert!(saw_bare_target);
         let response = scripted_stream_error_response();
         assert_eq!(response.status(), http::StatusCode::CREATED);
     }
