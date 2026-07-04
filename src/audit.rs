@@ -4452,6 +4452,43 @@ mod tests {
         ])
     }
 
+    /// Builds valid upstream-error existing audit event lines.
+    pub(super) fn upstream_error_existing_event_lines() -> [(&'static str, Vec<u8>); 3] {
+        [
+            (
+                "upstream connect failed",
+                upstream_error_existing_event_line(
+                    "upstream_connect_failed",
+                    StatusCode::BAD_GATEWAY,
+                ),
+            ),
+            (
+                "upstream request failed",
+                upstream_error_existing_event_line(
+                    "upstream_request_failed",
+                    StatusCode::BAD_GATEWAY,
+                ),
+            ),
+            (
+                "upstream timeout",
+                upstream_error_existing_event_line("upstream_timeout", StatusCode::GATEWAY_TIMEOUT),
+            ),
+        ]
+    }
+
+    /// Builds one valid upstream-error existing audit event line.
+    fn upstream_error_existing_event_line(
+        error_class: &'static str,
+        status: StatusCode,
+    ) -> Vec<u8> {
+        serialized_event_line_with_fields([
+            ("decision", Value::String("upstream_error".to_owned())),
+            ("error_class", Value::String(error_class.to_owned())),
+            ("status", Value::from(status.as_u16())),
+            ("upstream_path", Value::String("/v1/models".to_owned())),
+        ])
+    }
+
     /// Builds response-level semantically invalid header/downstream lines.
     fn semantic_invalid_response_header_lines() -> [(&'static str, Vec<u8>); 4] {
         [
@@ -5569,6 +5606,91 @@ mod tests {
     }
 
     #[test]
+    pub(super) fn existing_error_class_guard_binds_decisions() {
+        let cases = [
+            (ExistingAuditDecision::Allowed, None, Ok(None)),
+            (
+                ExistingAuditDecision::Allowed,
+                Some(ExistingAuditErrorClass::MethodDenied),
+                Err("allowed audit events must not have an error class"),
+            ),
+            (
+                ExistingAuditDecision::Denied,
+                Some(ExistingAuditErrorClass::MethodDenied),
+                Ok(Some(ExistingAuditErrorClass::MethodDenied)),
+            ),
+            (
+                ExistingAuditDecision::Denied,
+                Some(ExistingAuditErrorClass::ResponseHeadersTooLarge),
+                Err("audit error class does not match decision"),
+            ),
+            (
+                ExistingAuditDecision::Denied,
+                None,
+                Err("failed audit events must have an error class"),
+            ),
+            (
+                ExistingAuditDecision::ResponseError,
+                Some(ExistingAuditErrorClass::DownstreamClosed),
+                Ok(Some(ExistingAuditErrorClass::DownstreamClosed)),
+            ),
+            (
+                ExistingAuditDecision::ResponseError,
+                Some(ExistingAuditErrorClass::UpstreamTimeout),
+                Err("audit error class does not match decision"),
+            ),
+            (
+                ExistingAuditDecision::ResponseError,
+                None,
+                Err("failed audit events must have an error class"),
+            ),
+            (
+                ExistingAuditDecision::UpstreamError,
+                Some(ExistingAuditErrorClass::UpstreamTimeout),
+                Ok(Some(ExistingAuditErrorClass::UpstreamTimeout)),
+            ),
+            (
+                ExistingAuditDecision::UpstreamError,
+                Some(ExistingAuditErrorClass::DownstreamClosed),
+                Err("audit error class does not match decision"),
+            ),
+            (
+                ExistingAuditDecision::UpstreamError,
+                None,
+                Err("failed audit events must have an error class"),
+            ),
+        ];
+
+        for (decision, error_class, expected) in cases {
+            let fields = existing_error_class_fields(decision, error_class);
+
+            assert_eq!(fields.validate_error_class(), expected);
+        }
+    }
+
+    fn existing_error_class_fields(
+        decision: ExistingAuditDecision,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> ExistingAuditEventFields {
+        ExistingAuditEventFields {
+            decision,
+            error_class,
+            method: "GET".to_owned(),
+            path: "/v1/models".to_owned(),
+            query: None,
+            request_body: ExistingAuditBodySummary::Empty,
+            request_id: "req-000000000000000a-000000000000000b-0000000000000001".to_owned(),
+            response_body: ExistingAuditBodySummary::NotObserved,
+            status: StatusCode::OK,
+            timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
+            upstream_origin: upstream_origin(),
+            upstream_path: None,
+            upstream_query: None,
+            version: AuditSchemaVersion::CURRENT,
+        }
+    }
+
+    #[test]
     fn event_serializes_documented_fields_and_null_semantics() {
         let input = denied_input(
             "DELETE",
@@ -6035,6 +6157,20 @@ mod tests {
     #[tokio::test]
     async fn open_accepts_existing_response_error_shapes() {
         for (case_name, contents) in response_error_existing_event_lines() {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("existing log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            assert!(result.is_ok(), "{case_name} should be accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_upstream_error_shapes() {
+        for (case_name, contents) in upstream_error_existing_event_lines() {
             let directory = tempdir().expect("temporary directory should be created");
             let audit_log = directory.path().join("audit.ndjson");
             fs::write(&audit_log, contents).expect("existing log should be written");
@@ -6610,6 +6746,7 @@ mod proptests {
         existing_denial_error_classes_bind_statuses,
         existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
+        existing_error_class_guard_binds_decisions,
         existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
         existing_upstream_error_classes_bind_statuses, non_empty_body_value,
@@ -6617,7 +6754,7 @@ mod proptests {
         required_nullable_fields_deserialize_present_values, response_error_existing_event_lines,
         schema_invalid_existing_event_lines, semantic_invalid_existing_event_lines,
         serialized_denied_event_line, serialized_denied_event_value, serialized_event_value_line,
-        truncated_audit_methods_reject_non_writer_shapes,
+        truncated_audit_methods_reject_non_writer_shapes, upstream_error_existing_event_lines,
     };
     use super::{
         AcceptedAuditTarget, AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent,
@@ -7137,6 +7274,22 @@ mod proptests {
         ));
     }
 
+    /// Asserts that each existing audit log fixture opens successfully.
+    fn assert_existing_logs_accept(
+        directory: &Path,
+        filename_prefix: &str,
+        cases: impl IntoIterator<Item = (&'static str, Vec<u8>)>,
+    ) {
+        for (index, (case_name, contents)) in cases.into_iter().enumerate() {
+            assert_existing_log_accepts(
+                directory,
+                format!("{filename_prefix}-{index}.ndjson"),
+                contents,
+                case_name,
+            );
+        }
+    }
+
     #[test]
     fn existing_audit_log_schema_rejects_invalid_field_states() {
         let directory = tempdir().expect("temporary directory should be created");
@@ -7192,27 +7345,21 @@ mod proptests {
         ))
         .expect("valid query-bearing existing log should open");
 
-        for (index, (case_name, contents)) in denial_existing_event_lines().into_iter().enumerate()
-        {
-            assert_existing_log_accepts(
-                directory.path(),
-                format!("valid-denial-shape-{index}.ndjson"),
-                contents,
-                case_name,
-            );
-        }
-
-        for (index, (case_name, contents)) in response_error_existing_event_lines()
-            .into_iter()
-            .enumerate()
-        {
-            assert_existing_log_accepts(
-                directory.path(),
-                format!("valid-response-error-{index}.ndjson"),
-                contents,
-                case_name,
-            );
-        }
+        assert_existing_logs_accept(
+            directory.path(),
+            "valid-denial-shape",
+            denial_existing_event_lines(),
+        );
+        assert_existing_logs_accept(
+            directory.path(),
+            "valid-response-error",
+            response_error_existing_event_lines(),
+        );
+        assert_existing_logs_accept(
+            directory.path(),
+            "valid-upstream-error",
+            upstream_error_existing_event_lines(),
+        );
 
         for (index, (case_name, contents)) in schema_invalid_existing_event_lines()
             .into_iter()
@@ -7244,6 +7391,7 @@ mod proptests {
         existing_denial_error_classes_bind_statuses();
         existing_denied_target_distinguishes_authority_targets();
         existing_denied_target_rejects_non_denial_error_classes();
+        existing_error_class_guard_binds_decisions();
         existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
         existing_upstream_error_classes_bind_statuses();
