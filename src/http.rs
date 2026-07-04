@@ -911,6 +911,10 @@ mod tests {
         /// Expected fatal error for the deterministic audit sink failure.
         const EXPECTED_FATAL_AUDIT_WRITE_ERROR: &str =
             "failed to write audit event: scripted audit failure";
+        /// Expected empty fatal-error sequence.
+        const EXPECTED_NO_FATAL_ERRORS: &[&str] = &[];
+        /// Expected fatal-error sequence for one audit write failure.
+        const EXPECTED_FATAL_AUDIT_WRITE_ERRORS: &[&str] = &[EXPECTED_FATAL_AUDIT_WRITE_ERROR];
 
         /// Returns one denial reason by index.
         const fn denial_reason(index: u8) -> AuditDenialReason {
@@ -1192,12 +1196,16 @@ mod tests {
             }
         }
 
-        /// Returns the exact fatal post-start error expected for a scenario.
-        fn expected_fatal_error(scenario: &Scenario) -> Option<&'static str> {
-            (scenario.admission() == ScenarioAdmission::Open
+        /// Returns the exact fatal post-start errors expected for a scenario.
+        fn expected_fatal_errors(scenario: &Scenario) -> &'static [&'static str] {
+            if scenario.admission() == ScenarioAdmission::Open
                 && scenario.audit() == ScenarioAudit::FailFirst
-                && scenario.upstream() != ScenarioUpstream::Timeout)
-                .then_some(EXPECTED_FATAL_AUDIT_WRITE_ERROR)
+                && scenario.upstream() != ScenarioUpstream::Timeout
+            {
+                EXPECTED_FATAL_AUDIT_WRITE_ERRORS
+            } else {
+                EXPECTED_NO_FATAL_ERRORS
+            }
         }
 
         /// Returns the expected status for the harness response.
@@ -1374,7 +1382,11 @@ mod tests {
         ) -> Result<(), TestCaseError> {
             prop_assert_eq!(run.status, expected_status(scenario));
             prop_assert_eq!(&run.response_body, &expected_body(scenario));
-            prop_assert_eq!(run.fatal_error.as_deref(), expected_fatal_error(scenario));
+            let expected_fatal_errors = expected_fatal_errors(scenario);
+            prop_assert_eq!(run.fatal_errors.len(), expected_fatal_errors.len());
+            for (actual, expected) in run.fatal_errors.iter().zip(expected_fatal_errors) {
+                prop_assert_eq!(actual.as_str(), *expected);
+            }
             Ok(())
         }
 
@@ -1530,8 +1542,8 @@ mod tests {
                 assert_eq!(run.audit_attempts, 0);
                 assert!(run.upstream_requests.is_empty());
                 assert_eq!(
-                    run.fatal_error.as_deref(),
-                    Some("request id sequence exhausted")
+                    run.fatal_errors,
+                    ["request id sequence exhausted".to_owned()]
                 );
             }
         }
@@ -1617,8 +1629,8 @@ mod tests {
         audit_events: Vec<Value>,
         /// Upstream deadline used by the gateway.
         deadline: UpstreamDeadline,
-        /// Fatal gateway error reported after response start.
-        fatal_error: Option<String>,
+        /// Fatal gateway errors reported after response start.
+        fatal_errors: Vec<String>,
         /// Captured response body outcome.
         response_body: ScenarioBody,
         /// Captured response status.
@@ -2116,16 +2128,13 @@ mod tests {
             .clone();
         yield_now().await;
         let audit_attempts = audit_observer.event_count();
-        let fatal_error = fatal_receiver
-            .try_recv()
-            .ok()
-            .map(|error| error.to_string());
+        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver);
 
         ScenarioRun {
             audit_attempts,
             audit_events: captured_audit_events,
             deadline,
-            fatal_error,
+            fatal_errors: reported_fatal_errors,
             response_body,
             status,
             upstream_requests: captured_upstream_requests,
@@ -2170,20 +2179,28 @@ mod tests {
             .clone();
         yield_now().await;
         let audit_attempts = audit_observer.event_count();
-        let fatal_error = fatal_receiver
-            .try_recv()
-            .ok()
-            .map(|error| error.to_string());
+        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver);
 
         ScenarioRun {
             audit_attempts,
             audit_events: captured_audit_events,
             deadline,
-            fatal_error,
+            fatal_errors: reported_fatal_errors,
             response_body,
             status,
             upstream_requests: captured_upstream_requests,
         }
+    }
+
+    /// Drains every currently reported fatal error from a test receiver.
+    fn drain_fatal_errors(
+        fatal_receiver: &mut mpsc::UnboundedReceiver<GatewayError>,
+    ) -> Vec<String> {
+        let mut errors = Vec::new();
+        while let Ok(error) = fatal_receiver.try_recv() {
+            errors.push(error.to_string());
+        }
+        errors
     }
 
     /// Consumes a scenario response according to downstream behavior.
@@ -2311,7 +2328,7 @@ mod tests {
             run.response_body,
             ScenarioBody::Complete(Bytes::from_static(b"scripted"))
         );
-        assert_eq!(run.fatal_error, None);
+        assert!(run.fatal_errors.is_empty());
         assert_eq!(
             run.upstream_requests,
             [RecordedUpstreamRequest::new(
@@ -2348,7 +2365,7 @@ mod tests {
             run.response_body,
             ScenarioBody::Error("upstream_response_stream_failed".to_owned())
         );
-        assert_eq!(run.fatal_error, None);
+        assert!(run.fatal_errors.is_empty());
         assert_eq!(run.upstream_requests.len(), 1);
         assert_eq!(run.audit_events.len(), 1);
         let event = run
@@ -2387,7 +2404,7 @@ mod tests {
             run.response_body,
             ScenarioBody::Error("upstream_response_timeout".to_owned())
         );
-        assert_eq!(run.fatal_error, None);
+        assert!(run.fatal_errors.is_empty());
         assert_eq!(run.upstream_requests.len(), 1);
         assert_eq!(run.audit_events.len(), 1);
         let event = run
