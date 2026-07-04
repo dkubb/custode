@@ -28,6 +28,7 @@ use axum::response::IntoResponse as _;
 use axum::{Router, routing::any};
 use core::convert::Infallible;
 use core::future::{Future, IntoFuture as _};
+use core::num::NonZeroUsize;
 use core::pin::Pin;
 use futures_util::StreamExt as _;
 use futures_util::future::{self, Either};
@@ -43,7 +44,8 @@ use tokio_stream::wrappers::ReceiverStream;
 /// Harness-visible stream error used for every post-start stream abort.
 const TERMINAL_STREAM_ABORT_ERROR: &str = "response_stream_aborted";
 /// Bounded queue between upstream response reads and downstream response writes.
-const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 8;
+const RESPONSE_STREAM_CHANNEL_CAPACITY: NonZeroUsize =
+    NonZeroUsize::new(8).expect("response stream channel capacity should be non-zero");
 
 /// Serving runtime error.
 #[derive(Debug, Error)]
@@ -537,7 +539,7 @@ fn response_stream(
     permit: OwnedSemaphorePermit,
 ) -> ReceiverStream<Result<Bytes, io::Error>> {
     let response_timeout = context.gateway.config().request_timeout().as_duration();
-    let (sender, receiver) = mpsc::channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
+    let (sender, receiver) = mpsc::channel(RESPONSE_STREAM_CHANNEL_CAPACITY.get());
 
     tokio::spawn(async move {
         let _permit = permit;
@@ -4845,7 +4847,7 @@ mod tests {
         let (audit, audit_events) = MemoryAuditSink::new();
         let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
-        let chunk_count = RESPONSE_STREAM_CHANNEL_CAPACITY + 2;
+        let chunk_count = RESPONSE_STREAM_CHANNEL_CAPACITY.get() + 2;
         let upstream_body = stream::iter((0..chunk_count).map(|index| {
             let byte = u8::try_from(index).expect("test chunk index should fit in a byte");
             Ok::<Bytes, UpstreamBodyError>(Bytes::from(vec![byte]))
@@ -4878,7 +4880,7 @@ mod tests {
             .lock()
             .expect("memory audit sink should not be poisoned")
             .clone();
-        let observed_body: Vec<u8> = (0..=RESPONSE_STREAM_CHANNEL_CAPACITY)
+        let observed_body: Vec<u8> = (0..=RESPONSE_STREAM_CHANNEL_CAPACITY.get())
             .map(|index| u8::try_from(index).expect("test chunk index should fit in a byte"))
             .collect();
         assert_eq!(events.len(), 1);
