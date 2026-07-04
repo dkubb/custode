@@ -564,7 +564,6 @@ fn response_stream(
             pending = Some(chunk);
         }
 
-        let body_completed = pending.is_some();
         if let Some(final_chunk) = pending
             && sender.send(Ok(final_chunk)).await.is_err()
         {
@@ -580,9 +579,7 @@ fn response_stream(
         let audit_result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
-        if let Err(error) = audit_result
-            && !body_completed
-        {
+        if let Err(error) = audit_result {
             send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
         }
     });
@@ -953,31 +950,17 @@ mod tests {
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::FailFirst,
-                    ScenarioBounds::Roomy,
+                    ScenarioBounds::Roomy | ScenarioBounds::TinyResponse,
                     _,
-                    ScenarioUpstream::Respond,
-                )
-                | (
+                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                ) => ScenarioBody::Error("audit_failed".to_owned()),
+                (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
                     ScenarioBounds::Roomy,
                     ScenarioDownstream::ConsumeAll,
                     ScenarioUpstream::Respond,
                 ) => ScenarioBody::Complete(Bytes::from_static(b"scripted")),
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::FailFirst,
-                    ScenarioBounds::Roomy,
-                    _,
-                    ScenarioUpstream::StreamError,
-                )
-                | (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::FailFirst,
-                    ScenarioBounds::TinyResponse,
-                    _,
-                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
-                ) => ScenarioBody::Error("audit_failed".to_owned()),
                 (
                     ScenarioAdmission::Open,
                     ScenarioAudit::Record,
@@ -2724,10 +2707,10 @@ mod tests {
             .await
             .expect("proxy should respond");
 
-        let body = to_bytes(response.into_body(), 1_024)
+        let error = to_bytes(response.into_body(), 1_024)
             .await
-            .expect("response body should complete before the audit failure is fatal");
-        assert_eq!(body, Bytes::from_static(b"hello"));
+            .expect_err("completion audit failure should fail the response body");
+        assert_eq!(error.to_string(), "audit_failed");
         let fatal = fatal_receiver
             .recv()
             .await
@@ -3446,9 +3429,15 @@ mod tests {
             .expect("final chunk should be ok");
 
         assert_eq!(chunk, Bytes::from_static(b"final"));
+        let terminal = response_body
+            .next()
+            .await
+            .expect("audit failure should be sent after final chunk");
+        let error = terminal.expect_err("terminal item should be an audit error");
+        assert_eq!(error.to_string(), "audit_failed");
         assert!(
             response_body.next().await.is_none(),
-            "stream should close after final chunk"
+            "stream should close after terminal error"
         );
         assert_eq!(audit_observer.event_count(), 1);
         let events = audit_events
