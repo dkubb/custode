@@ -35,14 +35,25 @@ pub(super) struct FixedClock;
 /// In-memory audit sink used by deterministic handler tests.
 #[derive(Clone, Debug)]
 pub(super) struct MemoryAuditSink {
+    /// Simulated audit sink behavior.
+    behavior: MemoryAuditBehavior,
     /// Number of audit events observed by this sink.
     event_count: Arc<Mutex<usize>>,
     /// Captured serialized audit events.
     events: Arc<Mutex<Vec<Value>>>,
-    /// Audit event ordinal that should fail instead of recording.
-    fail_on_event: Option<NonZeroUsize>,
-    /// Optional serialized audit event byte limit.
-    max_event_bytes: Option<NonZeroUsize>,
+}
+
+/// Closed in-memory audit sink behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MemoryAuditBehavior {
+    /// Fail on the supplied audit event ordinal.
+    FailOn(NonZeroUsize),
+
+    /// Reject serialized audit events above the supplied byte limit.
+    LimitBytes(NonZeroUsize),
+
+    /// Record all audit events.
+    Record,
 }
 
 /// Request observed by the scripted upstream client.
@@ -321,24 +332,26 @@ impl AuditSink for MemoryAuditSink {
             *count = next;
             next
         };
-        let should_fail = self
-            .fail_on_event
-            .is_some_and(|fail_on| fail_on.get() == event_number);
-        if should_fail {
-            return Box::pin(future::ready(Err(AuditError::Write(io::Error::other(
-                "scripted audit failure",
-            )))));
-        }
-        if let Some(max_event_bytes) = self.max_event_bytes {
-            let bytes = serde_json::to_vec(event)
-                .expect("audit events contain only infallible JSON values")
-                .len()
-                .checked_add(1)
-                .expect("serialized audit event length should not overflow");
-            let max = max_event_bytes.get();
-            if bytes > max {
-                return Box::pin(future::ready(Err(AuditError::EventTooLarge { bytes, max })));
+        match self.behavior {
+            MemoryAuditBehavior::FailOn(fail_on) => {
+                if fail_on.get() == event_number {
+                    return Box::pin(future::ready(Err(AuditError::Write(io::Error::other(
+                        "scripted audit failure",
+                    )))));
+                }
             }
+            MemoryAuditBehavior::LimitBytes(max_event_bytes) => {
+                let bytes = serde_json::to_vec(event)
+                    .expect("audit events contain only infallible JSON values")
+                    .len()
+                    .checked_add(1)
+                    .expect("serialized audit event length should not overflow");
+                let max = max_event_bytes.get();
+                if bytes > max {
+                    return Box::pin(future::ready(Err(AuditError::EventTooLarge { bytes, max })));
+                }
+            }
+            MemoryAuditBehavior::Record => {}
         }
         let value =
             serde_json::to_value(event).expect("audit events contain only infallible JSON values");
@@ -372,10 +385,9 @@ impl MemoryAuditSink {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
+                behavior: MemoryAuditBehavior::FailOn(event),
                 event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
-                fail_on_event: Some(event),
-                max_event_bytes: None,
             },
             events,
         )
@@ -403,10 +415,9 @@ impl MemoryAuditSink {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
+                behavior: MemoryAuditBehavior::LimitBytes(max_event_bytes),
                 event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
-                fail_on_event: None,
-                max_event_bytes: Some(max_event_bytes),
             },
             events,
         )
@@ -418,10 +429,9 @@ impl MemoryAuditSink {
         let events = Arc::new(Mutex::new(Vec::new()));
         (
             Self {
+                behavior: MemoryAuditBehavior::Record,
                 event_count: Arc::new(Mutex::new(0)),
                 events: Arc::clone(&events),
-                fail_on_event: None,
-                max_event_bytes: None,
             },
             events,
         )
