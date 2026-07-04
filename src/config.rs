@@ -3,6 +3,7 @@
 use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
 use ::http::Method;
 use clap::Args;
+use core::cmp::Ordering;
 use core::net::SocketAddr;
 use core::num::{NonZeroU64, NonZeroUsize};
 use core::time::Duration;
@@ -127,6 +128,13 @@ pub(crate) enum ConfigError {
         min: u128,
         /// Supplied value.
         value: u128,
+    },
+
+    /// Operation was configured more than once.
+    #[error("duplicate allowed operation {operation:?}")]
+    DuplicateAllowedOperation {
+        /// Duplicate operation.
+        operation: String,
     },
 
     /// No operations were configured.
@@ -359,6 +367,15 @@ pub(crate) struct UpstreamOrigin {
 }
 
 impl AllowedOperation {
+    /// Compares operations by their canonical configuration order.
+    fn cmp_config(&self, other: &Self) -> Ordering {
+        self.method
+            .as_str()
+            .cmp(other.method.as_str())
+            .then_with(|| self.path.kind.sort_rank().cmp(&other.path.kind.sort_rank()))
+            .then_with(|| self.path.value.as_str().cmp(other.path.value.as_str()))
+    }
+
     /// Returns true if this operation has the supplied method.
     #[must_use]
     pub(crate) fn has_method(&self, method: &Method) -> bool {
@@ -414,6 +431,16 @@ impl AllowedOperation {
 
         Ok(Self { method, path })
     }
+
+    /// Returns this operation in canonical configuration form.
+    fn to_config_text(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.method.as_str(),
+            self.path.kind.as_str(),
+            self.path.value.as_str()
+        )
+    }
 }
 
 impl AllowedMethod {
@@ -421,6 +448,11 @@ impl AllowedMethod {
     #[must_use]
     pub(crate) const fn as_method(&self) -> &Method {
         &self.method
+    }
+
+    /// Returns the parsed method text.
+    fn as_str(&self) -> &str {
+        self.method.as_str()
     }
 
     /// Returns true if this configured method equals the supplied method.
@@ -496,6 +528,24 @@ impl AllowedPath {
             kind: AllowedPathKind::Prefix,
             value: parse_allowed_prefix(raw)?,
         })
+    }
+}
+
+impl AllowedPathKind {
+    /// Returns the canonical configuration token.
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+        }
+    }
+
+    /// Returns the canonical sort rank.
+    const fn sort_rank(self) -> u8 {
+        match self {
+            Self::Exact => 0,
+            Self::Prefix => 1,
+        }
     }
 }
 
@@ -991,10 +1041,23 @@ fn parse_allowed_operations(operations: Vec<String>) -> Result<Vec<AllowedOperat
         });
     }
 
-    operations
+    let mut parsed = operations
         .into_iter()
         .map(|operation| AllowedOperation::parse(&operation))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    parsed.sort_unstable_by(AllowedOperation::cmp_config);
+
+    if let Some(duplicate) = parsed
+        .iter()
+        .zip(parsed.iter().skip(1))
+        .find_map(|(left, right)| (left == right).then_some(right))
+    {
+        return Err(ConfigError::DuplicateAllowedOperation {
+            operation: duplicate.to_config_text(),
+        });
+    }
+
+    Ok(parsed)
 }
 
 /// Parses an allowed path string.
@@ -1084,6 +1147,13 @@ mod tests {
     /// Converts a test `usize` into the expected `u128` value.
     fn expected_usize_u128(value: usize) -> u128 {
         u128::try_from(value).expect("usize should fit into u128")
+    }
+
+    /// Builds unique exact operations for operation-set boundary tests.
+    fn unique_allowed_operations(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("GET:exact:/v1/models/{index}"))
+            .collect()
     }
 
     /// Builds the longest valid origin accepted by the input byte cap.
@@ -1392,8 +1462,48 @@ mod tests {
     }
 
     #[test]
+    fn operation_sets_reject_duplicate_entries() {
+        let operations = vec![
+            "POST:prefix:/v1/responses".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+        ];
+
+        assert!(matches!(
+            parse_allowed_operations(operations),
+            Err(ConfigError::DuplicateAllowedOperation { operation })
+                if operation == "GET:exact:/v1/models",
+        ));
+    }
+
+    #[test]
+    fn operation_sets_parse_into_canonical_order() {
+        let operations = vec![
+            "POST:prefix:/v1/responses".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+            "POST:exact:/v1/responses".to_owned(),
+        ];
+
+        let parsed = parse_allowed_operations(operations).expect("operations should parse");
+        let operation_text: Vec<String> = parsed
+            .iter()
+            .map(AllowedOperation::to_config_text)
+            .collect();
+        let expected_text: Vec<String> = [
+            "GET:exact:/v1/models",
+            "POST:exact:/v1/responses",
+            "POST:prefix:/v1/responses",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(operation_text, expected_text);
+    }
+
+    #[test]
     fn operation_sets_accept_the_maximum_supported_count() {
-        let operations = vec!["GET:exact:/v1/models".to_owned(); MAX_ALLOWED_OPERATIONS];
+        let operations = unique_allowed_operations(MAX_ALLOWED_OPERATIONS);
 
         let parsed =
             parse_allowed_operations(operations).expect("maximum operation count should parse");
@@ -1807,7 +1917,7 @@ mod proptests {
     use core::time::Duration;
     use proptest::prelude::*;
     use proptest::{collection, option};
-    use std::path::PathBuf;
+    use std::{collections::BTreeSet, path::PathBuf};
 
     /// HTTP token methods drawn from common and custom token spellings,
     /// including methods that collide with the kind tokens.
@@ -1989,6 +2099,45 @@ mod proptests {
         ]
     }
 
+    #[test]
+    fn parse_allowed_operations_canonicalizes_unique_inputs() {
+        let parsed = parse_allowed_operations(vec![
+            "POST:prefix:/v1/responses".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+            "POST:exact:/v1/responses".to_owned(),
+        ])
+        .expect("unique operations should parse");
+        let operation_text: Vec<String> = parsed
+            .iter()
+            .map(AllowedOperation::to_config_text)
+            .collect();
+        let expected_text: Vec<String> = [
+            "GET:exact:/v1/models",
+            "POST:exact:/v1/responses",
+            "POST:prefix:/v1/responses",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        assert_eq!(operation_text, expected_text);
+    }
+
+    #[test]
+    fn parse_allowed_operations_rejects_duplicate_entries() {
+        let result = parse_allowed_operations(vec![
+            "POST:prefix:/v1/responses".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+            "GET:exact:/v1/models".to_owned(),
+        ]);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::DuplicateAllowedOperation { operation })
+                if operation == "GET:exact:/v1/models",
+        ));
+    }
+
     proptest! {
         #[test]
         fn parse_accepts_every_valid_operation(
@@ -2159,10 +2308,15 @@ mod proptests {
             empty_entries in 0_usize..3,
         ) {
             let expected_count = operations.len();
-            let mut raw: Vec<String> = operations
+            let raw_operations: Vec<String> = operations
                 .into_iter()
                 .map(|(method, kind, path)| format!("{method}:{kind}:{path}"))
                 .collect();
+            let mut seen_operations = BTreeSet::new();
+            let has_duplicate = raw_operations
+                .iter()
+                .any(|operation| !seen_operations.insert(operation.clone()));
+            let mut raw = raw_operations;
             raw.extend(iter::repeat_n(String::new(), empty_entries));
 
             let result = parse_allowed_operations(raw);
@@ -2174,9 +2328,21 @@ mod proptests {
                 let is_invalid_operation =
                     matches!(result, Err(ConfigError::InvalidAllowedOperation { .. }));
                 prop_assert!(is_invalid_operation);
+            } else if has_duplicate {
+                let is_duplicate =
+                    matches!(result, Err(ConfigError::DuplicateAllowedOperation { .. }));
+                prop_assert!(is_duplicate);
             } else {
                 let parsed = result.expect("valid operations should parse");
+                let operation_text: Vec<String> = parsed
+                    .iter()
+                    .map(AllowedOperation::to_config_text)
+                    .collect();
+                let mut sorted_text = operation_text.clone();
+                sorted_text.sort();
+
                 prop_assert_eq!(parsed.len(), expected_count);
+                prop_assert_eq!(operation_text, sorted_text);
             }
         }
 
