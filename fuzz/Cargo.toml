@@ -1,0 +1,23 @@
+[package]
+name = "custode-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+custode = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "accepted_path_set_path"
+path = "fuzz_targets/accepted_path_set_path.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

@@ -750,6 +750,28 @@ pub mod testing {
     }
 }
 
+#[cfg(fuzzing)]
+/// Fuzz-only parser oracles.
+pub mod fuzzing {
+    use super::OriginFormPath;
+    use url::Url;
+
+    /// Checks that accepted origin-form paths are preserved by `Url::set_path`.
+    pub fn accepted_path_set_path(input: &[u8]) {
+        let Ok(path) = core::str::from_utf8(input) else {
+            return;
+        };
+        let Ok(parsed) = OriginFormPath::parse(path) else {
+            return;
+        };
+        let mut url = Url::parse("https://api.openai.com").expect("origin should parse");
+
+        url.set_path(parsed.as_str());
+
+        assert_eq!(url.path(), parsed.as_str());
+    }
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(

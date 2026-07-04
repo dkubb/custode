@@ -1,4 +1,6 @@
 /logs/
+/fuzz/artifacts/
+/fuzz/target/
 /proptest-regressions/
 /secrets/*
 !/secrets/*.example
