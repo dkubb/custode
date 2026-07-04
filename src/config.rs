@@ -15,8 +15,10 @@ use url::Url;
 const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
 /// Minimum serialized audit event bytes required for every admitted target.
 pub(crate) const MIN_AUDIT_EVENT_BYTES: usize = 0x0001_0000;
+/// Maximum accepted HTTP method bytes for allowlisted and audited methods.
+pub(crate) const MAX_ALLOWED_METHOD_BYTES: usize = 64;
 /// Maximum configured allowed operation bytes.
-const MAX_ALLOWED_OPERATION_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES + 64;
+const MAX_ALLOWED_OPERATION_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES + MAX_ALLOWED_METHOD_BYTES;
 /// Maximum configured allowed operations.
 const MAX_ALLOWED_OPERATIONS: usize = 256;
 /// Maximum concurrent gateway requests accepted by Tokio's semaphore.
@@ -38,9 +40,16 @@ const MAX_UPSTREAM_ORIGIN_BYTES: usize = 255;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllowedOperation {
     /// Accepted HTTP method.
-    method: Method,
+    method: AllowedMethod,
     /// Accepted request path.
     path: AllowedPath,
+}
+
+/// A configured HTTP method accepted by the gateway protocol.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AllowedMethod {
+    /// Parsed HTTP method.
+    method: Method,
 }
 
 /// Parsed maximum serialized audit event bytes.
@@ -170,6 +179,15 @@ pub(crate) enum ConfigError {
         raw: String,
         /// URL parser source error.
         source: url::ParseError,
+    },
+
+    /// Method exceeded the supported byte limit.
+    #[error("HTTP method must be at most {max} bytes, got {value}")]
+    MethodTooLong {
+        /// Maximum accepted bytes.
+        max: u128,
+        /// Supplied bytes.
+        value: u128,
     },
 
     /// Too many operations were configured.
@@ -344,13 +362,19 @@ impl AllowedOperation {
     /// Returns true if this operation has the supplied method.
     #[must_use]
     pub(crate) fn has_method(&self, method: &Method) -> bool {
-        self.method == *method
+        self.method.matches(method)
     }
 
     /// Returns true if this operation accepts the method and path.
     #[must_use]
     pub(crate) fn matches(&self, method: &Method, path: &OriginFormPath) -> bool {
-        self.method == *method && self.path.matches(path)
+        self.method.matches(method) && self.path.matches(path)
+    }
+
+    /// Returns the configured allowed method.
+    #[must_use]
+    pub(crate) const fn method(&self) -> &AllowedMethod {
+        &self.method
     }
 
     /// Parses a configured allowed operation.
@@ -377,16 +401,7 @@ impl AllowedOperation {
             });
         }
 
-        let method = Method::from_bytes(method_text.as_bytes()).map_err(|_error| {
-            ConfigError::InvalidMethod {
-                method: method_text.to_owned(),
-            }
-        })?;
-        if method == Method::CONNECT {
-            return Err(ConfigError::UnsupportedMethod {
-                method: method_text.to_owned(),
-            });
-        }
+        let method = AllowedMethod::parse(method_text)?;
         let path = match kind {
             "exact" => AllowedPath::exact(path_text)?,
             "prefix" => AllowedPath::prefix(path_text)?,
@@ -398,6 +413,46 @@ impl AllowedOperation {
         };
 
         Ok(Self { method, path })
+    }
+}
+
+impl AllowedMethod {
+    /// Returns the parsed HTTP method.
+    #[must_use]
+    pub(crate) const fn as_method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Returns true if this configured method equals the supplied method.
+    #[must_use]
+    fn matches(&self, method: &Method) -> bool {
+        self.method == *method
+    }
+
+    /// Parses a configured HTTP method.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the method is syntactically invalid, unsupported
+    /// by the gateway, or wider than the audited method domain.
+    pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
+        if raw.len() > MAX_ALLOWED_METHOD_BYTES {
+            return Err(ConfigError::MethodTooLong {
+                max: usize_to_u128(MAX_ALLOWED_METHOD_BYTES),
+                value: usize_to_u128(raw.len()),
+            });
+        }
+
+        let method =
+            Method::from_bytes(raw.as_bytes()).map_err(|_error| ConfigError::InvalidMethod {
+                method: raw.to_owned(),
+            })?;
+        if method == Method::CONNECT {
+            return Err(ConfigError::UnsupportedMethod {
+                method: raw.to_owned(),
+            });
+        }
+        Ok(Self { method })
     }
 }
 
@@ -974,11 +1029,12 @@ fn has_forbidden_allowed_path_character(path: &str) -> bool {
 )]
 mod tests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
-        MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
-        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
-        MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
-        UpstreamOrigin, non_zero_usize, parse_allowed_operations, usize_to_u128,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_METHOD_BYTES,
+        MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES,
+        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
+        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES,
+        MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
+        non_zero_usize, parse_allowed_operations, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -1037,6 +1093,7 @@ mod tests {
 
     #[test]
     fn configuration_limits_match_documented_values() {
+        assert_eq!(MAX_ALLOWED_METHOD_BYTES, 64);
         assert_eq!(MAX_ALLOWED_OPERATION_BYTES, 4_160);
         assert_eq!(MAX_ALLOWED_OPERATIONS, 256);
         assert_eq!(MAX_AUDIT_EVENT_BYTES, 0x0010_0000);
@@ -1387,6 +1444,19 @@ mod tests {
     }
 
     #[test]
+    fn operation_rejects_methods_over_the_supported_maximum() {
+        let method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
+        let raw = format!("{method}:exact:/");
+
+        assert!(matches!(
+            AllowedOperation::parse(&raw),
+            Err(ConfigError::MethodTooLong { max, value })
+                if max == expected_usize_u128(MAX_ALLOWED_METHOD_BYTES)
+                    && value == expected_usize_u128(method.len()),
+        ));
+    }
+
+    #[test]
     fn zero_bounds_fail_closed() {
         assert!(matches!(
             non_zero_usize("CUSTODE_MAX_REQUEST_BYTES", 0),
@@ -1705,11 +1775,12 @@ mod tests {
 )]
 mod proptests {
     use super::{
-        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_OPERATION_BYTES,
-        MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
-        MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
-        MAX_RESPONSE_HEADER_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
-        parse_allowed_operations, tests::serve_args, usize_to_u128,
+        AllowedOperation, AllowedPath, ConfigError, GatewayConfig, MAX_ALLOWED_METHOD_BYTES,
+        MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES,
+        MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES, MAX_REQUEST_HEADER_BYTES,
+        MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES, MAX_RESPONSE_HEADER_BYTES,
+        MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin, parse_allowed_operations,
+        tests::serve_args, usize_to_u128,
     };
     use crate::target::{
         MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery,
@@ -1757,6 +1828,12 @@ mod proptests {
             "[A-Z]{0,4}",
         )
             .prop_map(|(head, invalid, tail)| format!("{head}{invalid}{tail}"))
+    }
+
+    /// Token methods exceeding the audited method domain.
+    fn method_too_long() -> impl Strategy<Value = String> {
+        (MAX_ALLOWED_METHOD_BYTES + 1..=MAX_ALLOWED_METHOD_BYTES + 16)
+            .prop_map(|length| "A".repeat(length))
     }
 
     /// Operation match kinds accepted by the grammar.
@@ -1964,6 +2041,20 @@ mod proptests {
                 Err(ConfigError::InvalidMethod { .. }),
             );
             prop_assert!(is_invalid_method);
+        }
+
+        #[test]
+        fn parse_rejects_too_long_methods(
+            method in method_too_long(),
+            kind in kind_valid(),
+            path in allowed_path_valid(),
+        ) {
+            let raw = format!("{method}:{kind}:{path}");
+            let is_too_long_method = matches!(
+                AllowedOperation::parse(&raw),
+                Err(ConfigError::MethodTooLong { .. }),
+            );
+            prop_assert!(is_too_long_method);
         }
 
         #[test]

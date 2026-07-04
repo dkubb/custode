@@ -396,9 +396,9 @@ Configuration parsing is fail-closed:
   newline; concurrent requests Tokio `Semaphore::MAX_PERMITS`; request bytes
   1,073,741,824; request header name/value bytes 1,048,576; response bytes
   1,073,741,824; response header name/value bytes 1,048,576; incoming path
-  bytes 4,096; incoming query bytes 8,192; allowed operation bytes 4,160;
-  allowed operations 256; upstream origin bytes 255; request timeout 3,600
-  seconds.
+  bytes 4,096; incoming query bytes 8,192; allowed method bytes 64; allowed
+  operation bytes 4,160; allowed operations 256; upstream origin bytes 255;
+  request timeout 3,600 seconds.
 - `CUSTODE_MAX_AUDIT_EVENT_BYTES` MUST also be at least 65,536 bytes, so every
   admitted target under the current audit schema remains serializable. Rejected
   raw target fields are bounded before serialization; overlong path or query

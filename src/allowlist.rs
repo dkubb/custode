@@ -1,6 +1,6 @@
 //! Method and path allowlist decisions.
 
-use crate::config::GatewayConfig;
+use crate::config::{AllowedMethod, AllowedOperation, GatewayConfig};
 use crate::target::{OriginFormPath, OriginFormPathError, OriginFormQuery, OriginFormQueryError};
 use ::http::Method;
 
@@ -17,7 +17,7 @@ pub(crate) struct AcceptedTarget {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AllowedTarget {
     /// Allowed request method.
-    method: Method,
+    method: AllowedMethod,
     /// Accepted target matched by the method.
     target: AcceptedTarget,
 }
@@ -73,7 +73,7 @@ impl AllowedTarget {
     /// Returns the allowed request method.
     #[must_use]
     pub(crate) const fn method(&self) -> &Method {
-        &self.method
+        self.method.as_method()
     }
 
     /// Returns the allowlist-matched target.
@@ -112,12 +112,22 @@ pub(crate) enum RejectionReason {
 }
 
 /// Checks whether a request is allowed by the configured method and path sets.
-#[must_use]
+#[cfg(test)]
 fn is_allowed(config: &GatewayConfig, method: &Method, target: &AcceptedTarget) -> bool {
+    allowed_method(config, method, target).is_some()
+}
+
+/// Returns the configured method witness for an allowed request.
+fn allowed_method<'config>(
+    config: &'config GatewayConfig,
+    method: &Method,
+    target: &AcceptedTarget,
+) -> Option<&'config AllowedMethod> {
     config
         .allowed_operations()
         .iter()
-        .any(|operation| operation.matches(method, target.origin_form_path()))
+        .find(|operation| operation.matches(method, target.origin_form_path()))
+        .map(AllowedOperation::method)
 }
 
 /// Returns the rejection reason for a denied method.
@@ -164,14 +174,15 @@ pub(crate) fn allow_target(
     method: &Method,
     target: AcceptedTarget,
 ) -> Result<AllowedTarget, RejectionReason> {
-    if is_allowed(config, method, &target) {
-        Ok(AllowedTarget {
-            method: method.clone(),
-            target,
-        })
-    } else {
-        Err(rejection_for(config, method))
-    }
+    allowed_method(config, method, &target).map_or_else(
+        || Err(rejection_for(config, method)),
+        |allowed_method| {
+            Ok(AllowedTarget {
+                method: allowed_method.clone(),
+                target,
+            })
+        },
+    )
 }
 
 #[cfg(test)]

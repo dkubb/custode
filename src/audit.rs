@@ -2,7 +2,7 @@
 
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
-use crate::config::{AuditEventBytes, GatewayConfig, UpstreamOrigin};
+use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
 use ::http::{Method, StatusCode};
 use core::fmt;
@@ -32,9 +32,6 @@ const MAX_AUDIT_TARGET_PATH_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES;
 
 /// Maximum audited request query bytes.
 const MAX_AUDIT_TARGET_QUERY_BYTES: usize = MAX_ORIGIN_FORM_QUERY_BYTES;
-
-/// Maximum audited request method bytes.
-const MAX_AUDIT_METHOD_BYTES: usize = 64;
 
 /// Hex bytes in one half of a per-run token.
 #[cfg(test)]
@@ -1015,7 +1012,7 @@ impl AuditMethod {
     #[must_use]
     fn from_method(method: &Method) -> Self {
         Self {
-            value: bounded_audit_text(method.as_str(), MAX_AUDIT_METHOD_BYTES),
+            value: bounded_audit_text(method.as_str(), MAX_ALLOWED_METHOD_BYTES),
         }
     }
 }
@@ -1646,7 +1643,8 @@ mod tests {
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
     use crate::config::{
-        AuditEventBytes, GatewayConfig, MIN_AUDIT_EVENT_BYTES, ResponseBodyBytes, UpstreamOrigin,
+        AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, MIN_AUDIT_EVENT_BYTES,
+        ResponseBodyBytes, UpstreamOrigin,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, StatusCode};
@@ -2187,7 +2185,7 @@ mod tests {
 
     #[test]
     fn new_truncates_overlong_methods_with_original_length() {
-        let method = "A".repeat(super::MAX_AUDIT_METHOD_BYTES + 1);
+        let method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
         let target = AuditTarget::from_uri_parts("/v1/models", None);
         let input = denied_input(&method, target, AuditDenialReason::MethodDenied);
         let suffix = format!("...[truncated original_bytes={}]", method.len());
@@ -2201,7 +2199,7 @@ mod tests {
             .as_str()
             .expect("method should serialize as a string");
 
-        assert_eq!(audited_method.len(), super::MAX_AUDIT_METHOD_BYTES);
+        assert_eq!(audited_method.len(), MAX_ALLOWED_METHOD_BYTES);
         assert!(audited_method.ends_with(&suffix));
     }
 
@@ -2895,13 +2893,14 @@ mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, MAX_AUDIT_METHOD_BYTES,
-        ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken, RunTokenError,
-        inspect_audit_log_tail,
+        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
+        ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
-    use crate::config::{GatewayConfig, ResponseBodyBytes, UpstreamOrigin};
+    use crate::config::{
+        GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
+    };
     use ::http::Method;
     use ::http::StatusCode;
     use core::num::NonZeroU64;
@@ -3017,7 +3016,7 @@ mod proptests {
     fn method_text() -> impl Strategy<Value = String> {
         prop_oneof![
             8 => "[A-Z]{3,8}",
-            1 => Just("A".repeat(MAX_AUDIT_METHOD_BYTES + 1)),
+            1 => Just("A".repeat(MAX_ALLOWED_METHOD_BYTES + 1)),
         ]
     }
 
