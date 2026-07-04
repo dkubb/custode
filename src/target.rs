@@ -514,8 +514,8 @@ pub mod testing {
             .prop_map(|escapes| escapes.concat())
     }
 
-    /// Long mixed raw and escaped query strings accepted by the parser.
-    fn query_raw_escape_long_valid() -> impl Strategy<Value = String> {
+    /// Raw byte length bounds for one long query with one percent escape.
+    fn query_raw_escape_byte_bounds() -> (usize, usize) {
         let min_raw_bytes = LONG_QUERY_MIN_BYTES
             .checked_sub(PERCENT_ESCAPE_BYTES)
             .expect("long query minimum should fit one percent escape");
@@ -523,23 +523,42 @@ pub mod testing {
             .checked_sub(PERCENT_ESCAPE_BYTES)
             .expect("query maximum should fit one percent escape");
 
+        (min_raw_bytes, max_raw_bytes)
+    }
+
+    /// Long query strings with one escape followed by raw query text.
+    fn query_escape_raw_long_valid() -> impl Strategy<Value = String> {
+        let (min_raw_bytes, max_raw_bytes) = query_raw_escape_byte_bounds();
+
+        (
+            collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
+            percent_escape_valid(),
+        )
+            .prop_map(|(raw_chars, escape)| {
+                let raw = raw_chars.into_iter().collect::<String>();
+                format!("{escape}{raw}")
+            })
+    }
+
+    /// Long query strings with raw query text followed by one escape.
+    fn query_raw_escape_suffix_long_valid() -> impl Strategy<Value = String> {
+        let (min_raw_bytes, max_raw_bytes) = query_raw_escape_byte_bounds();
+
+        (
+            collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
+            percent_escape_valid(),
+        )
+            .prop_map(|(raw_chars, escape)| {
+                let raw = raw_chars.into_iter().collect::<String>();
+                format!("{raw}{escape}")
+            })
+    }
+
+    /// Long mixed raw and escaped query strings accepted by the parser.
+    fn query_raw_escape_long_valid() -> impl Strategy<Value = String> {
         prop_oneof![
-            (
-                collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
-                percent_escape_valid(),
-            )
-                .prop_map(|(raw_chars, escape)| {
-                    let raw = raw_chars.into_iter().collect::<String>();
-                    format!("{escape}{raw}")
-                }),
-            (
-                collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
-                percent_escape_valid(),
-            )
-                .prop_map(|(raw_chars, escape)| {
-                    let raw = raw_chars.into_iter().collect::<String>();
-                    format!("{raw}{escape}")
-                }),
+            query_escape_raw_long_valid(),
+            query_raw_escape_suffix_long_valid(),
         ]
     }
 
@@ -643,9 +662,10 @@ pub mod testing {
     mod tests {
         use super::super::{OriginFormPath, OriginFormQuery};
         use super::{
-            format_percent_escape, origin_form_path_valid, origin_form_query_valid,
-            percent_escape_valid, short_origin_form_query_valid,
-            url_preserved_origin_form_query_valid,
+            LONG_QUERY_MIN_BYTES, format_percent_escape, origin_form_path_valid,
+            origin_form_query_valid, percent_escape_valid, query_escape_raw_long_valid,
+            query_percent_escape_long_valid, query_raw_escape_suffix_long_valid,
+            short_origin_form_query_valid, url_preserved_origin_form_query_valid,
         };
         use proptest::strategy::{Strategy as _, ValueTree as _};
         use proptest::test_runner::TestRunner;
@@ -687,6 +707,28 @@ pub mod testing {
                 OriginFormQuery::parse(&query).expect("generated query should parse");
                 OriginFormQuery::parse(&url_preserved_query)
                     .expect("generated URL-preserved query should parse");
+            }
+        }
+
+        #[test]
+        fn long_query_generators_create_parseable_samples() {
+            let mut runner = TestRunner::deterministic();
+
+            for generator in [
+                query_percent_escape_long_valid().boxed(),
+                query_escape_raw_long_valid().boxed(),
+                query_raw_escape_suffix_long_valid().boxed(),
+            ] {
+                let query = generator
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
+
+                assert!(
+                    query.len() >= LONG_QUERY_MIN_BYTES,
+                    "generated query should be long: {query}"
+                );
+                OriginFormQuery::parse(&query).expect("generated long query should parse");
             }
         }
 
