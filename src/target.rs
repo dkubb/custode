@@ -41,6 +41,9 @@ pub(crate) struct OriginFormQuery {
 /// Origin-form query parsing error.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum OriginFormQueryError {
+    /// Query contained a literal fragment delimiter.
+    FragmentDelimiter,
+
     /// Query contained invalid percent-encoding.
     InvalidPercentEncoding,
 
@@ -89,14 +92,17 @@ impl OriginFormPath {
     /// # Errors
     ///
     /// Returns an error when the path exceeds the byte limit, is not
-    /// origin-form, contains invalid percent-encoding, contains a forbidden
-    /// literal or percent-encoded separator, or contains a literal or
-    /// percent-encoded dot segment.
+    /// origin-form, contains a literal component delimiter, contains invalid
+    /// percent-encoding, contains a forbidden literal or percent-encoded
+    /// separator, or contains a literal or percent-encoded dot segment.
     pub(crate) fn parse(path: &str) -> Result<Self, OriginFormPathError> {
         if path.len() > MAX_ORIGIN_FORM_PATH_BYTES {
             return Err(OriginFormPathError::TooLong);
         }
         if !path.starts_with('/') {
+            return Err(OriginFormPathError::NonOriginForm);
+        }
+        if has_path_component_delimiter(path) {
             return Err(OriginFormPathError::NonOriginForm);
         }
         if !has_valid_percent_encoding(path) {
@@ -126,11 +132,14 @@ impl OriginFormQuery {
     ///
     /// # Errors
     ///
-    /// Returns an error when the query exceeds the byte limit or contains
-    /// invalid percent-encoding.
+    /// Returns an error when the query exceeds the byte limit, contains a
+    /// literal fragment delimiter, or contains invalid percent-encoding.
     pub(crate) fn parse(query: &str) -> Result<Self, OriginFormQueryError> {
         if query.len() > MAX_ORIGIN_FORM_QUERY_BYTES {
             return Err(OriginFormQueryError::TooLong);
+        }
+        if has_query_component_delimiter(query) {
+            return Err(OriginFormQueryError::FragmentDelimiter);
         }
         if !has_valid_percent_encoding(query) {
             return Err(OriginFormQueryError::InvalidPercentEncoding);
@@ -164,6 +173,20 @@ pub(crate) fn has_valid_percent_encoding(value: &str) -> bool {
 /// Returns true when any path segment decodes exactly to `.` or `..`.
 fn has_dot_segment(path: &str) -> bool {
     path.split('/').any(segment_is_dot_segment)
+}
+
+/// Returns true when path text contains a delimiter that belongs outside the
+/// parsed path component.
+fn has_path_component_delimiter(path: &str) -> bool {
+    path.as_bytes()
+        .iter()
+        .any(|byte| matches!(byte, b'?' | b'#'))
+}
+
+/// Returns true when query text contains a delimiter that belongs outside the
+/// parsed query component.
+fn has_query_component_delimiter(query: &str) -> bool {
+    query.as_bytes().contains(&b'#')
 }
 
 /// Returns true when path text includes a separator spelling that would change
@@ -495,6 +518,17 @@ mod tests {
     }
 
     #[test]
+    fn path_rejects_component_delimiters() {
+        for path in ["/v1/models?limit=1", "/v1/models#fragment"] {
+            assert_eq!(
+                OriginFormPath::parse(path),
+                Err(OriginFormPathError::NonOriginForm),
+                "path {path} should fail closed",
+            );
+        }
+    }
+
+    #[test]
     fn path_rejects_percent_encoded_dot_segments() {
         assert_eq!(
             OriginFormPath::parse("/v1/responses/%2e%2e/models"),
@@ -581,6 +615,14 @@ mod tests {
         assert_eq!(
             OriginFormQuery::parse("bad=%zz"),
             Err(OriginFormQueryError::InvalidPercentEncoding),
+        );
+    }
+
+    #[test]
+    fn query_rejects_fragment_delimiters() {
+        assert_eq!(
+            OriginFormQuery::parse("limit=1#fragment"),
+            Err(OriginFormQueryError::FragmentDelimiter),
         );
     }
 
@@ -755,6 +797,16 @@ mod proptests {
         "[A-Za-z0-9_-][A-Za-z0-9/_-]{0,12}"
     }
 
+    /// Paths containing one literal delimiter that belongs outside the path.
+    fn path_with_component_delimiter() -> impl Strategy<Value = String> {
+        (
+            path_valid(),
+            prop_oneof![Just("?"), Just("#")],
+            "[A-Za-z0-9_-]{0,8}",
+        )
+            .prop_map(|(prefix, delimiter, suffix)| format!("{prefix}{delimiter}{suffix}"))
+    }
+
     /// Origin-form paths longer than the supported byte limit.
     fn path_too_long() -> impl Strategy<Value = String> {
         (MAX_ORIGIN_FORM_PATH_BYTES..=MAX_ORIGIN_FORM_PATH_BYTES + 64)
@@ -773,6 +825,12 @@ mod proptests {
             ],
         )
             .prop_map(|(prefix, escape)| format!("{prefix}%{escape}"))
+    }
+
+    /// Queries containing a literal fragment delimiter.
+    fn query_with_fragment_delimiter() -> impl Strategy<Value = String> {
+        ("[A-Za-z0-9_=&.-]{0,12}", "[A-Za-z0-9_=&.-]{0,12}")
+            .prop_map(|(prefix, suffix)| format!("{prefix}#{suffix}"))
     }
 
     /// Queries longer than the supported byte limit.
@@ -823,6 +881,16 @@ mod proptests {
         }
 
         #[test]
+        fn parse_rejects_every_path_component_delimiter(
+            path in path_with_component_delimiter(),
+        ) {
+            prop_assert_eq!(
+                OriginFormPath::parse(&path),
+                Err(OriginFormPathError::NonOriginForm)
+            );
+        }
+
+        #[test]
         fn parse_rejects_every_too_long_path(path in path_too_long()) {
             prop_assert_eq!(
                 OriginFormPath::parse(&path),
@@ -845,6 +913,16 @@ mod proptests {
             prop_assert_eq!(
                 OriginFormQuery::parse(&query),
                 Err(OriginFormQueryError::InvalidPercentEncoding)
+            );
+        }
+
+        #[test]
+        fn query_parse_rejects_every_fragment_delimiter(
+            query in query_with_fragment_delimiter(),
+        ) {
+            prop_assert_eq!(
+                OriginFormQuery::parse(&query),
+                Err(OriginFormQueryError::FragmentDelimiter)
             );
         }
 

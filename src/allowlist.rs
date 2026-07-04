@@ -29,9 +29,10 @@ impl AcceptedTarget {
     ///
     /// Returns a rejection when the path is not origin-form, when the path or
     /// query exceeds the byte limit, when the path or query contains invalid
-    /// percent-encoding, when the path contains a forbidden literal or
-    /// percent-encoded separator, or when the path contains a literal or
-    /// percent-encoded dot segment.
+    /// percent-encoding, when the path or query contains a component
+    /// delimiter, when the path contains a forbidden literal or percent-encoded
+    /// separator, or when the path contains a literal or percent-encoded dot
+    /// segment.
     pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
         let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
         let accepted_query = query
@@ -159,6 +160,7 @@ const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReaso
 /// Maps origin-form query errors into request rejection reasons.
 const fn rejection_from_query_error(error: OriginFormQueryError) -> RejectionReason {
     match error {
+        OriginFormQueryError::FragmentDelimiter => RejectionReason::NonOriginForm,
         OriginFormQueryError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
         OriginFormQueryError::TooLong => RejectionReason::QueryTooLong,
     }
@@ -294,6 +296,22 @@ mod tests {
     fn target_rejects_non_origin_form_paths() {
         assert_eq!(
             AcceptedTarget::new("v1/models", None),
+            Err(RejectionReason::NonOriginForm),
+        );
+    }
+
+    #[test]
+    fn target_rejects_component_delimiters() {
+        assert_eq!(
+            AcceptedTarget::new("/v1/models?limit=1", None),
+            Err(RejectionReason::NonOriginForm),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/models#fragment", None),
+            Err(RejectionReason::NonOriginForm),
+        );
+        assert_eq!(
+            AcceptedTarget::new("/v1/models", Some("limit=1#fragment")),
             Err(RejectionReason::NonOriginForm),
         );
     }

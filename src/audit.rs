@@ -3207,7 +3207,7 @@ mod tests {
     fn schema_invalid_existing_metadata_lines(
         too_long_path: String,
         too_long_query: String,
-    ) -> [(&'static str, Vec<u8>); 10] {
+    ) -> [(&'static str, Vec<u8>); 12] {
         [
             (
                 "invalid status",
@@ -3253,6 +3253,13 @@ mod tests {
                 ),
             ),
             (
+                "upstream path with component delimiter",
+                serialized_event_line_with_field(
+                    "upstream_path",
+                    Value::String("/v1/models?limit=1".to_owned()),
+                ),
+            ),
+            (
                 "too-long upstream query",
                 serialized_event_line_with_field("upstream_query", Value::String(too_long_query)),
             ),
@@ -3261,6 +3268,13 @@ mod tests {
                 serialized_event_line_with_field(
                     "upstream_query",
                     Value::String("bad=%zz".to_owned()),
+                ),
+            ),
+            (
+                "upstream query with fragment delimiter",
+                serialized_event_line_with_field(
+                    "upstream_query",
+                    Value::String("limit=1#fragment".to_owned()),
                 ),
             ),
             (
@@ -3618,7 +3632,7 @@ mod tests {
     }
 
     /// Builds upstream-level semantically invalid existing audit event lines.
-    fn semantic_invalid_upstream_lines() -> [(&'static str, Vec<u8>); 6] {
+    fn semantic_invalid_upstream_lines() -> [(&'static str, Vec<u8>); 8] {
         [
             (
                 "upstream error with response error class",
@@ -3670,6 +3684,26 @@ mod tests {
                     ("path", Value::String("not-origin-form".to_owned())),
                     ("status", Value::from(504_u64)),
                     ("upstream_path", Value::String("not-origin-form".to_owned())),
+                ]),
+            ),
+            (
+                "upstream attempted with path component delimiter",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("path", Value::String("/v1/models?limit=1".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "upstream attempted with query fragment delimiter",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("query", Value::String("limit=1#fragment".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
                 ]),
             ),
             (
