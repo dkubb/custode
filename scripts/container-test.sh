@@ -10,6 +10,7 @@
 # - the harness cannot reach an external URL directly, tested from inside
 #   the harness container;
 # - the harness cannot reach an external raw IP over HTTP directly;
+# - the harness cannot open a direct TCP connection to public DNS;
 # - the harness can reach the gateway on the internal network;
 # - the proxy audit log is valid NDJSON with monotonic request IDs.
 
@@ -17,7 +18,7 @@ export CUSTODE_UPSTREAM_ORIGIN="${CUSTODE_UPSTREAM_ORIGIN:-https://api.anthropic
 export CUSTODE_ALLOWED_OPERATIONS="${CUSTODE_ALLOWED_OPERATIONS:-POST:prefix:/v1/messages,GET:prefix:/v1/models}"
 export COMPOSE_PROJECT_NAME="custode_container_test_$$"
 
-readonly TAP_TEST_COUNT=9
+readonly TAP_TEST_COUNT=10
 
 test_number=0
 failed=0
@@ -152,6 +153,13 @@ harness_cannot_reach_raw_ip_http() {
   fi
 }
 
+harness_cannot_open_public_dns_tcp() {
+  if docker compose exec -T harness bash -c 'timeout 5 bash -c "</dev/tcp/1.1.1.1/53"' >/dev/null 2>&1; then
+    printf "harness opened a direct TCP connection to public DNS\n" >&2
+    return 1
+  fi
+}
+
 harness_reaches_gateway() {
   local status
 
@@ -253,6 +261,8 @@ run_test "harness networks are internal-only" harness_networks_are_internal_only
 run_test "harness cannot reach an external URL directly" harness_cannot_reach_external
 
 run_test "harness cannot reach a raw IP over HTTP directly" harness_cannot_reach_raw_ip_http
+
+run_test "harness cannot open TCP to public DNS directly" harness_cannot_open_public_dns_tcp
 
 run_test "harness reaches the gateway on the internal network" harness_reaches_gateway
 
