@@ -42,6 +42,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 /// Harness-visible stream error used for every post-start stream abort.
 const TERMINAL_STREAM_ABORT_ERROR: &str = "response_stream_aborted";
+/// Bounded queue between upstream response reads and downstream response writes.
+const RESPONSE_STREAM_CHANNEL_CAPACITY: usize = 8;
 
 /// Serving runtime error.
 #[derive(Debug, Error)]
@@ -528,89 +530,118 @@ fn response_stream(
     upstream_response: UpstreamResponse,
     permit: OwnedSemaphorePermit,
 ) -> ReceiverStream<Result<Bytes, io::Error>> {
-    let (sender, receiver) = mpsc::channel(8);
+    let response_timeout = context.gateway.config().request_timeout().as_duration();
+    let (sender, receiver) = mpsc::channel(RESPONSE_STREAM_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
         let _permit = permit;
-        let mut stream = upstream_response.into_body();
-        let mut pending = None;
-        while let Some(chunk_result) = stream.next().await {
-            let chunk = match chunk_result {
-                Ok(bytes) => bytes,
-                Err(upstream_body_error) => {
-                    let outcome = upstream_body_error_outcome(upstream_body_error.kind());
-                    if let Some(previous_chunk) = pending.take()
-                        && sender.send(Ok(previous_chunk)).await.is_err()
-                    {
-                        let _audit_result = context
-                            .audit_after_response_started(outcome)
-                            .await
-                            .inspect_err(log_upstream_body_audit_error);
-                        return;
-                    }
-                    send_stream_error(&sender, context.audit_after_response_started(outcome).await)
-                        .await;
+        let stream_result = timeout(
+            response_timeout,
+            stream_upstream_response(&mut context, upstream_response, &sender),
+        )
+        .await;
+        if stream_result.is_err() {
+            let _audit_result = context
+                .audit_after_response_started(ResponseStreamOutcome::UpstreamResponseTimeout)
+                .await
+                .inspect_err(log_upstream_body_audit_error);
+            try_send_terminal_stream_error(&sender);
+        }
+    });
+
+    ReceiverStream::new(receiver)
+}
+
+/// Streams the upstream response until completion or a terminal stream failure.
+async fn stream_upstream_response(
+    context: &mut ResponseAuditContext,
+    upstream_response: UpstreamResponse,
+    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let mut stream = upstream_response.into_body();
+    let mut pending = None;
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = match chunk_result {
+            Ok(bytes) => bytes,
+            Err(upstream_body_error) => {
+                let outcome = upstream_body_error_outcome(upstream_body_error.kind());
+                if let Some(previous_chunk) = pending.take()
+                    && sender.send(Ok(previous_chunk)).await.is_err()
+                {
+                    let _audit_result = context
+                        .audit_after_response_started(outcome)
+                        .await
+                        .inspect_err(log_upstream_body_audit_error);
                     return;
                 }
-            };
-
-            if let Some(previous_chunk) = pending.take()
-                && sender.send(Ok(previous_chunk)).await.is_err()
-            {
-                let _audit_result = context
-                    .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
-                    .await
-                    .inspect_err(log_downstream_close_audit_error);
+                send_stream_error(sender, context.audit_after_response_started(outcome).await)
+                    .await;
                 return;
             }
-
-            if let Err(response_body) = context.response_account.add_chunk(&chunk) {
-                send_stream_error(
-                    &sender,
-                    context
-                        .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge {
-                            response_body,
-                        })
-                        .await,
-                )
-                .await;
-                return;
-            }
-
-            pending = Some(chunk);
-        }
-
-        let Some(final_chunk) = pending else {
-            let audit_result = context
-                .audit_after_response_started(ResponseStreamOutcome::Allowed)
-                .await;
-            if audit_result.is_err() {
-                send_terminal_stream_error(&sender).await;
-            }
-            return;
         };
 
-        let Ok(final_permit) = sender.reserve().await else {
+        if let Some(previous_chunk) = pending.take()
+            && sender.send(Ok(previous_chunk)).await.is_err()
+        {
             let _audit_result = context
                 .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                 .await
                 .inspect_err(log_downstream_close_audit_error);
             return;
-        };
+        }
 
+        if let Err(response_body) = context.response_account.add_chunk(&chunk) {
+            send_stream_error(
+                sender,
+                context
+                    .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge {
+                        response_body,
+                    })
+                    .await,
+            )
+            .await;
+            return;
+        }
+
+        pending = Some(chunk);
+    }
+
+    let Some(final_chunk) = pending else {
         let audit_result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
-        match audit_result {
-            Ok(()) => final_permit.send(Ok(final_chunk)),
-            Err(_error) => {
-                drop(final_permit);
-                send_terminal_stream_error(&sender).await;
-            }
+        if audit_result.is_err() {
+            send_terminal_stream_error(sender).await;
         }
-    });
+        return;
+    };
 
-    ReceiverStream::new(receiver)
+    let Ok(final_permit) = sender.reserve().await else {
+        let _audit_result = context
+            .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
+            .await
+            .inspect_err(log_downstream_close_audit_error);
+        return;
+    };
+
+    let audit_result = context
+        .audit_after_response_started(ResponseStreamOutcome::Allowed)
+        .await;
+    match audit_result {
+        Ok(()) => final_permit.send(Ok(final_chunk)),
+        Err(_error) => {
+            drop(final_permit);
+            send_terminal_stream_error(sender).await;
+        }
+    }
+}
+
+/// Sends one generic terminal stream error without waiting for downstream space.
+fn try_send_terminal_stream_error(sender: &mpsc::Sender<Result<Bytes, io::Error>>) {
+    let send_result = sender.try_send(Err(io::Error::other(TERMINAL_STREAM_ABORT_ERROR)));
+    if send_result.is_err() {
+        tracing::debug!("failed to send terminal stream error");
+    }
 }
 
 /// Logs a downstream-close audit failure.
@@ -2001,13 +2032,14 @@ mod tests {
     }
 
     use super::{
-        AppState, ForwardRequestInput, ProductionAdapters, ResponseAuditContext,
-        ResponseAuditFailure, ResponseStreamOutcome, ServeError, TERMINAL_STREAM_ABORT_ERROR,
-        audit_denial_from_allowlist_rejection, audit_denial_from_request_body,
-        audit_denial_from_request_header, audit_denial_from_target_rejection,
-        audit_response_header_error, audit_upstream_error, forward_request,
-        is_fatal_request_failure, production_gateway, proxy, report_fatal_error, response_stream,
-        run_until_server_stops, send_stream_error, serve, serve_with_adapter_result,
+        AppState, ForwardRequestInput, ProductionAdapters, RESPONSE_STREAM_CHANNEL_CAPACITY,
+        ResponseAuditContext, ResponseAuditFailure, ResponseStreamOutcome, ServeError,
+        TERMINAL_STREAM_ABORT_ERROR, audit_denial_from_allowlist_rejection,
+        audit_denial_from_request_body, audit_denial_from_request_header,
+        audit_denial_from_target_rejection, audit_response_header_error, audit_upstream_error,
+        forward_request, is_fatal_request_failure, production_gateway, proxy, report_fatal_error,
+        response_stream, run_until_server_stops, send_stream_error, serve,
+        serve_with_adapter_result,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -4792,6 +4824,64 @@ mod tests {
         let event = events.first().expect("timeout should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "upstream_response_timeout");
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_times_out_stalled_downstream_writes() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let chunk_count = RESPONSE_STREAM_CHANNEL_CAPACITY + 2;
+        let upstream_body = stream::iter((0..chunk_count).map(|index| {
+            let byte = u8::try_from(index).expect("test chunk index should fit in a byte");
+            Ok::<Bytes, UpstreamBodyError>(Bytes::from(vec![byte]))
+        }));
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let semaphore = Arc::new(Semaphore::new(1));
+        let response_body = response_stream(
+            context,
+            upstream_response,
+            Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .expect("test permit should be available"),
+        );
+
+        yield_now().await;
+        assert!(
+            Arc::clone(&semaphore).try_acquire_owned().is_err(),
+            "stalled response stream should hold its permit before timeout"
+        );
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+        let released_permit = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("stalled response stream timeout should release its permit");
+        drop(released_permit);
+        drop(response_body);
+
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        let observed_body: Vec<u8> = (0..=RESPONSE_STREAM_CHANNEL_CAPACITY)
+            .map(|index| u8::try_from(index).expect("test chunk index should fit in a byte"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let event = events
+            .first()
+            .expect("stalled stream timeout should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_timeout");
+        assert_eq!(event["response_body"], non_empty_body_value(&observed_body));
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(
