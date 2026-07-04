@@ -884,14 +884,20 @@ mod tests {
 
     #[test]
     fn path_rejects_percent_encoded_dot_segments() {
-        assert_eq!(
-            OriginFormPath::parse("/v1/responses/%2e%2e/models"),
-            Err(OriginFormPathError::DotSegment),
-        );
-        assert_eq!(
-            OriginFormPath::parse("/v1/responses/%2E/models"),
-            Err(OriginFormPathError::DotSegment),
-        );
+        for path in [
+            "/v1/responses/%2e%2e/models",
+            "/v1/responses/%2E/models",
+            "/v1/responses/%2E%2e/models",
+            "/v1/responses/%2e%2E/models",
+            "/v1/responses/.%2E/models",
+            "/v1/responses/%2e./models",
+        ] {
+            assert_eq!(
+                OriginFormPath::parse(path),
+                Err(OriginFormPathError::DotSegment),
+                "path {path}"
+            );
+        }
     }
 
     #[test]
@@ -1082,7 +1088,11 @@ mod proptests {
             Just("%2e".to_owned()),
             Just("%2E".to_owned()),
             Just("%2e%2e".to_owned()),
+            Just("%2E%2e".to_owned()),
+            Just("%2e%2E".to_owned()),
             Just(".%2e".to_owned()),
+            Just(".%2E".to_owned()),
+            Just("%2e.".to_owned()),
             Just("%2E.".to_owned()),
         ]
     }

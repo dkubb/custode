@@ -331,14 +331,20 @@ mod tests {
 
     #[test]
     fn target_rejects_percent_encoded_dot_segments() {
-        assert_eq!(
-            AcceptedTarget::new("/v1/responses/%2e%2e/models", None),
-            Err(TargetRejectionReason::DotSegment),
-        );
-        assert_eq!(
-            AcceptedTarget::new("/v1/responses/%2E/models", None),
-            Err(TargetRejectionReason::DotSegment),
-        );
+        for path in [
+            "/v1/responses/%2e%2e/models",
+            "/v1/responses/%2E/models",
+            "/v1/responses/%2E%2e/models",
+            "/v1/responses/%2e%2E/models",
+            "/v1/responses/.%2E/models",
+            "/v1/responses/%2e./models",
+        ] {
+            assert_eq!(
+                AcceptedTarget::new(path, None),
+                Err(TargetRejectionReason::DotSegment),
+                "path {path}"
+            );
+        }
     }
 
     #[test]
@@ -566,7 +572,11 @@ mod proptests {
             Just("%2e".to_owned()),
             Just("%2E".to_owned()),
             Just("%2e%2e".to_owned()),
+            Just("%2E%2e".to_owned()),
+            Just("%2e%2E".to_owned()),
             Just(".%2e".to_owned()),
+            Just(".%2E".to_owned()),
+            Just("%2e.".to_owned()),
             Just("%2E.".to_owned()),
         ]
     }

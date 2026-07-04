@@ -940,6 +940,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_case_encoded_dot_segments_are_denied_and_audited() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:prefix:/v1/responses").await;
+        let paths = [
+            "/v1/responses/%2E%2e/models",
+            "/v1/responses/%2e%2E/models",
+            "/v1/responses/.%2E/models",
+            "/v1/responses/%2e./models",
+        ];
+
+        for path in paths {
+            let request = format!(
+                "GET {path} HTTP/1.1\r\n\
+                 Host: proxy.local\r\n\
+                 Connection: close\r\n\r\n"
+            );
+            let status_line = raw_response_status_line(gateway.addr, &request).await;
+            assert_eq!(status_line, "HTTP/1.1 400 Bad Request", "path {path}");
+        }
+
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "mixed-case encoded dot segment paths must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(paths.len()).await;
+        assert_eq!(events.len(), paths.len());
+        for (event, path) in events.iter().zip(paths) {
+            assert_eq!(event["decision"], "denied", "path {path}");
+            assert_eq!(event["error_class"], "dot_segment", "path {path}");
+            assert_eq!(event["path"], path, "path {path}");
+        }
+    }
+
+    #[tokio::test]
     async fn authority_form_request_line_is_denied_and_audited() {
         let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
