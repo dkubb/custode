@@ -1,6 +1,6 @@
 //! Audit event schema and writer.
 
-use crate::allowlist::AcceptedTarget;
+use crate::allowlist::{AcceptedTarget, RejectionReason};
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{
@@ -563,15 +563,104 @@ impl ExistingAuditErrorClass {
 }
 
 impl ExistingAuditEventFields {
+    /// Validates that the audit target reproduces the expected parser rejection.
+    fn expect_target_rejection(
+        &self,
+        expected: RejectionReason,
+        message: &'static str,
+    ) -> Result<(), &'static str> {
+        match AcceptedTarget::new(&self.path, self.query.as_deref()) {
+            Err(actual) if actual == expected => Ok(()),
+            Ok(_) | Err(_) => Err(message),
+        }
+    }
+
     /// Validates cross-field invariants that JSON shape alone cannot encode.
     fn validate(&self) -> Result<(), &'static str> {
         let error_class = self.validate_error_class()?;
+        self.validate_denied_target(error_class)?;
         self.validate_method(error_class)?;
         self.validate_request_body(error_class)?;
         self.validate_response_body(error_class)?;
         self.validate_status(error_class)?;
         self.validate_upstream_target()?;
         Ok(())
+    }
+
+    /// Validates denial error classes against the audited request target.
+    fn validate_denied_target(
+        &self,
+        maybe_error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        let Some(error_class) = maybe_error_class else {
+            return Ok(());
+        };
+        if self.decision != ExistingAuditDecision::Denied {
+            return Ok(());
+        }
+
+        match error_class {
+            ExistingAuditErrorClass::AbsoluteFormUnsupported
+            | ExistingAuditErrorClass::NonOriginForm => self.expect_target_rejection(
+                RejectionReason::NonOriginForm,
+                "audit target does not match non-origin-form denial",
+            ),
+            ExistingAuditErrorClass::DotSegment => self.expect_target_rejection(
+                RejectionReason::DotSegment,
+                "audit target does not match dot-segment denial",
+            ),
+            ExistingAuditErrorClass::EncodedSeparator => self.expect_target_rejection(
+                RejectionReason::EncodedSeparator,
+                "audit target does not match encoded-separator denial",
+            ),
+            ExistingAuditErrorClass::InvalidPercentEncoding => self.expect_target_rejection(
+                RejectionReason::InvalidPercentEncoding,
+                "audit target does not match invalid-percent denial",
+            ),
+            ExistingAuditErrorClass::PathTooLong => {
+                if is_truncated_audit_text(&self.path, MAX_AUDIT_TARGET_PATH_BYTES) {
+                    Ok(())
+                } else {
+                    Err("audit target does not match path-too-long denial")
+                }
+            }
+            ExistingAuditErrorClass::QueryTooLong => {
+                if OriginFormPath::parse(&self.path).is_ok()
+                    && self.query.as_deref().is_some_and(|query| {
+                        is_truncated_audit_text(query, MAX_AUDIT_TARGET_QUERY_BYTES)
+                    })
+                {
+                    Ok(())
+                } else {
+                    Err("audit target does not match query-too-long denial")
+                }
+            }
+            ExistingAuditErrorClass::MethodDenied
+            | ExistingAuditErrorClass::PathDenied
+            | ExistingAuditErrorClass::InvalidRequestConnectionHeader
+            | ExistingAuditErrorClass::RequestBodyReadFailed
+            | ExistingAuditErrorClass::RequestBodyTimeout
+            | ExistingAuditErrorClass::RequestBodyTooLarge
+            | ExistingAuditErrorClass::RequestHeadersTooLarge => {
+                if AcceptedTarget::new(&self.path, self.query.as_deref()).is_ok() {
+                    Ok(())
+                } else {
+                    Err("audit target must be accepted before this denial")
+                }
+            }
+            ExistingAuditErrorClass::ConnectUnsupported
+            | ExistingAuditErrorClass::TooManyRequests => Ok(()),
+            ExistingAuditErrorClass::DownstreamClosed
+            | ExistingAuditErrorClass::InvalidResponseConnectionHeader
+            | ExistingAuditErrorClass::ResponseBodyTooLarge
+            | ExistingAuditErrorClass::ResponseHeadersTooLarge
+            | ExistingAuditErrorClass::UpstreamConnectFailed
+            | ExistingAuditErrorClass::UpstreamRequestFailed
+            | ExistingAuditErrorClass::UpstreamResponseStreamFailed
+            | ExistingAuditErrorClass::UpstreamTimeout => {
+                Err("audit error class does not match decision")
+            }
+        }
     }
 
     /// Validates that the decision and error class agree.
@@ -1929,20 +2018,24 @@ fn is_existing_audit_method(value: &str) -> bool {
 
 /// Returns true for writer-shaped truncated method strings.
 fn is_truncated_audit_method(value: &str) -> bool {
-    let Some((prefix, suffix)) = value.split_once(AUDIT_TRUNCATION_PREFIX) else {
-        return false;
-    };
-    let Some(original_bytes_text) = suffix.strip_suffix(AUDIT_TRUNCATION_SUFFIX) else {
-        return false;
-    };
-    let Ok(original_byte_count) = original_bytes_text.parse::<usize>() else {
-        return false;
-    };
-    if value.len() != MAX_ALLOWED_METHOD_BYTES || original_byte_count <= MAX_ALLOWED_METHOD_BYTES {
-        return false;
-    }
+    truncated_audit_text_prefix(value, MAX_ALLOWED_METHOD_BYTES)
+        .is_some_and(|prefix| Method::from_bytes(prefix.as_bytes()).is_ok())
+}
 
-    Method::from_bytes(prefix.as_bytes()).is_ok()
+/// Returns true for writer-shaped truncated audit text.
+fn is_truncated_audit_text(value: &str, max_bytes: usize) -> bool {
+    truncated_audit_text_prefix(value, max_bytes).is_some()
+}
+
+/// Returns the untruncated prefix when audit text matches the writer shape.
+fn truncated_audit_text_prefix(value: &str, max_bytes: usize) -> Option<&str> {
+    let (prefix, suffix) = value.split_once(AUDIT_TRUNCATION_PREFIX)?;
+    let original_bytes_text = suffix.strip_suffix(AUDIT_TRUNCATION_SUFFIX)?;
+    let Ok(original_byte_count) = original_bytes_text.parse::<usize>() else {
+        return None;
+    };
+
+    (value.len() == max_bytes && original_byte_count > max_bytes).then_some(prefix)
 }
 
 /// Validates an existing audit upstream path string.
@@ -2414,12 +2507,12 @@ mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
-        AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
-        ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
-        ExistingAuditEventFields, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
-        ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
-        inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
-        validate_existing_audit_events, write_serialized_event,
+        AuditSchemaVersion, AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget,
+        AuditWriter, ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
+        ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
+        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
+        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
+        is_truncated_audit_method, validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -2746,11 +2839,123 @@ mod tests {
         ))
     }
 
+    /// Builds valid writer-shaped denied existing audit event lines.
+    pub(super) fn denial_existing_event_lines() -> Vec<(&'static str, Vec<u8>)> {
+        let path_too_long = format!("/{}", "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES));
+        let query_too_long = "q".repeat(MAX_AUDIT_TARGET_QUERY_BYTES + 1);
+
+        Vec::from([
+            (
+                "absolute form unsupported",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("http://evil.example/steal", None),
+                    AuditDenialReason::AbsoluteFormUnsupported,
+                ),
+            ),
+            (
+                "connect unsupported",
+                serialized_denial_event_line(
+                    "CONNECT",
+                    AuditTarget::from_uri_parts("evil.example:443", None),
+                    AuditDenialReason::ConnectUnsupported,
+                ),
+            ),
+            (
+                "dot segment",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("/v1/../models", None),
+                    AuditDenialReason::DotSegment,
+                ),
+            ),
+            (
+                "encoded separator",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("/v1/%2fmodels", None),
+                    AuditDenialReason::EncodedSeparator,
+                ),
+            ),
+            (
+                "invalid percent encoding",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("/v1/%zz", None),
+                    AuditDenialReason::InvalidPercentEncoding,
+                ),
+            ),
+            (
+                "non-origin form",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("*", None),
+                    AuditDenialReason::NonOriginForm,
+                ),
+            ),
+            (
+                "path too long",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts(&path_too_long, None),
+                    AuditDenialReason::PathTooLong,
+                ),
+            ),
+            (
+                "query too long",
+                serialized_denial_event_line(
+                    "GET",
+                    AuditTarget::from_uri_parts("/v1/models", Some(&query_too_long)),
+                    AuditDenialReason::QueryTooLong,
+                ),
+            ),
+            (
+                "request body timeout",
+                serialized_unobserved_denial_event_line(AuditDenialReason::RequestBodyTimeout),
+            ),
+            (
+                "too many requests",
+                serialized_denial_event_line(
+                    "CONNECT",
+                    AuditTarget::from_uri_parts("evil.example:443", None),
+                    AuditDenialReason::TooManyRequests,
+                ),
+            ),
+        ])
+    }
+
+    /// Builds one valid serialized denial event line.
+    fn serialized_denial_event_line(
+        method: &str,
+        target: AuditTarget,
+        reason: AuditDenialReason,
+    ) -> Vec<u8> {
+        serialized_audit_event_line(&AuditEvent::new(denied_input(method, target, reason)))
+    }
+
     /// Builds one valid serialized audit event line.
     pub(super) fn serialized_denied_event_line() -> Vec<u8> {
-        let mut line = serde_json::to_vec(&denied_event()).expect("event should serialize");
+        serialized_audit_event_line(&denied_event())
+    }
+
+    /// Builds one valid serialized audit event line.
+    fn serialized_audit_event_line(event: &AuditEvent) -> Vec<u8> {
+        let mut line = serde_json::to_vec(event).expect("event should serialize");
         line.push(b'\n');
         line
+    }
+
+    /// Builds a serialized denial line whose request body was not observed.
+    fn serialized_unobserved_denial_event_line(reason: AuditDenialReason) -> Vec<u8> {
+        let request = request_input(
+            "GET",
+            AuditTarget::from_uri_parts("/v1/models", None),
+            AuditBodySummary::not_observed(),
+        );
+        serialized_audit_event_line(&AuditEvent::new(AuditEventInput::new(
+            request,
+            AuditOutcome::denied(reason),
+        )))
     }
 
     /// Builds one valid serialized audit event value.
@@ -2994,6 +3199,7 @@ mod tests {
     pub(super) fn semantic_invalid_existing_event_lines() -> Vec<(&'static str, Vec<u8>)> {
         let mut lines = Vec::new();
         lines.extend(semantic_invalid_decision_lines());
+        lines.extend(semantic_invalid_denial_shape_lines());
         lines.extend(semantic_invalid_response_lines());
         lines.extend(semantic_invalid_upstream_lines());
         lines
@@ -3080,6 +3286,63 @@ mod tests {
                     "upstream_query",
                     Value::String("limit=1".to_owned()),
                 ),
+            ),
+        ]
+    }
+
+    /// Builds denial-target semantically invalid existing audit event lines.
+    fn semantic_invalid_denial_shape_lines() -> [(&'static str, Vec<u8>); 6] {
+        [
+            (
+                "method denied with non-origin target",
+                serialized_event_line_with_fields([
+                    ("path", Value::String("not-origin-form".to_owned())),
+                    ("status", Value::from(403_u64)),
+                ]),
+            ),
+            (
+                "dot segment denial with encoded separator target",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("dot_segment".to_owned())),
+                    ("path", Value::String("/v1/%2fmodels".to_owned())),
+                    ("status", Value::from(400_u64)),
+                ]),
+            ),
+            (
+                "non-origin-form denial with origin target",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("non_origin_form".to_owned())),
+                    ("path", Value::String("/v1/models".to_owned())),
+                    ("status", Value::from(400_u64)),
+                ]),
+            ),
+            (
+                "path too long without truncated path",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("path_too_long".to_owned())),
+                    ("path", Value::String("/v1/models".to_owned())),
+                    ("status", Value::from(414_u64)),
+                ]),
+            ),
+            (
+                "query too long with non-origin target",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("query_too_long".to_owned())),
+                    ("path", Value::String("*".to_owned())),
+                    (
+                        "query",
+                        Value::String("q".repeat(MAX_AUDIT_TARGET_QUERY_BYTES)),
+                    ),
+                    ("status", Value::from(414_u64)),
+                ]),
+            ),
+            (
+                "query too long without truncated query",
+                serialized_event_line_with_fields([
+                    ("error_class", Value::String("query_too_long".to_owned())),
+                    ("query", Value::String("limit=1".to_owned())),
+                    ("status", Value::from(414_u64)),
+                ]),
             ),
         ]
     }
@@ -3737,6 +4000,31 @@ mod tests {
         }
     }
 
+    #[test]
+    pub(super) fn existing_denied_target_rejects_non_denial_error_classes() {
+        let fields = ExistingAuditEventFields {
+            decision: ExistingAuditDecision::Denied,
+            error_class: Some(ExistingAuditErrorClass::DownstreamClosed),
+            method: "GET".to_owned(),
+            path: "/v1/models".to_owned(),
+            query: None,
+            request_body: ExistingAuditBodySummary::Empty,
+            request_id: "req-000000000000000a-000000000000000b-0000000000000001".to_owned(),
+            response_body: ExistingAuditBodySummary::NotObserved,
+            status: StatusCode::OK,
+            timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
+            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_path: None,
+            upstream_query: None,
+            version: AuditSchemaVersion::CURRENT,
+        };
+
+        assert_eq!(
+            fields.validate_denied_target(fields.error_class),
+            Err("audit error class does not match decision"),
+        );
+    }
+
     pub(super) fn existing_request_body_failures_require_unobserved_bodies() {
         for error_class in [
             ExistingAuditErrorClass::RequestBodyReadFailed,
@@ -4229,6 +4517,20 @@ mod tests {
             result.is_ok(),
             "encoded-separator denials should be accepted"
         );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_denial_shapes() {
+        for (case_name, contents) in denial_existing_event_lines() {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("existing log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            assert!(result.is_ok(), "{case_name} should be accepted");
+        }
     }
 
     #[tokio::test]
@@ -4757,7 +5059,9 @@ mod tests {
 )]
 mod proptests {
     use super::tests::{
-        TailReader, TailReaderFailure, existing_denial_error_classes_bind_statuses,
+        TailReader, TailReaderFailure, denial_existing_event_lines,
+        existing_denial_error_classes_bind_statuses,
+        existing_denied_target_rejects_non_denial_error_classes,
         existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
         existing_upstream_error_classes_bind_statuses, non_empty_body_value,
@@ -4998,6 +5302,42 @@ mod proptests {
         audit_runtime().block_on(AuditWriter::open(config))
     }
 
+    /// Asserts that one existing audit log line is accepted at startup.
+    fn assert_existing_log_accepts(
+        directory: &Path,
+        filename: String,
+        contents: Vec<u8>,
+        case_name: &str,
+    ) {
+        let audit_log = directory.join(filename);
+        fs::write(&audit_log, contents).expect("valid audit log should be written");
+
+        let result = open_writer(&GatewayConfig::for_test(audit_log, roomy_event_limit()));
+
+        assert!(result.is_ok(), "{case_name} should be accepted");
+    }
+
+    /// Asserts that one existing audit log line is rejected as corrupt.
+    fn assert_existing_log_rejects(
+        directory: &Path,
+        filename: String,
+        contents: Vec<u8>,
+        case_name: &str,
+    ) {
+        let audit_log = directory.join(filename);
+        fs::write(&audit_log, contents).expect("invalid audit log should be written");
+
+        let result = open_writer(&GatewayConfig::for_test(
+            audit_log.clone(),
+            roomy_event_limit(),
+        ));
+
+        assert!(
+            matches!(result, Err(super::AuditError::CorruptLog { path, .. }) if path == audit_log),
+            "{case_name} should be rejected"
+        );
+    }
+
     #[test]
     fn run_token_parser_covers_each_boundary_class() {
         let all_digits = "0123456789abcdef-fedcba9876543210";
@@ -5110,38 +5450,37 @@ mod proptests {
         ))
         .expect("valid query-bearing existing log should open");
 
+        for (index, (case_name, contents)) in denial_existing_event_lines().into_iter().enumerate()
+        {
+            assert_existing_log_accepts(
+                directory.path(),
+                format!("valid-denial-shape-{index}.ndjson"),
+                contents,
+                case_name,
+            );
+        }
+
         for (index, (case_name, contents)) in response_error_existing_event_lines()
             .into_iter()
             .enumerate()
         {
-            let audit_log = directory
-                .path()
-                .join(format!("valid-response-error-{index}.ndjson"));
-            fs::write(&audit_log, contents).expect("valid response-error log should be written");
-
-            let result = open_writer(&GatewayConfig::for_test(audit_log, roomy_event_limit()));
-
-            assert!(result.is_ok(), "{case_name} should be accepted");
+            assert_existing_log_accepts(
+                directory.path(),
+                format!("valid-response-error-{index}.ndjson"),
+                contents,
+                case_name,
+            );
         }
 
         for (index, (case_name, contents)) in schema_invalid_existing_event_lines()
             .into_iter()
             .enumerate()
         {
-            let audit_log = directory.path().join(format!("invalid-{index}.ndjson"));
-            fs::write(&audit_log, contents).expect("invalid log should be written");
-
-            let result = open_writer(&GatewayConfig::for_test(
-                audit_log.clone(),
-                roomy_event_limit(),
-            ));
-
-            assert!(
-                matches!(
-                    result,
-                    Err(super::AuditError::CorruptLog { path, .. }) if path == audit_log
-                ),
-                "{case_name} should be rejected"
+            assert_existing_log_rejects(
+                directory.path(),
+                format!("invalid-{index}.ndjson"),
+                contents,
+                case_name,
             );
         }
 
@@ -5149,22 +5488,11 @@ mod proptests {
             .into_iter()
             .enumerate()
         {
-            let audit_log = directory
-                .path()
-                .join(format!("semantic-invalid-{index}.ndjson"));
-            fs::write(&audit_log, contents).expect("invalid log should be written");
-
-            let result = open_writer(&GatewayConfig::for_test(
-                audit_log.clone(),
-                roomy_event_limit(),
-            ));
-
-            assert!(
-                matches!(
-                    result,
-                    Err(super::AuditError::CorruptLog { path, .. }) if path == audit_log
-                ),
-                "{case_name} should be rejected"
+            assert_existing_log_rejects(
+                directory.path(),
+                format!("semantic-invalid-{index}.ndjson"),
+                contents,
+                case_name,
             );
         }
     }
@@ -5172,6 +5500,7 @@ mod proptests {
     #[test]
     fn existing_audit_helpers_cover_closed_domains_under_property_filter() {
         existing_denial_error_classes_bind_statuses();
+        existing_denied_target_rejects_non_denial_error_classes();
         existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
         existing_upstream_error_classes_bind_statuses();
