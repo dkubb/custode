@@ -349,14 +349,19 @@ mod tests {
 
     #[test]
     fn target_rejects_percent_encoded_separators() {
-        assert_eq!(
-            AcceptedTarget::new("/v1/responses/%2e%2e%2fmodels", None),
-            Err(TargetRejectionReason::EncodedSeparator),
-        );
-        assert_eq!(
-            AcceptedTarget::new("/v1/responses/%5cmodels", None),
-            Err(TargetRejectionReason::EncodedSeparator),
-        );
+        for path in [
+            "/v1/responses/%2fmodels",
+            "/v1/responses/%2Fmodels",
+            "/v1/responses/%5cmodels",
+            "/v1/responses/%5Cmodels",
+            "/v1/responses/%2e%2e%2fmodels",
+        ] {
+            assert_eq!(
+                AcceptedTarget::new(path, None),
+                Err(TargetRejectionReason::EncodedSeparator),
+                "path {path}"
+            );
+        }
         assert_eq!(
             AcceptedTarget::new("/v1/responses\\models", None),
             Err(TargetRejectionReason::EncodedSeparator),
