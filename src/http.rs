@@ -1612,6 +1612,9 @@ mod tests {
     use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
 
+    /// Error string produced by the deterministic audit sink.
+    const SCRIPTED_AUDIT_WRITE_ERROR: &str = "failed to write audit event: scripted audit failure";
+
     /// Test wrapper that parses serve arguments.
     #[derive(Debug, Parser)]
     struct ServeCommand {
@@ -1786,6 +1789,35 @@ mod tests {
             .expect("temporary path should be UTF-8")
             .to_owned();
         (audit_log, text)
+    }
+
+    /// Asserts an exact fatal audit event-size failure.
+    fn assert_fatal_event_too_large(
+        fatal: &GatewayError,
+        expected_bytes: usize,
+        expected_max: usize,
+    ) {
+        assert_eq!(
+            fatal.to_string(),
+            format!("audit event has {expected_bytes} bytes, maximum is {expected_max}")
+        );
+        assert!(
+            matches!(
+                fatal,
+                GatewayError::Audit(AuditError::EventTooLarge { bytes, max })
+                    if *bytes == expected_bytes && *max == expected_max
+            ),
+            "unexpected fatal error: {fatal:?}"
+        );
+    }
+
+    /// Asserts an exact scripted fatal audit-write failure.
+    fn assert_scripted_fatal_audit_write(fatal: &GatewayError) {
+        assert_eq!(fatal.to_string(), SCRIPTED_AUDIT_WRITE_ERROR);
+        assert!(
+            matches!(fatal, GatewayError::Audit(AuditError::Write(_error))),
+            "unexpected fatal error: {fatal:?}"
+        );
     }
 
     /// Expected serialized empty body summary.
@@ -3137,10 +3169,7 @@ mod tests {
             .recv()
             .await
             .expect("fatal error should be reported");
-        assert!(
-            matches!(fatal, GatewayError::Audit(AuditError::EventTooLarge { .. })),
-            "completion audit failure should be fatal"
-        );
+        assert_fatal_event_too_large(&fatal, 481, 1);
     }
 
     #[tokio::test]
@@ -3162,10 +3191,7 @@ mod tests {
             .recv()
             .await
             .expect("fatal error should be reported");
-        assert!(
-            matches!(fatal, GatewayError::Audit(AuditError::EventTooLarge { .. })),
-            "disconnect audit failure should be fatal"
-        );
+        assert_fatal_event_too_large(&fatal, 503, 1);
     }
 
     #[tokio::test]
@@ -3932,7 +3958,7 @@ mod tests {
             .recv()
             .await
             .expect("audit failure should be reported");
-        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+        assert_scripted_fatal_audit_write(&fatal);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -3968,7 +3994,7 @@ mod tests {
             .recv()
             .await
             .expect("audit failure should be reported");
-        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+        assert_scripted_fatal_audit_write(&fatal);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4057,7 +4083,7 @@ mod tests {
             .recv()
             .await
             .expect("audit failure should be reported");
-        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+        assert_scripted_fatal_audit_write(&fatal);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4147,7 +4173,7 @@ mod tests {
             .recv()
             .await
             .expect("audit failure should be reported");
-        assert!(matches!(fatal, GatewayError::Audit(AuditError::Write(_))));
+        assert_scripted_fatal_audit_write(&fatal);
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]
@@ -4248,10 +4274,7 @@ mod tests {
             .expect("fatal error should be reported");
 
         assert!(result.is_err());
-        assert!(matches!(
-            fatal,
-            GatewayError::Audit(AuditError::EventTooLarge { .. }),
-        ));
+        assert_fatal_event_too_large(&fatal, 481, 1);
     }
 
     #[tokio::test]
