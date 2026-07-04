@@ -23,7 +23,7 @@ impl AccountedBody {
     /// Returns the byte count.
     #[must_use]
     pub(crate) fn byte_count(&self) -> u64 {
-        u64::try_from(self.bytes.len()).unwrap_or(u64::MAX)
+        u64::try_from(self.bytes.len()).expect("bounded body byte count should fit in u64")
     }
 
     /// Returns the body bytes.
