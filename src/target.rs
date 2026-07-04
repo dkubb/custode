@@ -1052,6 +1052,7 @@ mod proptests {
         OriginFormPathError, OriginFormQuery, OriginFormQueryError,
     };
     use proptest::prelude::*;
+    use url::Url;
 
     /// Origin-form paths built only from valid segments.
     fn path_valid() -> impl Strategy<Value = String> {
@@ -1210,6 +1211,18 @@ mod proptests {
                 .expect("valid paths should be accepted");
 
             prop_assert_eq!(parsed.as_str(), path.as_str());
+        }
+
+        #[test]
+        fn accepted_paths_are_preserved_by_url_set_path(path in path_valid()) {
+            let parsed = OriginFormPath::parse(&path)
+                .expect("valid paths should be accepted");
+            let mut url = Url::parse("https://api.openai.com")
+                .expect("test origin should parse");
+
+            url.set_path(parsed.as_str());
+
+            prop_assert_eq!(url.path(), parsed.as_str());
         }
 
         #[test]
