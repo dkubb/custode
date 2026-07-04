@@ -1209,8 +1209,8 @@ impl Serialize for AuditSchemaVersion {
 impl ObservedBodySummary {
     /// Creates an observed body summary from a response body account.
     #[must_use]
-    pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
-        let (byte_count, response_digest) = response_account.into_digest_parts();
+    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
+        let (byte_count, response_digest) = response_account.digest_parts();
         response_digest.map_or(Self::Empty, |digest| Self::NonEmpty {
             blake3: digest,
             bytes: NonZeroU64::new(byte_count)
@@ -1231,8 +1231,8 @@ impl ObservedBodySummary {
 impl ResponseBodyPrefix {
     /// Creates a prefix summary from accepted response bytes.
     #[must_use]
-    pub(crate) fn from_response_account(response_account: ResponseAccount) -> Self {
-        let (byte_count, response_digest) = response_account.into_digest_parts();
+    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
+        let (byte_count, response_digest) = response_account.digest_parts();
         response_digest.map_or(Self::NoneAccepted, |digest| Self::Accepted {
             blake3: digest,
             bytes: NonZeroU64::new(byte_count)
@@ -3817,7 +3817,7 @@ mod tests {
             .add_chunk(b"accepted")
             .expect("chunk should fit under the limit");
 
-        let prefix = ResponseBodyPrefix::from_response_account(account);
+        let prefix = ResponseBodyPrefix::from_response_account(&account);
 
         assert_eq!(
             prefix,
@@ -5282,7 +5282,7 @@ mod proptests {
         let account = ResponseAccount::new(ResponseBodyBytes::for_test(
             NonZeroU64::new(1).expect("limit should be non-zero"),
         ));
-        let summary = ObservedBodySummary::from_response_account(account).into_summary();
+        let summary = ObservedBodySummary::from_response_account(&account).into_summary();
 
         let value = serde_json::to_value(summary).expect("summary should serialize");
 

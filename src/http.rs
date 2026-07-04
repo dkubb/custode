@@ -188,40 +188,39 @@ enum StreamAbortReason {
 
 impl ResponseAuditContext {
     /// Writes the terminal response audit event.
-    async fn audit(self, stream_outcome: ResponseStreamOutcome) -> Result<(), GatewayError> {
-        let Self {
-            gateway,
-            request_body,
-            request_id,
-            response_account,
-            status,
-            target,
-            ..
-        } = self;
+    async fn audit(&self, stream_outcome: ResponseStreamOutcome) -> Result<(), GatewayError> {
         let audit_outcome = match stream_outcome {
             ResponseStreamOutcome::Allowed => {
-                ResponseAuditOutcome::allowed(response_account, status)
+                ResponseAuditOutcome::allowed(&self.response_account, self.status)
             }
             ResponseStreamOutcome::DownstreamClosed => {
-                ResponseAuditOutcome::downstream_closed(response_account, status)
+                ResponseAuditOutcome::downstream_closed(&self.response_account, self.status)
             }
             ResponseStreamOutcome::ResponseBodyTooLarge => {
-                ResponseAuditOutcome::response_body_too_large(response_account, status)
+                ResponseAuditOutcome::response_body_too_large(&self.response_account, self.status)
             }
             ResponseStreamOutcome::UpstreamResponseStreamFailed => {
-                ResponseAuditOutcome::upstream_response_stream_failed(response_account, status)
+                ResponseAuditOutcome::upstream_response_stream_failed(
+                    &self.response_account,
+                    self.status,
+                )
             }
             ResponseStreamOutcome::UpstreamResponseTimeout => {
-                ResponseAuditOutcome::upstream_response_timeout(response_account, status)
+                ResponseAuditOutcome::upstream_response_timeout(&self.response_account, self.status)
             }
         };
-        let input = ResponseAuditInput::new(target, audit_outcome, request_body, request_id);
-        gateway.audit_response(input).await
+        let input = ResponseAuditInput::new(
+            &self.target,
+            audit_outcome,
+            &self.request_body,
+            self.request_id.clone(),
+        );
+        self.gateway.audit_response(input).await
     }
 
     /// Writes the terminal response audit event or reports a fatal error.
     async fn audit_after_response_started(
-        self,
+        &self,
         outcome: ResponseStreamOutcome,
     ) -> Result<(), ResponseAuditFailure> {
         let fatal_errors = self.fatal_errors.clone();
@@ -484,7 +483,7 @@ async fn forward_request(
         Err(error) => {
             let audit_error = audit_upstream_error(&error);
             let outcome = ResponseAuditOutcome::upstream_error(audit_error);
-            let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
+            let input = ResponseAuditInput::new(&target, outcome, &request_body, request_id);
             return audit_response_status(&gateway, input, audit_error.status()).await;
         }
     };
@@ -497,7 +496,7 @@ async fn forward_request(
         Err(error) => {
             let audit_error = audit_response_header_error(error);
             let outcome = ResponseAuditOutcome::response_header_error(audit_error);
-            let input = ResponseAuditInput::new(target, outcome, request_body, request_id);
+            let input = ResponseAuditInput::new(&target, outcome, &request_body, request_id);
             return audit_response_status(&gateway, input, audit_error.status()).await;
         }
     };
@@ -526,7 +525,7 @@ async fn forward_request(
 /// Audits a response failure and returns its status response.
 async fn audit_response_status(
     gateway: &Gateway,
-    input: ResponseAuditInput,
+    input: ResponseAuditInput<'_>,
     status: StatusCode,
 ) -> Result<Response<Body>, GatewayError> {
     gateway.audit_response(input).await?;

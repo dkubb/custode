@@ -136,9 +136,9 @@ impl ResponseAccount {
         Ok(())
     }
 
-    /// Consumes the account into its response byte count and digest.
+    /// Returns the response byte count and digest.
     #[must_use]
-    pub(crate) fn into_digest_parts(self) -> (u64, Option<BodyDigest>) {
+    pub(crate) fn digest_parts(&self) -> (u64, Option<BodyDigest>) {
         let digest = if self.bytes == 0 {
             None
         } else {
@@ -274,7 +274,7 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Ok(()));
-        let (byte_count, digest) = account.into_digest_parts();
+        let (byte_count, digest) = account.digest_parts();
         assert_eq!(byte_count, 5);
         assert!(digest.is_some());
     }
@@ -286,7 +286,7 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        assert_eq!(account.into_digest_parts(), (0, None));
+        assert_eq!(account.digest_parts(), (0, None));
     }
 
     #[test]
@@ -299,7 +299,7 @@ mod tests {
         let result = account.add_chunk(b"oo");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        let (byte_count, digest) = account.into_digest_parts();
+        let (byte_count, digest) = account.digest_parts();
         assert_eq!(byte_count, 4);
         assert!(digest.is_some());
     }
@@ -308,7 +308,7 @@ mod tests {
     fn finalize_digest_is_none_for_empty_responses() {
         let account = ResponseAccount::new(response_limit(5));
 
-        assert_eq!(account.into_digest_parts(), (0, None));
+        assert_eq!(account.digest_parts(), (0, None));
     }
 
     #[test]
@@ -321,7 +321,7 @@ mod tests {
             .add_chunk(b"lo")
             .expect("second chunk should fit within the limit");
 
-        let (_byte_count, digest) = account.into_digest_parts();
+        let (_byte_count, digest) = account.digest_parts();
         assert_eq!(digest_hex(digest).as_deref(), Some(HELLO_DIGEST));
     }
 }

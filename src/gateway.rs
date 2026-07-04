@@ -53,15 +53,15 @@ pub(crate) enum GatewayError {
 
 /// Input for response audit events.
 #[derive(Debug)]
-pub(crate) struct ResponseAuditInput {
+pub(crate) struct ResponseAuditInput<'request> {
     /// Closed response audit outcome.
     outcome: ResponseAuditOutcome,
     /// Accounted request body.
-    request_body: AccountedBody,
+    request_body: &'request AccountedBody,
     /// Request identity.
     request_id: RequestId,
     /// Allowlist witness for the accepted method and target.
-    target: AllowedTarget,
+    target: &'request AllowedTarget,
 }
 
 /// Closed response audit outcome.
@@ -130,7 +130,7 @@ enum ResponseAuditOutcomeKind {
 impl ResponseAuditOutcome {
     /// Creates an allowed response outcome.
     #[must_use]
-    pub(crate) fn allowed(response_account: ResponseAccount, status: StatusCode) -> Self {
+    pub(crate) fn allowed(response_account: &ResponseAccount, status: StatusCode) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::Allowed {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -141,7 +141,10 @@ impl ResponseAuditOutcome {
 
     /// Creates a downstream-closed response outcome.
     #[must_use]
-    pub(crate) fn downstream_closed(response_account: ResponseAccount, status: StatusCode) -> Self {
+    pub(crate) fn downstream_closed(
+        response_account: &ResponseAccount,
+        status: StatusCode,
+    ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::DownstreamClosed {
                 response_body: ObservedBodySummary::from_response_account(response_account),
@@ -159,7 +162,7 @@ impl ResponseAuditOutcome {
     /// Creates a response-body-too-large outcome.
     #[must_use]
     pub(crate) fn response_body_too_large(
-        response_account: ResponseAccount,
+        response_account: &ResponseAccount,
         status: StatusCode,
     ) -> Self {
         Self {
@@ -189,7 +192,7 @@ impl ResponseAuditOutcome {
     /// Creates an upstream-response-stream-failed outcome.
     #[must_use]
     pub(crate) fn upstream_response_stream_failed(
-        response_account: ResponseAccount,
+        response_account: &ResponseAccount,
         status: StatusCode,
     ) -> Self {
         Self {
@@ -203,7 +206,7 @@ impl ResponseAuditOutcome {
     /// Creates an upstream-response-timeout outcome.
     #[must_use]
     pub(crate) fn upstream_response_timeout(
-        response_account: ResponseAccount,
+        response_account: &ResponseAccount,
         status: StatusCode,
     ) -> Self {
         Self {
@@ -215,13 +218,13 @@ impl ResponseAuditOutcome {
     }
 }
 
-impl ResponseAuditInput {
+impl<'request> ResponseAuditInput<'request> {
     /// Creates response audit input from an accepted method-target witness.
     #[must_use]
     pub(crate) const fn new(
-        target: AllowedTarget,
+        target: &'request AllowedTarget,
         outcome: ResponseAuditOutcome,
-        request_body: AccountedBody,
+        request_body: &'request AccountedBody,
         request_id: RequestId,
     ) -> Self {
         Self {
@@ -267,12 +270,12 @@ impl Gateway {
     /// Returns an error when writing the audit event fails.
     pub(crate) async fn audit_response(
         &self,
-        input: ResponseAuditInput,
+        input: ResponseAuditInput<'_>,
     ) -> Result<(), GatewayError> {
         let request = ObservedAuditRequestInput::new(
-            &input.target,
+            input.target,
             input.request_id,
-            &input.request_body,
+            input.request_body,
             self.config.upstream_origin().clone(),
         );
         let event_input = match input.outcome.into_kind() {
@@ -560,10 +563,11 @@ mod tests {
         let gateway = runtime_gateway(directory.path()).await;
         let request_body = accounted_body(Body::empty()).await;
         let response_account = ResponseAccount::new(gateway.config().max_response_bytes());
+        let target = allowed_target(&gateway, "/v1/models", None);
         let input = ResponseAuditInput::new(
-            allowed_target(&gateway, "/v1/models", None),
-            ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
-            request_body,
+            &target,
+            ResponseAuditOutcome::allowed(&response_account, StatusCode::OK),
+            &request_body,
             RequestId::from_parts(
                 &RunToken::for_test("000000000000000a-000000000000000b"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
@@ -590,10 +594,11 @@ mod tests {
         response_account
             .add_chunk(b"world")
             .expect("response chunk should be accounted");
+        let target = allowed_target(&gateway, "/v1/models", Some("q='"));
         let input = ResponseAuditInput::new(
-            allowed_target(&gateway, "/v1/models", Some("q='")),
-            ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
-            request_body,
+            &target,
+            ResponseAuditOutcome::allowed(&response_account, StatusCode::OK),
+            &request_body,
             RequestId::from_parts(
                 &RunToken::for_test("000000000000000a-000000000000000b"),
                 NonZeroU64::new(1).expect("sequence should be non-zero"),
