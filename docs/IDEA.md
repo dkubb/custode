@@ -281,6 +281,12 @@ If the gateway cannot allocate a request identity, it MUST fail closed by
 terminating the gateway. No request audit event is possible on that path
 because the audit schema requires the missing request identity.
 
+For streaming responses, a downstream close before the gateway starts writing
+the terminal allowed audit event is a response completion failure. After the
+gateway starts writing that required allowed audit event for the final response
+state, the completion decision is committed; a later downstream close while
+sending the already-audited final chunk MUST NOT change the emitted event.
+
 Each audit event MUST include:
 
 - schema version;

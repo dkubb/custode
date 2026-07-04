@@ -470,6 +470,13 @@ started, including after the upstream response body has been fully forwarded,
 the gateway exits the process with a non-zero status so the container fails
 closed and the request cannot complete as an unaudited success.
 
+Response-stream completion has one explicit ordering boundary: if the
+downstream closes before the terminal allowed audit event starts, the gateway
+writes a `response_error` event with error class `downstream_closed`. If the
+terminal allowed audit event has started for the final response state, that
+allowed decision is committed; a later close while sending the already-audited
+final chunk is not reclassified.
+
 ## 11. Audit Log
 
 The audit log is newline-delimited JSON.
