@@ -3,6 +3,7 @@
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{AuditEventBytes, GatewayConfig, UpstreamOrigin};
+use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
 use ::http::{Method, StatusCode};
 use core::fmt;
 use core::num::NonZeroU64;
@@ -19,6 +20,18 @@ use tokio::io::{
     AsyncWriteExt as _, BufReader,
 };
 use tokio::sync::Mutex;
+
+/// Suffix added when audit target text is truncated.
+const AUDIT_TRUNCATION_PREFIX: &str = "...[truncated original_bytes=";
+
+/// Suffix terminator added when audit target text is truncated.
+const AUDIT_TRUNCATION_SUFFIX: &str = "]";
+
+/// Maximum audited request path bytes.
+const MAX_AUDIT_TARGET_PATH_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES;
+
+/// Maximum audited request query bytes.
+const MAX_AUDIT_TARGET_QUERY_BYTES: usize = MAX_ORIGIN_FORM_QUERY_BYTES;
 
 /// Hex bytes in one half of a per-run token.
 #[cfg(test)]
@@ -966,13 +979,10 @@ impl AuditTarget {
     /// Creates an audit target from raw request URI parts.
     #[must_use]
     pub(crate) fn from_uri_parts(path: &str, query: Option<&str>) -> Self {
+        let normalized_path = if path.is_empty() { "/" } else { path };
         Self {
-            path: if path.is_empty() {
-                "/".to_owned()
-            } else {
-                path.to_owned()
-            },
-            query: query.map(str::to_owned),
+            path: bounded_audit_text(normalized_path, MAX_AUDIT_TARGET_PATH_BYTES),
+            query: query.map(|value| bounded_audit_text(value, MAX_AUDIT_TARGET_QUERY_BYTES)),
         }
     }
 
@@ -1303,6 +1313,46 @@ impl AuditTimestamp {
     pub(crate) fn now() -> Self {
         Self(humantime::format_rfc3339_nanos(SystemTime::now()).to_string())
     }
+}
+
+/// Returns audit text bounded to `max_bytes`, with original byte count if cut.
+fn bounded_audit_text(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+
+    let suffix = format!(
+        "{AUDIT_TRUNCATION_PREFIX}{}{AUDIT_TRUNCATION_SUFFIX}",
+        value.len()
+    );
+    let prefix_bytes = max_bytes
+        .checked_sub(suffix.len())
+        .expect("audit target bound should fit the truncation marker");
+    let prefix = utf8_prefix(value, prefix_bytes);
+    let capacity = prefix
+        .len()
+        .checked_add(suffix.len())
+        .expect("bounded audit text length should fit usize");
+    let mut bounded = String::with_capacity(capacity);
+    bounded.push_str(&prefix);
+    bounded.push_str(&suffix);
+    bounded
+}
+
+/// Returns the longest UTF-8 prefix within `max_bytes`.
+fn utf8_prefix(value: &str, max_bytes: usize) -> String {
+    let mut prefix = String::new();
+    for character in value.chars() {
+        let next_len = prefix
+            .len()
+            .checked_add(character.len_utf8())
+            .expect("UTF-8 prefix length should fit usize");
+        if next_len > max_bytes {
+            break;
+        }
+        prefix.push(character);
+    }
+    prefix
 }
 
 /// Inspects an existing audit log tail and maps I/O failures.
@@ -2339,6 +2389,36 @@ mod tests {
 
         assert_eq!(target.path(), "/");
         assert_eq!(target.query(), None);
+    }
+
+    #[test]
+    fn from_uri_parts_truncates_overlong_paths_with_original_length() {
+        let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
+        let target = AuditTarget::from_uri_parts(&path, None);
+        let suffix = format!(
+            "...[truncated original_bytes={}]",
+            MAX_ORIGIN_FORM_PATH_BYTES + 1
+        );
+
+        assert_eq!(target.path().len(), MAX_ORIGIN_FORM_PATH_BYTES);
+        assert!(target.path().starts_with('/'));
+        assert!(target.path().ends_with(&suffix));
+        assert_eq!(target.query(), None);
+    }
+
+    #[test]
+    fn from_uri_parts_truncates_overlong_queries_with_original_length() {
+        let query = "q".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+        let target = AuditTarget::from_uri_parts("/v1/models", Some(&query));
+        let suffix = format!(
+            "...[truncated original_bytes={}]",
+            MAX_ORIGIN_FORM_QUERY_BYTES + 1
+        );
+        let audited_query = target.query().expect("query should be audited");
+
+        assert_eq!(target.path(), "/v1/models");
+        assert_eq!(audited_query.len(), MAX_ORIGIN_FORM_QUERY_BYTES);
+        assert!(audited_query.ends_with(&suffix));
     }
 
     #[test]

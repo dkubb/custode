@@ -2394,7 +2394,9 @@ mod tests {
         let event = events.first().expect("denial should be audited");
         assert_eq!(event["decision"], "denied");
         assert_eq!(event["error_class"], "path_too_long");
-        assert_eq!(event["path"], path);
+        let audited_path = event["path"].as_str().expect("path should be a string");
+        assert_eq!(audited_path.len(), MAX_ORIGIN_FORM_PATH_BYTES);
+        assert!(audited_path.ends_with(&format!("...[truncated original_bytes={}]", path.len())));
     }
 
     #[tokio::test]
@@ -2416,7 +2418,9 @@ mod tests {
         assert_eq!(event["decision"], "denied");
         assert_eq!(event["error_class"], "query_too_long");
         assert_eq!(event["path"], "/v1/models");
-        assert_eq!(event["query"], query);
+        let audited_query = event["query"].as_str().expect("query should be a string");
+        assert_eq!(audited_query.len(), MAX_ORIGIN_FORM_QUERY_BYTES);
+        assert!(audited_query.ends_with(&format!("...[truncated original_bytes={}]", query.len())));
     }
 
     #[tokio::test]

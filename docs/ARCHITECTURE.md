@@ -400,7 +400,9 @@ Configuration parsing is fail-closed:
   allowed operations 256; upstream origin bytes 255; request timeout 3,600
   seconds.
 - `CUSTODE_MAX_AUDIT_EVENT_BYTES` MUST also be at least 65,536 bytes, so every
-  admitted target under the current audit schema remains serializable.
+  admitted target under the current audit schema remains serializable. Rejected
+  raw target fields are bounded before serialization; overlong path or query
+  text keeps a prefix and records the original byte count in the audited string.
 
 A later file-based config MAY replace environment parsing, but it MUST keep the
 same fail-closed semantics.
