@@ -514,6 +514,23 @@ mod tests {
     }
 
     #[test]
+    fn production_request_id_sources_start_with_distinct_ids() {
+        let first_source =
+            SequentialRequestIds::production().expect("first production source should build");
+        let second_source =
+            SequentialRequestIds::production().expect("second production source should build");
+
+        let first = first_source
+            .next_request_id()
+            .expect("first production id should allocate");
+        let second = second_source
+            .next_request_id()
+            .expect("second production id should allocate");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
     fn sequential_request_ids_report_exhaustion_without_wrapping() {
         let run_token = RunToken::for_test("000000000000000a-000000000000000b");
         let request_ids = SequentialRequestIds {
