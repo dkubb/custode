@@ -1,7 +1,7 @@
 # file	regions	functions	lines	branches
 src/adapters.rs	149	24	89	6
 src/allowlist.rs	1	0	1	0
-src/audit.rs	59	18	46	8
+src/audit.rs	50	16	40	7
 src/body.rs	8	3	7	2
 src/config.rs	13	0	11	4
 src/gateway.rs	10	3	6	0

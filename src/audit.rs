@@ -14,7 +14,10 @@ use crate::target::{
 };
 use ::http::{Method, StatusCode, Uri};
 use core::fmt;
+use core::future::Future;
 use core::num::NonZeroU64;
+use core::pin::Pin;
+use core::task::{Context, Poll};
 use serde::de::{Error as SerdeError, Unexpected};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::HashSet;
@@ -24,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
-use tokio::fs::{OpenOptions, create_dir_all};
+use tokio::fs::{File, OpenOptions, create_dir_all};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite,
     AsyncWriteExt as _, BufReader,
@@ -436,10 +439,63 @@ trait AuditLogTailReader: AsyncRead + AsyncSeek + Send + Unpin {}
 
 impl<T> AuditLogTailReader for T where T: AsyncRead + AsyncSeek + Send + Unpin {}
 
-/// Sendable writer surface required to append audit events.
-trait AuditLogWriter: AsyncWrite + Send + Unpin {}
+/// Future returned by audit commit operations.
+type AuditCommit<'writer> = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'writer>>;
 
-impl<T> AuditLogWriter for T where T: AsyncWrite + Send + Unpin {}
+/// Sendable writer surface required to append audit events.
+trait AuditLogWriter: AsyncWrite + Send + Unpin {
+    /// Durably commits flushed audit bytes.
+    fn commit(&mut self) -> AuditCommit<'_>;
+}
+
+/// Audit file adapter that commits event bytes to stable storage.
+struct DurableAuditFile {
+    /// Open audit file.
+    file: File,
+}
+
+impl DurableAuditFile {
+    /// Creates a durable audit file adapter.
+    const fn new(file: File) -> Self {
+        Self { file }
+    }
+}
+
+impl AsyncWrite for DurableAuditFile {
+    fn is_write_vectored(&self) -> bool {
+        self.file.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.file).poll_shutdown(cx)
+    }
+
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.file).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.file).poll_write_vectored(cx, bufs)
+    }
+}
+
+impl AuditLogWriter for DurableAuditFile {
+    fn commit(&mut self) -> AuditCommit<'_> {
+        Box::pin(async move { self.file.sync_data().await })
+    }
+}
 
 /// Structured audit event.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2502,7 +2558,9 @@ impl AuditWriter {
         }
         Ok(Self {
             max_event_bytes: config.max_audit_event_bytes(),
-            state: Arc::new(Mutex::new(AuditWriterState::new(audit_file))),
+            state: Arc::new(Mutex::new(AuditWriterState::new(DurableAuditFile::new(
+                audit_file,
+            )))),
         })
     }
 
@@ -3206,16 +3264,17 @@ fn serialize_json_event(event: &AuditEvent) -> Vec<u8> {
     serde_json::to_vec(event).expect("audit events contain only infallible JSON values")
 }
 
-/// Writes serialized audit bytes to the supplied writer.
+/// Writes, flushes, and commits serialized audit bytes to the supplied writer.
 async fn write_serialized_event<W>(writer: &mut W, serialized: &[u8]) -> Result<(), AuditError>
 where
-    W: AsyncWrite + Unpin + ?Sized,
+    W: AuditLogWriter + ?Sized,
 {
     writer
         .write_all(serialized)
         .await
         .map_err(AuditError::Write)?;
-    writer.flush().await.map_err(AuditError::Write)
+    writer.flush().await.map_err(AuditError::Write)?;
+    writer.commit().await.map_err(AuditError::Write)
 }
 
 #[cfg(test)]
@@ -3226,14 +3285,15 @@ where
 )]
 mod tests {
     use super::{
-        AcceptedAuditTarget, AuditBodySummary, AuditDecision, AuditDenial, AuditDenialReason,
-        AuditError, AuditEvent, AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput,
-        AuditResponseError, AuditResponseHeaderError, AuditSchemaVersion, AuditTarget,
-        AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter, AuthorityAuditTarget,
-        ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
-        ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
-        ObservedBodySummary, PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId,
-        RequiredOption, RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
+        AcceptedAuditTarget, AuditBodySummary, AuditCommit, AuditDecision, AuditDenial,
+        AuditDenialReason, AuditError, AuditEvent, AuditEventInput, AuditLogTail, AuditLogWriter,
+        AuditOutcome, AuditRequestInput, AuditResponseError, AuditResponseHeaderError,
+        AuditSchemaVersion, AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget,
+        AuditWriter, AuthorityAuditTarget, DurableAuditFile, ExistingAuditBodySummary,
+        ExistingAuditDecision, ExistingAuditErrorClass, ExistingAuditEventFields,
+        MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES, ObservedBodySummary,
+        PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId, RequiredOption,
+        RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
         is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
         write_serialized_event,
     };
@@ -3263,18 +3323,19 @@ mod tests {
     use std::time::UNIX_EPOCH;
     use std::{fs, io};
     use tempfile::tempdir;
-    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, ReadBuf};
+    use tokio::fs::OpenOptions as TokioOpenOptions;
+    use tokio::io::{AsyncRead, AsyncSeek, AsyncWrite, AsyncWriteExt as _, ReadBuf};
 
     /// Test writer that fails one write operation class.
     #[derive(Debug)]
-    struct FailingWriter {
+    pub(super) struct FailingWriter {
         /// Operation that should fail.
         failure: WriterFailure,
     }
 
     /// Test writer that writes a prefix, then fails the next write.
     #[derive(Debug)]
-    struct PartialWriteThenFailWriter {
+    pub(super) struct PartialWriteThenFailWriter {
         /// Bytes successfully written before failure.
         bytes: SharedWrittenBytes,
         /// Prefix bytes to write before failing.
@@ -3288,7 +3349,10 @@ mod tests {
 
     /// Test writer failure mode.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    enum WriterFailure {
+    pub(super) enum WriterFailure {
+        /// Fail durable commits.
+        Commit,
+
         /// Fail flushes.
         Flush,
 
@@ -3296,9 +3360,16 @@ mod tests {
         Write,
     }
 
+    impl FailingWriter {
+        /// Creates a writer that fails one operation class.
+        pub(super) const fn failing(failure: WriterFailure) -> Self {
+            Self { failure }
+        }
+    }
+
     impl PartialWriteThenFailWriter {
         /// Creates a writer that writes `prefix_bytes` before failing.
-        fn new(bytes: SharedWrittenBytes, prefix_bytes: usize) -> Self {
+        pub(super) fn new(bytes: SharedWrittenBytes, prefix_bytes: usize) -> Self {
             Self {
                 bytes,
                 prefix_bytes,
@@ -3438,8 +3509,8 @@ mod tests {
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.failure {
+                WriterFailure::Commit | WriterFailure::Write => Poll::Ready(Ok(())),
                 WriterFailure::Flush => Poll::Ready(Err(io::Error::other("flush failed"))),
-                WriterFailure::Write => Poll::Ready(Ok(())),
             }
         }
 
@@ -3453,7 +3524,7 @@ mod tests {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             match self.failure {
-                WriterFailure::Flush => Poll::Ready(Ok(buf.len())),
+                WriterFailure::Commit | WriterFailure::Flush => Poll::Ready(Ok(buf.len())),
                 WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
             }
         }
@@ -3464,12 +3535,23 @@ mod tests {
             bufs: &[io::IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
             match self.failure {
-                WriterFailure::Flush => {
+                WriterFailure::Commit | WriterFailure::Flush => {
                     let bytes = bufs.iter().map(|buf| buf.len()).sum();
                     Poll::Ready(Ok(bytes))
                 }
                 WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
             }
+        }
+    }
+
+    impl AuditLogWriter for FailingWriter {
+        fn commit(&mut self) -> AuditCommit<'_> {
+            Box::pin(async move {
+                match self.failure {
+                    WriterFailure::Commit => Err(io::Error::other("commit failed")),
+                    WriterFailure::Flush | WriterFailure::Write => Ok(()),
+                }
+            })
         }
     }
 
@@ -3519,6 +3601,12 @@ mod tests {
                 return Poll::Ready(Ok(0));
             };
             self.poll_write(cx, first)
+        }
+    }
+
+    impl AuditLogWriter for PartialWriteThenFailWriter {
+        fn commit(&mut self) -> AuditCommit<'_> {
+            Box::pin(async move { Ok(()) })
         }
     }
 
@@ -6420,9 +6508,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_audit_file_delegates_write_methods_to_inner_file() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let expected_vectored = TokioOpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&audit_log)
+            .await
+            .expect("audit file should open")
+            .is_write_vectored();
+        let audit_file = TokioOpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&audit_log)
+            .await
+            .expect("audit file should open");
+        let mut writer = DurableAuditFile::new(audit_file);
+
+        let bytes = writer
+            .write_vectored(&[io::IoSlice::new(b"{"), io::IoSlice::new(b"}\n")])
+            .await
+            .expect("vectored audit file write should succeed");
+        writer
+            .commit()
+            .await
+            .expect("audit file commit should succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("audit file shutdown should succeed");
+
+        assert_eq!(writer.is_write_vectored(), expected_vectored);
+        assert_eq!(bytes, 3);
+        assert_eq!(
+            fs::read(&audit_log).expect("audit log should be readable"),
+            b"{}\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_event_poisons_writer_after_commit_failure() {
+        let writer = AuditWriter::for_test_writer(
+            FailingWriter {
+                failure: WriterFailure::Commit,
+            },
+            AuditEventBytes::for_test(roomy_event_limit()),
+        );
+
+        let first = writer.write_event(&denied_event()).await;
+        let second = writer.write_event(&denied_event()).await;
+
+        assert!(matches!(first, Err(AuditError::Write(_))));
+        assert!(matches!(second, Err(AuditError::Poisoned)));
+    }
+
+    #[tokio::test]
     async fn write_serialized_event_reports_write_failures() {
         let mut writer = FailingWriter {
             failure: WriterFailure::Write,
+        };
+
+        let result = write_serialized_event(&mut writer, b"{\"version\":3}\n").await;
+
+        assert!(matches!(result, Err(AuditError::Write(_))));
+    }
+
+    #[tokio::test]
+    async fn write_serialized_event_reports_commit_failures() {
+        let mut writer = FailingWriter {
+            failure: WriterFailure::Commit,
         };
 
         let result = write_serialized_event(&mut writer, b"{\"version\":3}\n").await;
@@ -6450,8 +6605,9 @@ mod tests {
 )]
 mod proptests {
     use super::tests::{
-        TailReader, TailReaderFailure, denial_existing_event_lines,
-        duplicate_existing_request_ids_reject, existing_denial_error_classes_bind_statuses,
+        FailingWriter, PartialWriteThenFailWriter, TailReader, TailReaderFailure, WriterFailure,
+        denial_existing_event_lines, duplicate_existing_request_ids_reject,
+        existing_denial_error_classes_bind_statuses,
         existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
         existing_request_body_failures_require_unobserved_bodies,
@@ -6465,18 +6621,18 @@ mod proptests {
     };
     use super::{
         AcceptedAuditTarget, AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent,
-        AuditEventInput, AuditOutcome, AuditRequestInput, AuditResponseError,
+        AuditEventInput, AuditLogWriter as _, AuditOutcome, AuditRequestInput, AuditResponseError,
         AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
-        AuditWriter, AuthorityAuditTarget, ObservedBodySummary, PreparsedAuditTarget,
-        RejectedAuditTarget, RequestId, RunToken, RunTokenError, inspect_audit_log_tail,
-        is_existing_request_id,
+        AuditWriter, AuthorityAuditTarget, DurableAuditFile, ObservedBodySummary,
+        PreparsedAuditTarget, RejectedAuditTarget, RequestId, RunToken, RunTokenError,
+        inspect_audit_log_tail, is_existing_request_id,
     };
     use crate::allowlist::{
         AcceptedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
     };
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
     use crate::config::{
-        GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
+        AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, ResponseBodyBytes, UpstreamOrigin,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::{Method, StatusCode, Uri};
@@ -6487,11 +6643,15 @@ mod proptests {
     use proptest::{collection, option};
     use serde_json::{Map, Value, value::to_raw_value};
     use std::fs;
+    use std::io;
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::Command;
+    use std::sync::{Arc as StdArc, Mutex as StdMutex};
     use std::time::UNIX_EPOCH;
     use tempfile::tempdir;
+    use tokio::fs::OpenOptions as TokioOpenOptions;
+    use tokio::io::{AsyncWrite as _, AsyncWriteExt as _};
     use tokio::runtime::{Builder, Runtime};
 
     /// Returns body length as a `u64`.
@@ -7133,6 +7293,77 @@ mod proptests {
             Err(super::AuditError::EventTooLarge { bytes, max })
                 if bytes == exact_size && max == too_small.get()
         ));
+    }
+
+    #[test]
+    fn durable_audit_file_methods_are_covered_under_property_filter() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let runtime = audit_runtime();
+
+        let (expected_vectored, actual_vectored, bytes) = runtime.block_on(async {
+            let expected_vectored = TokioOpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&audit_log)
+                .await
+                .expect("audit file should open")
+                .is_write_vectored();
+            let audit_file = TokioOpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&audit_log)
+                .await
+                .expect("audit file should open");
+            let mut writer = DurableAuditFile::new(audit_file);
+            let actual_vectored = writer.is_write_vectored();
+            let bytes = writer
+                .write_vectored(&[io::IoSlice::new(b"{"), io::IoSlice::new(b"}\n")])
+                .await
+                .expect("vectored audit file write should succeed");
+            writer
+                .commit()
+                .await
+                .expect("audit file commit should succeed");
+            writer
+                .shutdown()
+                .await
+                .expect("audit file shutdown should succeed");
+
+            (expected_vectored, actual_vectored, bytes)
+        });
+
+        let audit_contents = fs::read(audit_log).expect("audit log should be readable");
+
+        assert_eq!(actual_vectored, expected_vectored);
+        assert_eq!(bytes, 3);
+        assert_eq!(audit_contents, b"{}\n");
+    }
+
+    #[test]
+    fn writer_commit_outcomes_are_covered_under_property_filter() {
+        let runtime = audit_runtime();
+        let event = denied_audit_event();
+        let successful_bytes = StdArc::new(StdMutex::new(Vec::new()));
+        let successful_writer = AuditWriter::for_test_writer(
+            PartialWriteThenFailWriter::new(
+                StdArc::clone(&successful_bytes),
+                roomy_event_limit().get(),
+            ),
+            AuditEventBytes::for_test(roomy_event_limit()),
+        );
+        let failing_writer = AuditWriter::for_test_writer(
+            FailingWriter::failing(WriterFailure::Commit),
+            AuditEventBytes::for_test(roomy_event_limit()),
+        );
+
+        let successful = runtime.block_on(successful_writer.write_event(&event));
+        let first_failure = runtime.block_on(failing_writer.write_event(&event));
+        let second_failure = runtime.block_on(failing_writer.write_event(&event));
+
+        successful.expect("commit success should write an event");
+        assert!(matches!(first_failure, Err(super::AuditError::Write(_))));
+        assert!(matches!(second_failure, Err(super::AuditError::Poisoned)));
     }
 
     #[cfg(unix)]
