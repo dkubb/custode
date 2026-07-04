@@ -72,11 +72,19 @@ fn run_coverage_summary_for_source(
         .expect("coverage script should run")
 }
 
-fn run_file_ratchet_for_source(source_text: &str, segments: &str, ratchet: &str) -> Output {
+fn run_file_ratchet_for_source(
+    source_relative_path: &Path,
+    source_text: &str,
+    segments: &str,
+    ratchet: &str,
+) -> Output {
     let directory = tempdir().expect("temporary directory should be created");
-    let source = directory.path().join("fixture.rs");
+    let source = directory.path().join(source_relative_path);
     let summary = directory.path().join("coverage.json");
     let ratchet_path = directory.path().join("ratchet.tsv");
+    if let Some(parent) = source.parent() {
+        fs::create_dir_all(parent).expect("source parent should be created");
+    }
     fs::write(&source, source_text).expect("source fixture should be written");
     fs::write(&ratchet_path, ratchet).expect("ratchet fixture should be written");
     let filename = serde_json::to_string(&source.to_string_lossy())
@@ -289,6 +297,7 @@ fn exclude_test_modules_ignores_alphabetic_char_literals() {
 #[test]
 fn file_ratchet_allows_known_missed_lines_outside_test_modules() {
     let output = run_file_ratchet_for_source(
+        Path::new("fixture.rs"),
         "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
         "[[6,1,0,true,false]]",
         "fixture.rs\t0\t0\t1\t0\n",
@@ -300,10 +309,26 @@ fn file_ratchet_allows_known_missed_lines_outside_test_modules() {
 #[test]
 fn file_ratchet_rejects_new_missed_lines_outside_test_modules() {
     let output = run_file_ratchet_for_source(
+        Path::new("fixture.rs"),
         "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
         "[[6,1,0,true,false]]",
         "fixture.rs\t0\t0\t0\t0\n",
     );
 
     assert_file_line_failure(output, 1, 0);
+}
+
+#[test]
+fn file_ratchet_uses_last_source_directory_component() {
+    let output = run_file_ratchet_for_source(
+        Path::new("src/checkout/src/fixture.rs"),
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[[6,1,0,true,false]]",
+        "src/fixture.rs\t0\t0\t1\t0\n",
+    );
+
+    assert!(
+        output.status.success(),
+        "parent source directories should not change ratchet key"
+    );
 }

@@ -367,6 +367,7 @@ detailed_file_report_excluding_test_modules() {
   local summary_path="${1}"
   local exclusions_path
   local events_path
+  local repo_root
 
   validate_summary_totals "${summary_path}"
 
@@ -381,6 +382,7 @@ detailed_file_report_excluding_test_modules() {
 
   exclusions_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-exclusions.XXXXXX")
   events_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-events.XXXXXX")
+  repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
   build_exclusion_table "${summary_path}" >"${exclusions_path}"
 
   jq --raw-output '
@@ -450,16 +452,42 @@ detailed_file_report_excluding_test_modules() {
     @tsv
   ' "${summary_path}" >"${events_path}"
 
-  awk -F '\t' -v exclusions_path="${exclusions_path}" '
+  awk -F '\t' -v exclusions_path="${exclusions_path}" -v repo_root="${repo_root}" '
+      function suffix_after_last(filename, marker, prefix, parts, count) {
+        count = split(filename, parts, marker)
+        if (count > 1) {
+          return prefix parts[count]
+        }
+        return ""
+      }
       function short_file(filename) {
+        relative = ""
+        src_file = ""
+        tests_file = ""
         if (filename ~ /\/\.cargo\/registry\// || filename ~ /\/index\.crates\.io-/) {
           return ""
         }
-        if (match(filename, /\/src\//)) {
-          return "src/" substr(filename, RSTART + 5)
+        if (repo_root != "" && index(filename, repo_root "/") == 1) {
+          relative = substr(filename, length(repo_root) + 2)
+          if (relative ~ /^(src|tests)\//) {
+            return relative
+          }
+          sub(/^.*\//, "", relative)
+          return relative
         }
-        if (match(filename, /\/tests\//)) {
-          return "tests/" substr(filename, RSTART + 7)
+        src_file = suffix_after_last(filename, "/src/", "src/")
+        tests_file = suffix_after_last(filename, "/tests/", "tests/")
+        if (src_file != "" && tests_file != "") {
+          if (length(src_file) <= length(tests_file)) {
+            return src_file
+          }
+          return tests_file
+        }
+        if (src_file != "") {
+          return src_file
+        }
+        if (tests_file != "") {
+          return tests_file
         }
         sub(/^.*\//, "", filename)
         return filename
