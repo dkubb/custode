@@ -338,7 +338,8 @@ The gateway MUST reject:
 - paths containing literal or percent-encoded `.` or `..` segments, so the
   allowlist decision and the upstream URL are computed from the same path
   segment structure;
-- queries containing literal fragment delimiters;
+- queries containing literal fragment delimiters, literal backslashes, or bytes
+  outside HTTP request-target syntax;
 - method-path pairs absent from the configured operation allowlist, where each
   allowed operation binds exactly one method to exactly one exact path or
   segment-bounded path prefix.

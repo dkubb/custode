@@ -217,7 +217,8 @@ contain literal query delimiters, literal fragment delimiters, literal
 backslashes, percent-encoded path separators, or literal or percent-encoded `.`
 or `..` segments, so that the allowlist decision and the upstream URL are
 computed from the same path segment structure. Incoming request queries MUST NOT
-contain literal fragment delimiters.
+contain literal fragment delimiters, literal backslashes, or bytes outside HTTP
+request-target syntax.
 
 The gateway MUST derive the upstream URL by joining the configured provider
 origin with the incoming origin-form path and query. The incoming `Host` header

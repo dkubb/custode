@@ -851,6 +851,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_query_backslash_does_not_reach_upstream() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let status_line = raw_response_status_line(
+            gateway.addr,
+            "GET /v1/models?q=\\ HTTP/1.1\r\n\
+             Host: proxy.local\r\n\
+             Connection: close\r\n\r\n",
+        )
+        .await;
+
+        assert_eq!(status_line, "HTTP/1.1 400 Bad Request");
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "denied targets must not reach the upstream"
+        );
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "non_origin_form");
+        assert_eq!(event["path"], "/v1/models");
+        assert_eq!(event["query"], r"q=\");
+    }
+
+    #[tokio::test]
     async fn absolute_form_request_line_is_denied_and_audited() {
         let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
