@@ -1175,6 +1175,7 @@ mod tests {
             scenario: &Scenario,
             run: &ScenarioRun,
         ) -> Result<(), TestCaseError> {
+            prop_assert_eq!(run.audit_attempts, 1);
             let expected_events = usize::from(scenario.audit() == ScenarioAudit::Record);
             prop_assert_eq!(run.audit_events.len(), expected_events);
             if expected_events == 0 {
@@ -1369,6 +1370,7 @@ mod tests {
                 assert_eq!(run.status, StatusCode::INTERNAL_SERVER_ERROR);
                 assert_eq!(run.response_body, ScenarioBody::Complete(Bytes::new()));
                 assert!(run.audit_events.is_empty());
+                assert_eq!(run.audit_attempts, 0);
                 assert!(run.upstream_requests.is_empty());
                 assert_eq!(
                     run.fatal_error.as_deref(),
@@ -1449,6 +1451,8 @@ mod tests {
     /// Observations from a deterministic gateway scenario.
     #[derive(Debug, Eq, PartialEq)]
     struct ScenarioRun {
+        /// Number of attempted audit writes.
+        audit_attempts: usize,
         /// Captured audit events.
         audit_events: Vec<Value>,
         /// Upstream deadline used by the gateway.
@@ -1887,6 +1891,7 @@ mod tests {
     async fn run_scenario(scenario: Scenario) -> ScenarioRun {
         let request_shape = scenario.request();
         let (audit, audit_recorder) = MemoryAuditSink::from_audit(scenario.audit());
+        let audit_observer = audit.clone();
         let (client, upstream_recorder) =
             ScriptedUpstreamClient::from_upstream(scenario.upstream());
         let mut config = GatewayConfig::for_runtime_test(
@@ -1943,12 +1948,14 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         yield_now().await;
+        let audit_attempts = audit_observer.event_count();
         let fatal_error = fatal_receiver
             .try_recv()
             .ok()
             .map(|error| error.to_string());
 
         ScenarioRun {
+            audit_attempts,
             audit_events: captured_audit_events,
             deadline,
             fatal_error,
@@ -1961,6 +1968,7 @@ mod tests {
     /// Runs a deterministic request-id exhaustion scenario.
     async fn run_request_id_exhaustion_scenario(permits: usize) -> ScenarioRun {
         let (audit, audit_recorder) = MemoryAuditSink::new();
+        let audit_observer = audit.clone();
         let (client, upstream_recorder) = ScriptedUpstreamClient::new();
         let config = GatewayConfig::for_runtime_test(
             PathBuf::from("unused-audit.ndjson"),
@@ -1994,12 +2002,14 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         yield_now().await;
+        let audit_attempts = audit_observer.event_count();
         let fatal_error = fatal_receiver
             .try_recv()
             .ok()
             .map(|error| error.to_string());
 
         ScenarioRun {
+            audit_attempts,
             audit_events: captured_audit_events,
             deadline,
             fatal_error,
