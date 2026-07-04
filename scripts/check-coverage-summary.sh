@@ -476,6 +476,11 @@ build_exclusion_table() {
         return next_char ~ /^[[:alpha:]_]$/
       }
 
+      function starts_char_literal(text, position, after_next_char) {
+        after_next_char = substr(text, position + 2, 1)
+        return starts_lifetime(text, position) == 0 || after_next_char == "'\''"
+      }
+
       function scan_line(text, cursor, text_length, char, next_char) {
         code_text = ""
         delta = 0
@@ -550,7 +555,7 @@ build_exclusion_table() {
             cursor += 1
             continue
           }
-          if (char == "'\''" && starts_lifetime(text, cursor) == 0) {
+          if (char == "'\''" && starts_char_literal(text, cursor) == 1) {
             in_char = 1
             cursor += 1
             continue

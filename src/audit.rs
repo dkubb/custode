@@ -2869,8 +2869,9 @@ mod proptests {
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
         AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
-        ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
+        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, MAX_AUDIT_METHOD_BYTES,
+        ObservedBodySummary, RequestId, ResponseBodyPrefix, RunToken, RunTokenError,
+        inspect_audit_log_tail,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, ResponseAccount};
@@ -2984,6 +2985,14 @@ mod proptests {
     /// Returns a parsed method from generated method text.
     fn method_value(method: &str) -> Method {
         Method::from_bytes(method.as_bytes()).expect("generated method should parse")
+    }
+
+    /// Generates method text across the audited method boundary.
+    fn method_text() -> impl Strategy<Value = String> {
+        prop_oneof![
+            8 => "[A-Z]{3,8}",
+            1 => Just("A".repeat(MAX_AUDIT_METHOD_BYTES + 1)),
+        ]
     }
 
     /// Returns one closed denial reason from a generated index.
@@ -3177,7 +3186,7 @@ mod proptests {
             denial_kind in 0_u8..16,
             response_error_kind in 0_u8..5,
             upstream_error_kind in 0_u8..3,
-            method in "[A-Z]{3,8}",
+            method in method_text(),
             path in raw_path(),
             query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
             upstream_path in "/[A-Za-z0-9/_-]{0,20}",

@@ -236,3 +236,14 @@ fn exclude_test_modules_ignores_braces_inside_raw_strings() {
 
     assert_line_failure(output, 1, 0);
 }
+
+#[test]
+fn exclude_test_modules_ignores_alphabetic_char_literals() {
+    let output = run_coverage_summary_for_source(
+        "fn before() {}\nmod tests {\n    const LETTER: char = 'a';\n}\nfn after() {}\n",
+        "[[5,1,0,true,false]]",
+        0,
+    );
+
+    assert_line_failure(output, 1, 0);
+}
