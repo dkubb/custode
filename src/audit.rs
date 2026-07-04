@@ -450,14 +450,46 @@ struct ExistingAuditEvent {
 }
 
 /// Existing audit event fields parsed at startup before appending.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct ExistingAuditEventFields {
     /// Final audit decision.
     decision: ExistingAuditDecision,
     /// Stable error class for failed decisions.
-    #[serde(deserialize_with = "deserialize_required_option")]
     error_class: Option<ExistingAuditErrorClass>,
+    /// Request method.
+    method: String,
+    /// Accepted request path, or bounded raw target for denied requests.
+    path: String,
+    /// Request query string without `?`.
+    query: Option<String>,
+    /// Request body summary.
+    request_body: ExistingAuditBodySummary,
+    /// Request identity.
+    request_id: String,
+    /// Response body summary.
+    response_body: ExistingAuditBodySummary,
+    /// Response status returned to the harness.
+    status: StatusCode,
+    /// RFC 3339 UTC timestamp.
+    timestamp: String,
+    /// Configured upstream origin.
+    upstream_origin: UpstreamOrigin,
+    /// Upstream path, when an upstream request was attempted.
+    upstream_path: Option<String>,
+    /// Upstream query, when an upstream request was attempted.
+    upstream_query: Option<String>,
+    /// Audit schema version.
+    version: AuditSchemaVersion,
+}
+
+/// Wire-shaped existing audit event fields parsed at startup.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingAuditEventWireFields {
+    /// Final audit decision.
+    decision: ExistingAuditDecision,
+    /// Stable error class for failed decisions.
+    error_class: RequiredOption<ExistingAuditErrorClass>,
     /// Request method.
     #[serde(deserialize_with = "deserialize_existing_method")]
     method: String,
@@ -466,7 +498,7 @@ struct ExistingAuditEventFields {
     path: String,
     /// Request query string without `?`.
     #[serde(deserialize_with = "deserialize_existing_query")]
-    query: Option<String>,
+    query: RequiredOption<String>,
     /// Request body summary.
     request_body: ExistingAuditBodySummary,
     /// Request identity.
@@ -485,14 +517,18 @@ struct ExistingAuditEventFields {
     upstream_origin: UpstreamOrigin,
     /// Upstream path, when an upstream request was attempted.
     #[serde(deserialize_with = "deserialize_existing_upstream_path")]
-    upstream_path: Option<String>,
+    upstream_path: RequiredOption<String>,
     /// Upstream query, when an upstream request was attempted.
     #[serde(deserialize_with = "deserialize_existing_upstream_query")]
-    upstream_query: Option<String>,
+    upstream_query: RequiredOption<String>,
     /// Audit schema version.
     #[serde(deserialize_with = "deserialize_existing_version")]
     version: AuditSchemaVersion,
 }
+
+/// Field wrapper that requires presence while admitting JSON null.
+#[derive(Debug)]
+struct RequiredOption<T>(Option<T>);
 
 /// Existing audit body summary parsed at startup.
 #[derive(Debug, Deserialize)]
@@ -712,6 +748,72 @@ impl ExistingAuditErrorClass {
             self,
             Self::RequestBodyReadFailed | Self::RequestBodyTimeout | Self::RequestBodyTooLarge
         )
+    }
+}
+
+impl<'de, T> Deserialize<'de> for RequiredOption<T>
+where
+    T: Deserialize<'de>,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<T>::deserialize(deserializer).map(Self)
+    }
+
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
+    }
+}
+
+impl<T> RequiredOption<T> {
+    /// Returns the nullable field value.
+    fn into_option(self) -> Option<T> {
+        let Self(value) = self;
+        value
+    }
+
+    /// Builds a present nullable field wrapper.
+    const fn new(value: Option<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExistingAuditEventFields {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = ExistingAuditEventWireFields::deserialize(deserializer)?;
+        Ok(Self {
+            decision: fields.decision,
+            error_class: fields.error_class.into_option(),
+            method: fields.method,
+            path: fields.path,
+            query: fields.query.into_option(),
+            request_body: fields.request_body,
+            request_id: fields.request_id,
+            response_body: fields.response_body,
+            status: fields.status,
+            timestamp: fields.timestamp,
+            upstream_origin: fields.upstream_origin,
+            upstream_path: fields.upstream_path.into_option(),
+            upstream_query: fields.upstream_query.into_option(),
+            version: fields.version,
+        })
+    }
+
+    fn deserialize_in_place<D>(deserializer: D, place: &mut Self) -> Result<(), D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        *place = Self::deserialize(deserializer)?;
+        Ok(())
     }
 }
 
@@ -2575,16 +2677,17 @@ where
 }
 
 /// Deserializes and validates the existing audit query field.
-fn deserialize_existing_query<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_existing_query<'de, D>(deserializer: D) -> Result<RequiredOption<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
+    let value = RequiredOption::<String>::deserialize(deserializer)?.into_option();
     value
         .map(|query| {
             deserialize_existing_string_bounded(query, MAX_AUDIT_TARGET_QUERY_BYTES, "audit query")
         })
         .transpose()
+        .map(RequiredOption::new)
 }
 
 /// Deserializes and validates the existing audit request identity.
@@ -2649,25 +2752,31 @@ where
 }
 
 /// Deserializes and validates the existing audit upstream path field.
-fn deserialize_existing_upstream_path<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_existing_upstream_path<'de, D>(
+    deserializer: D,
+) -> Result<RequiredOption<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
+    let value = RequiredOption::<String>::deserialize(deserializer)?.into_option();
     value
         .map(|path| deserialize_existing_origin_path(path, "upstream path"))
         .transpose()
+        .map(RequiredOption::new)
 }
 
 /// Deserializes and validates the existing audit upstream query field.
-fn deserialize_existing_upstream_query<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+fn deserialize_existing_upstream_query<'de, D>(
+    deserializer: D,
+) -> Result<RequiredOption<String>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let value = Option::<String>::deserialize(deserializer)?;
+    let value = RequiredOption::<String>::deserialize(deserializer)?.into_option();
     value
         .map(|query| deserialize_existing_origin_query(query, "upstream query"))
         .transpose()
+        .map(RequiredOption::new)
 }
 
 /// Deserializes and validates the existing audit schema version.
@@ -2684,15 +2793,6 @@ where
             &"the current audit schema version",
         ))
     }
-}
-
-/// Deserializes a required nullable field.
-fn deserialize_required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-    D: Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Option::<T>::deserialize(deserializer)
 }
 
 /// Validates bounded audit text from an existing log line.
@@ -2992,9 +3092,10 @@ mod tests {
         AuditSchemaVersion, AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget,
         AuditWriter, ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
         ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
-        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
-        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
-        is_truncated_audit_method, validate_existing_audit_events, write_serialized_event,
+        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, RequiredOption, ResponseBodyPrefix,
+        RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
+        is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
+        write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{NonEmptyBodyObservation, ResponseAccount};
@@ -3503,6 +3604,145 @@ mod tests {
         serialized_event_value_line(&event)
     }
 
+    /// Builds one serialized audit event line with one field removed.
+    pub(super) fn serialized_event_line_without_field(field: &'static str) -> Vec<u8> {
+        let mut event = serialized_denied_event_value();
+        let object = event
+            .as_object_mut()
+            .expect("serialized event should be an object");
+        object
+            .remove(field)
+            .expect("serialized event should contain field");
+        serialized_event_value_line(&event)
+    }
+
+    /// Covers in-place deserialization for required nullable fields.
+    pub(super) fn required_nullable_fields_deserialize_in_place() {
+        let mut nullable = RequiredOption::<String>::new(None);
+        let mut nullable_deserializer = serde_json::Deserializer::from_str("\"present\"");
+
+        <RequiredOption<String> as serde::Deserialize>::deserialize_in_place(
+            &mut nullable_deserializer,
+            &mut nullable,
+        )
+        .expect("required nullable field should deserialize in place");
+
+        assert_eq!(nullable.into_option(), Some("present".to_owned()));
+
+        let mut invalid_nullable = RequiredOption::<String>::new(None);
+        let mut invalid_nullable_deserializer = serde_json::Deserializer::from_str("false");
+        let invalid_nullable_error =
+            <RequiredOption<String> as serde::Deserialize>::deserialize_in_place(
+                &mut invalid_nullable_deserializer,
+                &mut invalid_nullable,
+            )
+            .expect_err("invalid nullable field should fail in-place deserialization");
+
+        assert!(
+            invalid_nullable_error.to_string().contains("invalid type"),
+            "unexpected required nullable field error: {invalid_nullable_error}"
+        );
+
+        let mut fields =
+            serde_json::from_value::<ExistingAuditEventFields>(serialized_denied_event_value())
+                .expect("existing audit event fields should parse");
+        let mut event = serialized_denied_event_value();
+        let object = event
+            .as_object_mut()
+            .expect("serialized event should be an object");
+        object.insert("query".to_owned(), Value::String("limit=1".to_owned()));
+        let serialized_event = serde_json::to_vec(&event).expect("event should serialize");
+        let mut fields_deserializer = serde_json::Deserializer::from_slice(&serialized_event);
+
+        <ExistingAuditEventFields as serde::Deserialize>::deserialize_in_place(
+            &mut fields_deserializer,
+            &mut fields,
+        )
+        .expect("existing audit event fields should deserialize in place");
+
+        assert_eq!(fields.query.as_deref(), Some("limit=1"));
+
+        let missing_query = serialized_event_line_without_field("query");
+        let mut missing_query_deserializer = serde_json::Deserializer::from_slice(&missing_query);
+        let missing_query_error =
+            <ExistingAuditEventFields as serde::Deserialize>::deserialize_in_place(
+                &mut missing_query_deserializer,
+                &mut fields,
+            )
+            .expect_err("missing query should fail in-place deserialization");
+
+        assert!(
+            missing_query_error
+                .to_string()
+                .contains("missing field `query`"),
+            "unexpected existing audit fields error: {missing_query_error}"
+        );
+    }
+
+    /// Covers value deserialization for present required nullable fields.
+    pub(super) fn required_nullable_fields_deserialize_present_values() {
+        let event = AuditEvent::new(AuditEventInput::new(
+            request_input(
+                "GET",
+                AuditTarget::from_uri_parts("/v1/models", Some("limit=1")),
+                AuditBodySummary::empty(),
+            ),
+            AuditOutcome::allowed(
+                ObservedBodySummary::Empty,
+                StatusCode::OK,
+                AuditUpstreamTarget::new("/v1/models", Some("limit=1")),
+            ),
+        ));
+        let event_value = serde_json::from_slice::<Value>(&serialized_audit_event_line(&event))
+            .expect("serialized allowed event line should parse as JSON");
+        let fields = serde_json::from_value::<ExistingAuditEventFields>(event_value)
+            .expect("allowed event fields should parse from a JSON value");
+
+        assert_eq!(fields.error_class, None);
+        assert_eq!(fields.query.as_deref(), Some("limit=1"));
+        assert_eq!(fields.upstream_path.as_deref(), Some("/v1/models"));
+        assert_eq!(fields.upstream_query.as_deref(), Some("limit=1"));
+
+        for (field, invalid_value) in [
+            ("status", Value::from(99_u64)),
+            ("timestamp", Value::String("not-a-timestamp".to_owned())),
+            ("upstream_origin", Value::String("not-a-url".to_owned())),
+        ] {
+            let mut invalid = serialized_denied_event_value();
+            let object = invalid
+                .as_object_mut()
+                .expect("serialized event should be an object");
+            object.insert(field.to_owned(), invalid_value);
+            serde_json::from_value::<ExistingAuditEventFields>(invalid)
+                .expect_err("invalid audit event value should fail deserialization");
+        }
+    }
+
+    /// Covers duplicate request-id rejection for existing audit logs.
+    pub(super) async fn duplicate_existing_request_ids_reject() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("duplicate.ndjson");
+        let line = serialized_denied_event_line();
+        let contents = [line.as_slice(), line.as_slice()].concat();
+
+        fs::write(&audit_log, contents).expect("duplicate log should be written");
+        let result =
+            AuditWriter::open(&GatewayConfig::for_test(audit_log, roomy_event_limit())).await;
+
+        assert!(matches!(result, Err(super::AuditError::CorruptLog { .. })));
+    }
+
+    #[test]
+    fn required_nullable_fields_deserialize_in_place_in_unit_tests() {
+        required_nullable_fields_deserialize_in_place();
+        required_nullable_fields_deserialize_present_values();
+    }
+
+    #[tokio::test]
+    async fn duplicate_existing_request_ids_reject_in_unit_tests() {
+        duplicate_existing_request_ids_reject().await;
+    }
+
     /// Builds one valid non-empty body summary with a custom digest.
     fn non_empty_body_value_with_digest(digest: String) -> Value {
         let mut body = non_empty_body_value();
@@ -3606,8 +3846,24 @@ mod tests {
     fn schema_invalid_existing_metadata_lines(
         too_long_path: String,
         too_long_query: String,
-    ) -> [(&'static str, Vec<u8>); 12] {
+    ) -> [(&'static str, Vec<u8>); 16] {
         [
+            (
+                "missing error class",
+                serialized_event_line_without_field("error_class"),
+            ),
+            (
+                "missing query",
+                serialized_event_line_without_field("query"),
+            ),
+            (
+                "missing upstream path",
+                serialized_event_line_without_field("upstream_path"),
+            ),
+            (
+                "missing upstream query",
+                serialized_event_line_without_field("upstream_query"),
+            ),
             (
                 "invalid status",
                 serialized_event_line_with_field("status", Value::from(99_u64)),
@@ -5872,15 +6128,16 @@ mod tests {
 mod proptests {
     use super::tests::{
         TailReader, TailReaderFailure, denial_existing_event_lines,
-        existing_denial_error_classes_bind_statuses,
+        duplicate_existing_request_ids_reject, existing_denial_error_classes_bind_statuses,
         existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
         existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
         existing_upstream_error_classes_bind_statuses, non_empty_body_value,
-        response_error_existing_event_lines, schema_invalid_existing_event_lines,
-        semantic_invalid_existing_event_lines, serialized_denied_event_line,
-        serialized_denied_event_value, serialized_event_value_line,
+        required_nullable_fields_deserialize_in_place,
+        required_nullable_fields_deserialize_present_values, response_error_existing_event_lines,
+        schema_invalid_existing_event_lines, semantic_invalid_existing_event_lines,
+        serialized_denied_event_line, serialized_denied_event_value, serialized_event_value_line,
         truncated_audit_methods_reject_non_writer_shapes,
     };
     use super::{
@@ -5888,6 +6145,7 @@ mod proptests {
         AuditOutcome, AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
         ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
+        is_existing_request_id,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
@@ -6256,6 +6514,10 @@ mod proptests {
             RunToken::new("0123456789abcdef0fedcba987654321"),
             Err(RunTokenError::InvalidShape),
         );
+        assert_eq!(
+            RunToken::new("0123456789abcde--fedcba9876543210"),
+            Err(RunTokenError::InvalidShape),
+        );
     }
 
     #[test]
@@ -6394,6 +6656,14 @@ mod proptests {
         existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
         existing_upstream_error_classes_bind_statuses();
+        audit_runtime().block_on(duplicate_existing_request_ids_reject());
+        assert!(!is_existing_request_id("request-id"));
+        assert!(!is_existing_request_id("req-000000000000000a"));
+        assert!(!is_existing_request_id(
+            "req-000000000000000a-000000000000000b"
+        ));
+        required_nullable_fields_deserialize_in_place();
+        required_nullable_fields_deserialize_present_values();
         truncated_audit_methods_reject_non_writer_shapes();
     }
 
