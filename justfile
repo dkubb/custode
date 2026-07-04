@@ -63,3 +63,12 @@ mutants:
 check: fmt-check lint shell-check test dockerfile-check
 
 ci: check deny
+
+stress-check:
+    just ci
+    scripts/test-verify-audit-log.sh
+    just docker-test
+    mkdir -p target/fuzz-corpus/{accepted_path_set_path,allowed_operation_parse,upstream_origin_parse}
+    cargo fuzz run accepted_path_set_path target/fuzz-corpus/accepted_path_set_path -- -runs=256
+    cargo fuzz run allowed_operation_parse target/fuzz-corpus/allowed_operation_parse -- -runs=256
+    cargo fuzz run upstream_origin_parse target/fuzz-corpus/upstream_origin_parse -- -runs=256
