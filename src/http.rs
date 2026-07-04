@@ -552,7 +552,7 @@ fn response_stream(
             let _audit_result = context
                 .audit_after_response_started(ResponseStreamOutcome::ResponseStreamTimeout)
                 .await
-                .inspect_err(log_upstream_body_audit_error);
+                .inspect_err(log_response_stream_timeout_audit_error);
             try_send_terminal_stream_error(&sender);
         }
     });
@@ -655,6 +655,11 @@ fn try_send_terminal_stream_error(sender: &mpsc::Sender<Result<Bytes, io::Error>
 /// Logs a downstream-close audit failure.
 fn log_downstream_close_audit_error(audit_error: &ResponseAuditFailure) {
     tracing::error!(%audit_error, "failed to audit downstream close");
+}
+
+/// Logs a response-stream-timeout audit failure.
+fn log_response_stream_timeout_audit_error(audit_error: &ResponseAuditFailure) {
+    tracing::error!(%audit_error, "failed to audit response stream timeout");
 }
 
 /// Logs an upstream-body audit failure.
