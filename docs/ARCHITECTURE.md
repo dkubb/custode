@@ -399,6 +399,11 @@ Configuration parsing is fail-closed:
   bytes 4,096; incoming query bytes 8,192; allowed method bytes 64; allowed
   operation bytes 4,160; allowed operations 256; upstream origin bytes 255;
   request timeout 3,600 seconds.
+- The allowed operation byte limit applies to the raw configured
+  `METHOD:kind:/path` string, including the two `:` delimiters and the
+  `exact` or `prefix` kind. The separate method and path maxima bound parsed
+  components, but one configured operation cannot contain both a maximum-length
+  method and a maximum-length path.
 - `CUSTODE_MAX_AUDIT_EVENT_BYTES` MUST also be at least 65,536 bytes, so every
   admitted target under the current audit schema remains serializable. Rejected
   raw target fields are bounded before serialization; overlong path or query
