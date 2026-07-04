@@ -253,6 +253,95 @@ const fn hex_value(byte: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::inline_modules,
+    reason = "inline test generators keep parser and generator contracts adjacent"
+)]
+pub mod testing {
+    //! Test-only generators for origin-form targets.
+
+    use proptest::collection;
+    use proptest::prelude::*;
+
+    /// Valid percent escapes spanning every byte and both hex cases.
+    fn percent_escape_valid() -> impl Strategy<Value = String> {
+        (any::<u8>(), any::<bool>()).prop_map(|(byte, uppercase)| {
+            if uppercase {
+                format!("%{byte:02X}")
+            } else {
+                format!("%{byte:02x}")
+            }
+        })
+    }
+
+    /// Query atom accepted by the parser.
+    fn query_atom_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[A-Za-z0-9._~-]{1,8}",
+            prop_oneof![
+                Just("!".to_owned()),
+                Just("$".to_owned()),
+                Just("&".to_owned()),
+                Just("'".to_owned()),
+                Just("(".to_owned()),
+                Just(")".to_owned()),
+                Just("*".to_owned()),
+                Just("+".to_owned()),
+                Just(",".to_owned()),
+                Just("/".to_owned()),
+                Just(":".to_owned()),
+                Just(";".to_owned()),
+                Just("=".to_owned()),
+                Just("?".to_owned()),
+                Just("@".to_owned()),
+            ],
+            percent_escape_valid(),
+        ]
+    }
+
+    /// Query atom accepted by the parser and preserved by `url::Url`.
+    fn url_preserved_query_atom_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[A-Za-z0-9._~-]{1,8}",
+            prop_oneof![
+                Just("!".to_owned()),
+                Just("$".to_owned()),
+                Just("&".to_owned()),
+                Just("(".to_owned()),
+                Just(")".to_owned()),
+                Just("*".to_owned()),
+                Just("+".to_owned()),
+                Just(",".to_owned()),
+                Just("/".to_owned()),
+                Just(":".to_owned()),
+                Just(";".to_owned()),
+                Just("=".to_owned()),
+                Just("?".to_owned()),
+                Just("@".to_owned()),
+            ],
+            percent_escape_valid(),
+        ]
+    }
+
+    /// Valid query strings accepted as origin-form query witnesses.
+    pub(crate) fn origin_form_query_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            collection::vec(query_atom_valid(), 1..=8).prop_map(|atoms| atoms.concat()),
+        ]
+    }
+
+    /// Accepted query strings whose raw spelling is preserved by `url::Url`.
+    pub(crate) fn url_preserved_origin_form_query_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just(String::new()),
+            collection::vec(url_preserved_query_atom_valid(), 1..=8)
+                .prop_map(|atoms| atoms.concat()),
+        ]
+    }
+}
+
+#[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
     clippy::inline_modules,
@@ -490,29 +579,13 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
+    use super::testing::origin_form_query_valid;
     use super::{
         MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath,
         OriginFormPathError, OriginFormQuery, OriginFormQueryError,
     };
     use proptest::collection;
     use proptest::prelude::*;
-
-    /// Percent escapes of non-dot bytes, spanning the full hex alphabet in
-    /// both cases.
-    fn escape_non_dot() -> impl Strategy<Value = String> {
-        (any::<u8>(), any::<bool>()).prop_filter_map(
-            "dot escapes decode to dot segments",
-            |(byte, uppercase)| {
-                (byte != b'.').then(|| {
-                    if uppercase {
-                        format!("%{byte:02X}")
-                    } else {
-                        format!("%{byte:02x}")
-                    }
-                })
-            },
-        )
-    }
 
     /// Percent escapes that cannot change path segment structure.
     fn path_escape_valid() -> impl Strategy<Value = String> {
@@ -624,15 +697,6 @@ mod proptests {
             .prop_map(|tail_len| format!("/{}", "a".repeat(tail_len)))
     }
 
-    /// Valid query strings accepted as origin-form query witnesses.
-    fn query_valid() -> impl Strategy<Value = String> {
-        prop_oneof![
-            Just(String::new()),
-            "[A-Za-z0-9_=&.-]{1,24}",
-            escape_non_dot(),
-        ]
-    }
-
     /// Queries whose final percent escape is truncated or non-hex.
     fn query_with_invalid_percent() -> impl Strategy<Value = String> {
         (
@@ -703,7 +767,7 @@ mod proptests {
         }
 
         #[test]
-        fn query_parse_accepts_every_valid_query(query in query_valid()) {
+        fn query_parse_accepts_every_valid_query(query in origin_form_query_valid()) {
             let parsed = OriginFormQuery::parse(&query)
                 .expect("valid query should be accepted");
 

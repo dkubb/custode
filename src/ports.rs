@@ -368,6 +368,7 @@ mod proptests {
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, RequestBodyBytes, RequestHeaderBytes, UpstreamOrigin};
     use crate::headers::forward_request_headers;
+    use crate::target::testing::url_preserved_origin_form_query_valid;
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::num::NonZeroUsize;
@@ -385,7 +386,9 @@ mod proptests {
 
     proptest! {
         #[test]
-        fn from_target_preserves_accepted_target(query in prop::option::of("[a-z0-9=&]{0,16}")) {
+        fn from_target_preserves_accepted_target(
+            query in prop::option::of(url_preserved_origin_form_query_valid()),
+        ) {
             let runtime = Runtime::new()
                 .expect("runtime should build");
             let body = runtime.block_on(AccountedBody::read_request(

@@ -1667,7 +1667,10 @@ mod proptests {
         MAX_RESPONSE_HEADER_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
         parse_allowed_operations, tests::serve_args, usize_to_u128,
     };
-    use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
+    use crate::target::{
+        MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery,
+        testing::url_preserved_origin_form_query_valid,
+    };
     use ::http::Method;
     use core::iter;
     use core::net::SocketAddr;
@@ -2231,7 +2234,7 @@ mod proptests {
         fn join_path_query_preserves_origin_path_and_query(
             origin in origin_valid(),
             path in accepted_path(),
-            query in option::of("[a-z]{1,5}=[a-z]{1,5}"),
+            query in option::of(url_preserved_origin_form_query_valid()),
         ) {
             let parsed = UpstreamOrigin::parse(&origin).expect("generated origin should parse");
             let parsed_path = OriginFormPath::parse(&path)
