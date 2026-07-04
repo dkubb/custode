@@ -167,6 +167,9 @@ incompatibilities, unused dependencies, and broad Clippy lint groups.
 Suppressions MUST NOT be used to hide warnings. If a
 site-local lint exception is needed, it MUST use
 `#[expect(..., reason = "...")]` and the reason MUST explain the invariant.
+The cargo-mutants runner is the only lint-cap exception: `.cargo/mutants.toml`
+sets `cap_lints = true` so lint-only mutants are not discarded before tests
+can kill them. Normal compile, test, and lint gates still deny warnings.
 
 ## 6. Repository Shape
 
