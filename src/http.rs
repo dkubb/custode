@@ -542,11 +542,10 @@ fn response_stream(
                     if let Some(previous_chunk) = pending.take()
                         && sender.send(Ok(previous_chunk)).await.is_err()
                     {
-                        if let Err(audit_error) =
-                            context.audit_after_response_started(outcome).await
-                        {
-                            tracing::error!(%audit_error, "failed to audit upstream body error");
-                        }
+                        let _audit_result = context
+                            .audit_after_response_started(outcome)
+                            .await
+                            .inspect_err(log_upstream_body_audit_error);
                         return;
                     }
                     send_stream_error(&sender, context.audit_after_response_started(outcome).await)
@@ -558,12 +557,10 @@ fn response_stream(
             if let Some(previous_chunk) = pending.take()
                 && sender.send(Ok(previous_chunk)).await.is_err()
             {
-                if let Err(audit_error) = context
+                let _audit_result = context
                     .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                     .await
-                {
-                    tracing::error!(%audit_error, "failed to audit downstream close");
-                }
+                    .inspect_err(log_downstream_close_audit_error);
                 return;
             }
 
@@ -594,12 +591,10 @@ fn response_stream(
         };
 
         let Ok(final_permit) = sender.reserve().await else {
-            if let Err(audit_error) = context
+            let _audit_result = context
                 .audit_after_response_started(ResponseStreamOutcome::DownstreamClosed)
                 .await
-            {
-                tracing::error!(%audit_error, "failed to audit downstream close");
-            }
+                .inspect_err(log_downstream_close_audit_error);
             return;
         };
 
@@ -616,6 +611,16 @@ fn response_stream(
     });
 
     ReceiverStream::new(receiver)
+}
+
+/// Logs a downstream-close audit failure.
+fn log_downstream_close_audit_error(audit_error: &ResponseAuditFailure) {
+    tracing::error!(%audit_error, "failed to audit downstream close");
+}
+
+/// Logs an upstream-body audit failure.
+fn log_upstream_body_audit_error(audit_error: &ResponseAuditFailure) {
+    tracing::error!(%audit_error, "failed to audit upstream body error");
 }
 
 /// Sends a stream error after the terminal audit attempt completes.
@@ -1717,6 +1722,11 @@ mod tests {
     use tokio::task::yield_now;
     use tokio::time::{Instant, advance, sleep};
     use tower::ServiceExt as _;
+    use tracing::{
+        Level,
+        subscriber::{DefaultGuard, set_default},
+    };
+    use tracing_subscriber::fmt;
 
     /// Error string produced by the deterministic audit sink.
     const SCRIPTED_AUDIT_WRITE_ERROR: &str = "failed to write audit event: scripted audit failure";
@@ -4634,6 +4644,54 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert!(events.is_empty());
+        let fatal = fatal_receiver
+            .recv()
+            .await
+            .expect("audit failure should be reported");
+        assert_scripted_fatal_audit_write(&fatal);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_reports_fatal_error_when_pending_chunk_disconnect_audit_fails() {
+        let _subscriber_guard: DefaultGuard =
+            set_default(fmt().with_max_level(Level::ERROR).finish());
+        let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
+        let (audit, audit_events) = MemoryAuditSink::failing_on(fail_on_first);
+        let audit_observer = audit.clone();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::unfold(Some(false), |state| async move {
+            match state {
+                Some(false) => Some((
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"first")),
+                    Some(true),
+                )),
+                Some(true) => {
+                    sleep(Duration::from_secs(1)).await;
+                    Some((
+                        Ok::<Bytes, UpstreamBodyError>(Bytes::from_static(b"second")),
+                        None,
+                    ))
+                }
+                None => None,
+            }
+        });
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let response_body = response_stream(context, upstream_response, test_permit());
+
+        yield_now().await;
+        drop(response_body);
+        advance(Duration::from_secs(1)).await;
+        yield_now().await;
+
+        assert_eq!(audit_observer.event_count(), 1);
+        assert!(
+            audit_events
+                .lock()
+                .expect("memory audit sink should not be poisoned")
+                .is_empty()
+        );
         let fatal = fatal_receiver
             .recv()
             .await
