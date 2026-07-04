@@ -4,6 +4,7 @@ use crate::config::{RequestBodyBytes, ResponseBodyBytes};
 use axum::body::{Body, to_bytes};
 use blake3::{Hash, Hasher};
 use core::error::Error as CoreError;
+use core::num::NonZeroU64;
 use http_body_util::LengthLimitError;
 use serde::{Serialize, Serializer};
 use thiserror::Error;
@@ -19,6 +20,21 @@ pub(crate) struct AccountedBody {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BodyDigest(Hash);
 
+/// Observed body accounting state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BodyObservation {
+    /// Body was observed and empty.
+    Empty,
+
+    /// Body was observed and non-empty.
+    NonEmpty {
+        /// Body digest.
+        blake3: BodyDigest,
+        /// Body byte count.
+        bytes: NonZeroU64,
+    },
+}
+
 impl AccountedBody {
     /// Returns the byte count.
     #[must_use]
@@ -32,20 +48,21 @@ impl AccountedBody {
         &self.bytes
     }
 
-    /// Returns the BLAKE3 digest when the body is non-empty.
-    #[must_use]
-    pub(crate) fn digest(&self) -> Option<BodyDigest> {
-        if self.bytes.is_empty() {
-            None
-        } else {
-            Some(BodyDigest::from_bytes(&self.bytes))
-        }
-    }
-
     /// Creates body accounting from bytes.
     #[must_use]
     const fn from_bytes(bytes: Vec<u8>) -> Self {
         Self { bytes }
+    }
+
+    /// Returns the observed body accounting state.
+    #[must_use]
+    pub(crate) fn observation(&self) -> BodyObservation {
+        NonZeroU64::new(self.byte_count()).map_or(BodyObservation::Empty, |bytes| {
+            BodyObservation::NonEmpty {
+                blake3: BodyDigest::from_non_empty_bytes(&self.bytes, bytes),
+                bytes,
+            }
+        })
     }
 
     /// Reads and accounts for a request body.
@@ -73,15 +90,20 @@ impl AccountedBody {
 }
 
 impl BodyDigest {
-    /// Creates a body digest from complete body bytes.
+    /// Creates a body digest from complete non-empty body bytes.
     #[must_use]
-    pub(crate) fn from_bytes(bytes: &[u8]) -> Self {
+    pub(crate) fn from_non_empty_bytes(bytes: &[u8], byte_count: NonZeroU64) -> Self {
+        debug_assert_eq!(
+            u64::try_from(bytes.len()).expect("slice length should fit in u64"),
+            byte_count.get(),
+            "body digest byte count should match body length",
+        );
         Self(blake3::hash(bytes))
     }
 
-    /// Creates a body digest from a streaming hasher.
+    /// Creates a body digest from a streaming hasher with non-empty bytes.
     #[must_use]
-    fn from_hasher(hasher: &Hasher) -> Self {
+    fn from_non_empty_hasher(hasher: &Hasher, _byte_count: NonZeroU64) -> Self {
         Self(hasher.finalize())
     }
 
@@ -136,17 +158,6 @@ impl ResponseAccount {
         Ok(())
     }
 
-    /// Returns the response byte count and digest.
-    #[must_use]
-    pub(crate) fn digest_parts(&self) -> (u64, Option<BodyDigest>) {
-        let digest = if self.bytes == 0 {
-            None
-        } else {
-            Some(BodyDigest::from_hasher(&self.hasher))
-        };
-        (self.bytes, digest)
-    }
-
     /// Creates a response account.
     #[must_use]
     pub(crate) fn new(max_bytes: ResponseBodyBytes) -> Self {
@@ -155,6 +166,17 @@ impl ResponseAccount {
             hasher: Hasher::new(),
             max_bytes,
         }
+    }
+
+    /// Returns the observed response body accounting state.
+    #[must_use]
+    pub(crate) fn observation(&self) -> BodyObservation {
+        NonZeroU64::new(self.bytes).map_or(BodyObservation::Empty, |bytes| {
+            BodyObservation::NonEmpty {
+                blake3: BodyDigest::from_non_empty_hasher(&self.hasher, bytes),
+                bytes,
+            }
+        })
     }
 }
 
@@ -193,7 +215,9 @@ fn chunk_len_u64(chunk: &[u8]) -> u64 {
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{AccountedBody, BodyDigest, BodyError, RequestBodyError, ResponseAccount};
+    use super::{
+        AccountedBody, BodyDigest, BodyError, BodyObservation, RequestBodyError, ResponseAccount,
+    };
     use crate::config::{RequestBodyBytes, ResponseBodyBytes};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
@@ -204,9 +228,21 @@ mod tests {
     /// BLAKE3 digest of `hello`, computed independently with `b3sum`.
     const HELLO_DIGEST: &str = "ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f";
 
+    /// Returns the digest for non-empty test bytes.
+    fn body_digest(bytes: &[u8]) -> BodyDigest {
+        let byte_count = NonZeroU64::new(
+            u64::try_from(bytes.len()).expect("test body length should fit in u64"),
+        )
+        .expect("test body should be non-empty");
+        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+    }
+
     /// Returns digest hex for assertion output.
-    fn digest_hex(digest: Option<BodyDigest>) -> Option<String> {
-        digest.map(BodyDigest::to_hex_string)
+    fn observation_digest_hex(observation: BodyObservation) -> Option<String> {
+        match observation {
+            BodyObservation::Empty => None,
+            BodyObservation::NonEmpty { blake3, .. } => Some(blake3.to_hex_string()),
+        }
     }
 
     /// A roomy body limit for tests that should not hit the bound.
@@ -233,7 +269,7 @@ mod tests {
         assert_eq!(accounted.bytes(), b"hello");
         assert_eq!(accounted.byte_count(), 5);
         assert_eq!(
-            digest_hex(accounted.digest()).as_deref(),
+            observation_digest_hex(accounted.observation()).as_deref(),
             Some(HELLO_DIGEST)
         );
     }
@@ -246,7 +282,7 @@ mod tests {
 
         assert_eq!(accounted.bytes(), b"");
         assert_eq!(accounted.byte_count(), 0);
-        assert_eq!(accounted.digest(), None);
+        assert_eq!(accounted.observation(), BodyObservation::Empty);
     }
 
     #[tokio::test]
@@ -274,9 +310,13 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Ok(()));
-        let (byte_count, digest) = account.digest_parts();
-        assert_eq!(byte_count, 5);
-        assert!(digest.is_some());
+        assert_eq!(
+            account.observation(),
+            BodyObservation::NonEmpty {
+                blake3: body_digest(b"hello"),
+                bytes: NonZeroU64::new(5).expect("literal should be non-zero"),
+            }
+        );
     }
 
     #[test]
@@ -286,7 +326,7 @@ mod tests {
         let result = account.add_chunk(b"hello");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        assert_eq!(account.digest_parts(), (0, None));
+        assert_eq!(account.observation(), BodyObservation::Empty);
     }
 
     #[test]
@@ -299,16 +339,20 @@ mod tests {
         let result = account.add_chunk(b"oo");
 
         assert_eq!(result, Err(BodyError::ResponseTooLarge));
-        let (byte_count, digest) = account.digest_parts();
-        assert_eq!(byte_count, 4);
-        assert!(digest.is_some());
+        assert_eq!(
+            account.observation(),
+            BodyObservation::NonEmpty {
+                blake3: body_digest(b"hell"),
+                bytes: NonZeroU64::new(4).expect("literal should be non-zero"),
+            }
+        );
     }
 
     #[test]
     fn finalize_digest_is_none_for_empty_responses() {
         let account = ResponseAccount::new(response_limit(5));
 
-        assert_eq!(account.digest_parts(), (0, None));
+        assert_eq!(account.observation(), BodyObservation::Empty);
     }
 
     #[test]
@@ -321,7 +365,9 @@ mod tests {
             .add_chunk(b"lo")
             .expect("second chunk should fit within the limit");
 
-        let (_byte_count, digest) = account.digest_parts();
-        assert_eq!(digest_hex(digest).as_deref(), Some(HELLO_DIGEST));
+        assert_eq!(
+            observation_digest_hex(account.observation()).as_deref(),
+            Some(HELLO_DIGEST)
+        );
     }
 }

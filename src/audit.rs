@@ -1,7 +1,7 @@
 //! Audit event schema and writer.
 
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason};
-use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
+use crate::body::{AccountedBody, BodyDigest, BodyObservation, ResponseAccount};
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{
     MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
@@ -1144,16 +1144,19 @@ impl AuditBodySummary {
         }
     }
 
+    /// Creates a body summary from an observed body.
+    #[must_use]
+    const fn from_observation(observation: BodyObservation) -> Self {
+        match observation {
+            BodyObservation::Empty => Self::empty(),
+            BodyObservation::NonEmpty { blake3, bytes } => Self::non_empty(blake3, bytes),
+        }
+    }
+
     /// Creates an observed body summary from a request body.
     #[must_use]
     fn from_request_body(request_body: &AccountedBody) -> Self {
-        request_body.digest().map_or_else(Self::empty, |digest| {
-            Self::non_empty(
-                digest,
-                NonZeroU64::new(request_body.byte_count())
-                    .expect("request body digest requires non-zero bytes"),
-            )
-        })
+        Self::from_observation(request_body.observation())
     }
 
     /// Creates a non-empty body summary.
@@ -1207,15 +1210,19 @@ impl Serialize for AuditSchemaVersion {
 }
 
 impl ObservedBodySummary {
+    /// Creates an observed body summary from an observed body.
+    #[must_use]
+    const fn from_observation(observation: BodyObservation) -> Self {
+        match observation {
+            BodyObservation::Empty => Self::Empty,
+            BodyObservation::NonEmpty { blake3, bytes } => Self::NonEmpty { blake3, bytes },
+        }
+    }
+
     /// Creates an observed body summary from a response body account.
     #[must_use]
     pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
-        let (byte_count, response_digest) = response_account.digest_parts();
-        response_digest.map_or(Self::Empty, |digest| Self::NonEmpty {
-            blake3: digest,
-            bytes: NonZeroU64::new(byte_count)
-                .expect("response body digest requires non-zero bytes"),
-        })
+        Self::from_observation(response_account.observation())
     }
 
     /// Returns the underlying audit body summary.
@@ -1232,12 +1239,10 @@ impl ResponseBodyPrefix {
     /// Creates a prefix summary from accepted response bytes.
     #[must_use]
     pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
-        let (byte_count, response_digest) = response_account.digest_parts();
-        response_digest.map_or(Self::NoneAccepted, |digest| Self::Accepted {
-            blake3: digest,
-            bytes: NonZeroU64::new(byte_count)
-                .expect("response body digest requires non-zero bytes"),
-        })
+        match response_account.observation() {
+            BodyObservation::Empty => Self::NoneAccepted,
+            BodyObservation::NonEmpty { blake3, bytes } => Self::Accepted { blake3, bytes },
+        }
     }
 
     /// Consumes the prefix into its audit body summary.
@@ -2900,6 +2905,15 @@ mod tests {
         NonZeroU64::new(value).expect("test request sequence should be non-zero")
     }
 
+    /// Returns the digest for non-empty test body bytes.
+    fn body_digest(bytes: &[u8]) -> BodyDigest {
+        let byte_count = NonZeroU64::new(
+            u64::try_from(bytes.len()).expect("test body length should fit in u64"),
+        )
+        .expect("test body should be non-empty");
+        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+    }
+
     /// Returns the fixed upstream origin used by unit-test fixtures.
     fn upstream_origin() -> UpstreamOrigin {
         UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse")
@@ -3884,7 +3898,7 @@ mod tests {
         assert_eq!(
             prefix,
             ResponseBodyPrefix::Accepted {
-                blake3: BodyDigest::from_bytes(b"accepted"),
+                blake3: body_digest(b"accepted"),
                 bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
             },
         );
@@ -3893,14 +3907,14 @@ mod tests {
     #[test]
     fn response_body_prefix_summary_records_accepted_bytes() {
         let prefix = ResponseBodyPrefix::Accepted {
-            blake3: BodyDigest::from_bytes(b"accepted"),
+            blake3: body_digest(b"accepted"),
             bytes: NonZeroU64::new(8).expect("accepted body should be non-empty"),
         };
 
         assert_eq!(
             prefix.into_summary(),
             AuditBodySummary::non_empty(
-                BodyDigest::from_bytes(b"accepted"),
+                body_digest(b"accepted"),
                 NonZeroU64::new(8).expect("accepted body should be non-empty"),
             )
         );
@@ -5314,10 +5328,17 @@ mod proptests {
         u64::try_from(bytes.len()).expect("generated body length should fit u64")
     }
 
+    /// Returns the digest for non-empty generated body bytes.
+    fn body_digest(bytes: &[u8]) -> BodyDigest {
+        let byte_count =
+            NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty");
+        BodyDigest::from_non_empty_bytes(bytes, byte_count)
+    }
+
     /// Returns a non-empty audit body summary for observed bytes.
     fn body_summary(bytes: &[u8]) -> AuditBodySummary {
         AuditBodySummary::non_empty(
-            BodyDigest::from_bytes(bytes),
+            body_digest(bytes),
             NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
         )
     }
@@ -5325,7 +5346,7 @@ mod proptests {
     /// Returns an observed body summary for observed bytes.
     fn observed_body_summary(bytes: &[u8]) -> ObservedBodySummary {
         ObservedBodySummary::NonEmpty {
-            blake3: BodyDigest::from_bytes(bytes),
+            blake3: body_digest(bytes),
             bytes: NonZeroU64::new(body_len(bytes)).expect("generated body should be non-empty"),
         }
     }
@@ -5823,10 +5844,10 @@ mod proptests {
             let status = status_code(status_code_value);
             let request_body = body_summary(&request_body_bytes);
             let request_bytes = body_len(&request_body_bytes);
-            let request_digest = BodyDigest::from_bytes(&request_body_bytes).to_hex_string();
+            let request_digest = body_digest(&request_body_bytes).to_hex_string();
             let observed_response_body = observed_body_summary(&response_body_bytes);
             let response_bytes = body_len(&response_body_bytes);
-            let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
+            let response_digest = body_digest(&response_body_bytes).to_hex_string();
             let upstream = AuditUpstreamTarget::new(&upstream_path, upstream_query.as_deref());
             let (
                 outcome,
@@ -5867,7 +5888,7 @@ mod proptests {
                         1 => (
                             AuditResponseError::response_body_too_large(
                                 ResponseBodyPrefix::Accepted {
-                                    blake3: BodyDigest::from_bytes(&response_body_bytes),
+                                    blake3: body_digest(&response_body_bytes),
                                     bytes: NonZeroU64::new(response_bytes)
                                         .expect("generated body should be non-empty"),
                                 },
