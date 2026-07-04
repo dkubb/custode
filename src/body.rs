@@ -29,6 +29,13 @@ pub(crate) struct NonEmptyBodyObservation {
     bytes: NonZeroU64,
 }
 
+/// Observed response body bytes that exceeded the configured bound.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct OversizedResponseBody {
+    /// Observed response body summary at the overflow point.
+    observation: NonEmptyBodyObservation,
+}
+
 /// Observed body accounting state.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum BodyObservation {
@@ -191,7 +198,7 @@ impl ResponseAccount {
     /// # Errors
     ///
     /// Returns an error when the response body exceeds the configured bound.
-    pub(crate) fn add_chunk(&mut self, chunk: &[u8]) -> Result<(), BodyError> {
+    pub(crate) fn add_chunk(&mut self, chunk: &[u8]) -> Result<(), OversizedResponseBody> {
         let chunk_len = chunk_len_u64(chunk);
         let remaining = self
             .max_bytes
@@ -199,7 +206,7 @@ impl ResponseAccount {
             .checked_sub(self.bytes)
             .expect("response byte count should not exceed limit");
         if chunk_len > remaining {
-            return Err(BodyError::ResponseTooLarge);
+            return Err(self.oversized_body(chunk, chunk_len));
         }
         self.bytes = self
             .bytes
@@ -226,6 +233,20 @@ impl ResponseAccount {
             BodyObservation::NonEmpty(NonEmptyBodyObservation::from_hasher(&self.hasher, bytes))
         })
     }
+
+    /// Builds the observed oversized-body summary without mutating accepted state.
+    #[must_use]
+    fn oversized_body(&self, chunk: &[u8], chunk_len: u64) -> OversizedResponseBody {
+        let bytes = self
+            .bytes
+            .checked_add(chunk_len)
+            .expect("response byte total should not overflow");
+        let non_empty_bytes =
+            NonZeroU64::new(bytes).expect("oversized response body should include observed bytes");
+        let mut hasher = self.hasher.clone();
+        hasher.update(chunk);
+        OversizedResponseBody::from_hasher(&hasher, non_empty_bytes)
+    }
 }
 
 /// Request body handling error.
@@ -243,12 +264,20 @@ pub(crate) enum RequestBodyError {
     TooLarge,
 }
 
-/// Body handling error.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub(crate) enum BodyError {
-    /// Response exceeded its configured maximum.
-    #[error("response body exceeded configured maximum")]
-    ResponseTooLarge,
+impl OversizedResponseBody {
+    /// Creates an oversized-body summary from a streaming body hasher.
+    #[must_use]
+    fn from_hasher(hasher: &Hasher, byte_count: NonZeroU64) -> Self {
+        Self {
+            observation: NonEmptyBodyObservation::from_hasher(hasher, byte_count),
+        }
+    }
+
+    /// Returns the observed response body summary.
+    #[must_use]
+    pub(crate) const fn observation(self) -> NonEmptyBodyObservation {
+        self.observation
+    }
 }
 
 /// Returns a chunk length representable in the response byte counter.
@@ -264,8 +293,8 @@ fn chunk_len_u64(chunk: &[u8]) -> u64 {
 )]
 mod tests {
     use super::{
-        AccountedBody, BodyDigest, BodyError, BodyObservation, NonEmptyBodyObservation,
-        RequestBodyError, ResponseAccount,
+        AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, RequestBodyError,
+        ResponseAccount,
     };
     use crate::config::{RequestBodyBytes, ResponseBodyBytes};
     use axum::body::Body;
@@ -372,7 +401,9 @@ mod tests {
 
         let result = account.add_chunk(b"hello");
 
-        assert_eq!(result, Err(BodyError::ResponseTooLarge));
+        let oversized = result.expect_err("chunk should exceed the response limit");
+
+        assert_eq!(oversized.observation(), non_empty_body(b"hello"));
         assert_eq!(account.observation(), BodyObservation::Empty);
     }
 
@@ -385,7 +416,9 @@ mod tests {
 
         let result = account.add_chunk(b"oo");
 
-        assert_eq!(result, Err(BodyError::ResponseTooLarge));
+        let oversized = result.expect_err("chunk should exceed the accumulated response limit");
+
+        assert_eq!(oversized.observation(), non_empty_body(b"helloo"));
         assert_eq!(
             account.observation(),
             BodyObservation::NonEmpty(non_empty_body(b"hell"))

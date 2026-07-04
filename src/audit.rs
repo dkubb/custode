@@ -2,7 +2,8 @@
 
 use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason};
 use crate::body::{
-    AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, ResponseAccount,
+    AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, OversizedResponseBody,
+    ResponseAccount,
 };
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
 use crate::target::{
@@ -277,8 +278,8 @@ enum AuditResponseErrorKind {
 
     /// Response body exceeded the configured byte limit.
     ResponseBodyTooLarge {
-        /// Accepted response body prefix.
-        response_body: ResponseBodyPrefix,
+        /// Observed oversized response body.
+        response_body: OversizedResponseBody,
         /// Response status returned to the harness.
         status: StatusCode,
     },
@@ -1076,7 +1077,10 @@ impl ExistingAuditEventFields {
                 | ExistingAuditErrorClass::ResponseHeadersTooLarge,
             ) if self.response_body.is_not_observed() => Ok(()),
             Some(ExistingAuditErrorClass::ResponseBodyTooLarge)
-                if !matches!(self.response_body, ExistingAuditBodySummary::Empty) =>
+                if matches!(
+                    self.response_body,
+                    ExistingAuditBodySummary::NonEmpty { .. }
+                ) =>
             {
                 Ok(())
             }
@@ -1238,16 +1242,6 @@ pub(crate) enum ObservedBodySummary {
 
     /// Body was observed and non-empty.
     NonEmpty(NonEmptyBodyObservation),
-}
-
-/// Accepted response prefix for oversized response-body failures.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ResponseBodyPrefix {
-    /// A non-empty response prefix was accepted before the limit failure.
-    Accepted(NonEmptyBodyObservation),
-
-    /// No response bytes were accepted before the limit failure.
-    NoneAccepted,
 }
 
 /// Input used to construct an audit event.
@@ -1515,26 +1509,6 @@ impl ObservedBodySummary {
         match self {
             Self::Empty => AuditBodySummary::empty(),
             Self::NonEmpty(non_empty) => AuditBodySummary::non_empty(non_empty),
-        }
-    }
-}
-
-impl ResponseBodyPrefix {
-    /// Creates a prefix summary from accepted response bytes.
-    #[must_use]
-    pub(crate) fn from_response_account(response_account: &ResponseAccount) -> Self {
-        match response_account.observation() {
-            BodyObservation::Empty => Self::NoneAccepted,
-            BodyObservation::NonEmpty(non_empty) => Self::Accepted(non_empty),
-        }
-    }
-
-    /// Consumes the prefix into its audit body summary.
-    #[must_use]
-    const fn into_summary(self) -> AuditBodySummary {
-        match self {
-            Self::NoneAccepted => AuditBodySummary::not_observed(),
-            Self::Accepted(non_empty) => AuditBodySummary::non_empty(non_empty),
         }
     }
 }
@@ -1818,7 +1792,7 @@ impl AuditResponseError {
                 status,
             } => (
                 "response_body_too_large",
-                response_body.into_summary(),
+                AuditBodySummary::non_empty(response_body.observation()),
                 status,
             ),
             AuditResponseErrorKind::ResponseHeader { error } => (
@@ -1848,7 +1822,7 @@ impl AuditResponseError {
     /// Creates a response-body-too-large response error.
     #[must_use]
     pub(crate) const fn response_body_too_large(
-        response_body: ResponseBodyPrefix,
+        response_body: OversizedResponseBody,
         status: StatusCode,
     ) -> Self {
         Self {
@@ -3088,17 +3062,19 @@ where
 mod tests {
     use super::{
         AuditBodySummary, AuditDecision, AuditDenial, AuditDenialReason, AuditError, AuditEvent,
-        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
-        AuditSchemaVersion, AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget,
-        AuditWriter, ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
-        ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
-        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, RequiredOption, ResponseBodyPrefix,
-        RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
-        is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
-        write_serialized_event,
+        AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseError,
+        AuditResponseHeaderError, AuditSchemaVersion, AuditTarget, AuditTimestamp,
+        AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ExistingAuditBodySummary,
+        ExistingAuditDecision, ExistingAuditErrorClass, ExistingAuditEventFields,
+        MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES, ObservedBodySummary,
+        RUN_TOKEN_BYTES, RequestId, RequiredOption, RunToken, RunTokenError,
+        classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
+        is_truncated_audit_method, validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
-    use crate::body::{NonEmptyBodyObservation, ResponseAccount};
+    use crate::body::{
+        BodyObservation, NonEmptyBodyObservation, OversizedResponseBody, ResponseAccount,
+    };
     use crate::config::{
         AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, MIN_AUDIT_EVENT_BYTES,
         ResponseBodyBytes, UpstreamOrigin,
@@ -3386,6 +3362,16 @@ mod tests {
     /// Returns the observation for non-empty test body bytes.
     fn non_empty_body(bytes: &[u8]) -> NonEmptyBodyObservation {
         NonEmptyBodyObservation::for_test(bytes)
+    }
+
+    /// Returns the oversized response body observed when `bytes` crosses a tiny limit.
+    pub(super) fn oversized_response_body(bytes: &[u8]) -> OversizedResponseBody {
+        let mut account = ResponseAccount::new(ResponseBodyBytes::for_test(
+            NonZeroU64::new(1).expect("limit should be non-zero"),
+        ));
+        account
+            .add_chunk(bytes)
+            .expect_err("test body should exceed the tiny limit")
     }
 
     /// Returns the fixed upstream origin used by unit-test fixtures.
@@ -3974,7 +3960,8 @@ mod tests {
         let mut lines = Vec::new();
         lines.extend(semantic_invalid_decision_lines());
         lines.extend(semantic_invalid_denial_shape_lines());
-        lines.extend(semantic_invalid_response_lines());
+        lines.extend(semantic_invalid_response_header_lines());
+        lines.extend(semantic_invalid_response_body_lines());
         lines.extend(semantic_invalid_upstream_lines());
         lines
     }
@@ -4209,8 +4196,8 @@ mod tests {
         ])
     }
 
-    /// Builds response-level semantically invalid existing audit event lines.
-    fn semantic_invalid_response_lines() -> [(&'static str, Vec<u8>); 8] {
+    /// Builds response-level semantically invalid header/downstream lines.
+    fn semantic_invalid_response_header_lines() -> [(&'static str, Vec<u8>); 4] {
         [
             (
                 "response error with denial class",
@@ -4255,6 +4242,12 @@ mod tests {
                     ("upstream_path", Value::String("/v1/models".to_owned())),
                 ]),
             ),
+        ]
+    }
+
+    /// Builds response-level semantically invalid body lines.
+    fn semantic_invalid_response_body_lines() -> [(&'static str, Vec<u8>); 5] {
+        [
             (
                 "response body too large with empty response body",
                 serialized_event_line_with_fields([
@@ -4266,6 +4259,18 @@ mod tests {
                     ("status", Value::from(200_u64)),
                     ("upstream_path", Value::String("/v1/models".to_owned())),
                     ("response_body", empty_body_value()),
+                ]),
+            ),
+            (
+                "response body too large with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("response_body_too_large".to_owned()),
+                    ),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
                 ]),
             ),
             (
@@ -4642,28 +4647,28 @@ mod tests {
     }
 
     #[test]
-    fn response_body_prefix_records_accepted_bytes() {
+    fn oversized_response_body_records_observed_bytes() {
         let mut account = ResponseAccount::new(ResponseBodyBytes::for_test(
-            NonZeroU64::new(16).expect("limit should be non-zero"),
+            NonZeroU64::new(4).expect("limit should be non-zero"),
         ));
-        account
+        let oversized = account
             .add_chunk(b"accepted")
-            .expect("chunk should fit under the limit");
+            .expect_err("chunk should exceed the response limit");
 
-        let prefix = ResponseBodyPrefix::from_response_account(&account);
-
-        assert_eq!(
-            prefix,
-            ResponseBodyPrefix::Accepted(non_empty_body(b"accepted")),
-        );
+        assert_eq!(oversized.observation(), non_empty_body(b"accepted"));
+        assert_eq!(account.observation(), BodyObservation::Empty);
     }
 
     #[test]
-    fn response_body_prefix_summary_records_accepted_bytes() {
-        let prefix = ResponseBodyPrefix::Accepted(non_empty_body(b"accepted"));
+    fn response_body_too_large_records_observed_bytes() {
+        let error = AuditResponseError::response_body_too_large(
+            oversized_response_body(b"accepted"),
+            StatusCode::OK,
+        );
+        let (_error_class, response_body, _status) = error.into_parts();
 
         assert_eq!(
-            prefix.into_summary(),
+            response_body,
             AuditBodySummary::non_empty(non_empty_body(b"accepted"))
         );
     }
@@ -6134,7 +6139,7 @@ mod proptests {
         existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
         existing_upstream_error_classes_bind_statuses, non_empty_body_value,
-        required_nullable_fields_deserialize_in_place,
+        oversized_response_body, required_nullable_fields_deserialize_in_place,
         required_nullable_fields_deserialize_present_values, response_error_existing_event_lines,
         schema_invalid_existing_event_lines, semantic_invalid_existing_event_lines,
         serialized_denied_event_line, serialized_denied_event_value, serialized_event_value_line,
@@ -6144,8 +6149,7 @@ mod proptests {
         AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent, AuditEventInput,
         AuditOutcome, AuditRequestInput, AuditResponseError, AuditResponseHeaderError, AuditTarget,
         AuditUpstreamError, AuditUpstreamTarget, AuditWriter, ObservedBodySummary, RequestId,
-        ResponseBodyPrefix, RunToken, RunTokenError, inspect_audit_log_tail,
-        is_existing_request_id,
+        RunToken, RunTokenError, inspect_audit_log_tail, is_existing_request_id,
     };
     use crate::allowlist::AcceptedTarget;
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
@@ -6825,15 +6829,17 @@ mod proptests {
                             ),
                             body_value(response_bytes, &response_digest),
                         ),
-                        1 => (
-                            AuditResponseError::response_body_too_large(
-                                ResponseBodyPrefix::Accepted(non_empty_observation(
-                                    &response_body_bytes,
-                                )),
-                                status,
-                            ),
-                            body_value(response_bytes, &response_digest),
-                        ),
+                        1 => {
+                            let overflow_body = b"overflow";
+                            let overflow_digest = body_digest(overflow_body).to_hex_string();
+                            (
+                                AuditResponseError::response_body_too_large(
+                                    oversized_response_body(overflow_body),
+                                    status,
+                                ),
+                                body_value(body_len(overflow_body), &overflow_digest),
+                            )
+                        }
                         2 => (
                             AuditResponseError::response_header(response_header_error(0)),
                             not_observed_body_value(),

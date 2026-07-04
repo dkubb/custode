@@ -554,6 +554,10 @@ the gateway observed an empty body. `non_empty` includes `bytes` and `blake3`
 fields, where `bytes` is non-zero and `blake3` is the lowercase BLAKE3 hex
 digest of the observed bytes.
 
+For `response_body_too_large`, `response_body` MUST be `non_empty`. It records
+the bytes observed through the chunk that crossed the configured response-byte
+bound, so its byte count can be larger than that configured bound.
+
 An audit write failure cannot be represented as an `audit_error` event in the
 required audit log because the failure mode is the inability to write that log.
 The process fails closed instead.

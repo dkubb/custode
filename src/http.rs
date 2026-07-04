@@ -9,7 +9,7 @@ use crate::audit::{
     AuditDenial, AuditDenialReason, AuditResponseHeaderError, AuditTarget, AuditUpstreamError,
     AuditWriter, RequestId,
 };
-use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
+use crate::body::{AccountedBody, OversizedResponseBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::gateway::{Gateway, GatewayError, ResponseAuditInput, ResponseAuditOutcome};
 use crate::headers::{
@@ -154,7 +154,10 @@ enum ResponseStreamOutcome {
     DownstreamClosed,
 
     /// Response body exceeded the configured byte limit.
-    ResponseBodyTooLarge,
+    ResponseBodyTooLarge {
+        /// Observed oversized response body.
+        response_body: OversizedResponseBody,
+    },
 
     /// Upstream response stream failed after upstream I/O started.
     UpstreamResponseStreamFailed,
@@ -196,8 +199,8 @@ impl ResponseAuditContext {
             ResponseStreamOutcome::DownstreamClosed => {
                 ResponseAuditOutcome::downstream_closed(&self.response_account, self.status)
             }
-            ResponseStreamOutcome::ResponseBodyTooLarge => {
-                ResponseAuditOutcome::response_body_too_large(&self.response_account, self.status)
+            ResponseStreamOutcome::ResponseBodyTooLarge { response_body } => {
+                ResponseAuditOutcome::response_body_too_large(response_body, self.status)
             }
             ResponseStreamOutcome::UpstreamResponseStreamFailed => {
                 ResponseAuditOutcome::upstream_response_stream_failed(
@@ -584,11 +587,13 @@ fn response_stream(
                 return;
             }
 
-            if let Err(_error) = context.response_account.add_chunk(&chunk) {
+            if let Err(response_body) = context.response_account.add_chunk(&chunk) {
                 send_stream_error(
                     &sender,
                     context
-                        .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge)
+                        .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge {
+                            response_body,
+                        })
                         .await,
                     StreamAbortReason::ResponseBodyTooLarge,
                 )
@@ -989,6 +994,12 @@ mod tests {
             }
         }
 
+        /// Returns body length as a `u64`.
+        fn audit_body_len(body: &[u8]) -> Result<u64, TestCaseError> {
+            u64::try_from(body.len())
+                .map_err(|_error| TestCaseError::fail("audit body length should fit u64"))
+        }
+
         /// Returns lower-case headers named by generated connection headers.
         fn connection_header_names(headers: &[(String, String)]) -> Vec<String> {
             headers
@@ -1045,8 +1056,8 @@ mod tests {
                     "response_error",
                     Value::String("response_body_too_large".to_owned()),
                     StatusCode::CREATED,
-                    0,
-                    not_observed_body_value(),
+                    audit_body_len(b"script")?,
+                    audit_body_value(b"script")?,
                     true,
                 )),
                 (
@@ -1399,10 +1410,17 @@ mod tests {
                 &request_body_value_for_audit(scenario)?
             );
             prop_assert_eq!(&object["response_body"], &response_body);
-            prop_assert!(
-                response_bytes <= max_response_bytes(scenario),
-                "audited response bytes exceeded scenario bound"
-            );
+            if error_class == Value::String("response_body_too_large".to_owned()) {
+                prop_assert!(
+                    response_bytes > max_response_bytes(scenario),
+                    "oversized response audit should record observed bytes past the bound"
+                );
+            } else {
+                prop_assert!(
+                    response_bytes <= max_response_bytes(scenario),
+                    "audited response bytes exceeded scenario bound"
+                );
+            }
             prop_assert_eq!(&object["status"], &Value::from(status.as_u16()));
             prop_assert_eq!(
                 &object["timestamp"],
@@ -2370,7 +2388,6 @@ mod tests {
                 Ok(ScenarioFatalError::RequestIdSequenceExhausted)
             }
             unexpected @ (GatewayError::Audit(_)
-            | GatewayError::Body(_)
             | GatewayError::Header(_)
             | GatewayError::ResponseBuild(_)) => Err(unexpected),
         }
@@ -3231,7 +3248,10 @@ mod tests {
         let event = events.first().expect("failure should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "response_body_too_large");
-        assert_eq!(event["response_body"], not_observed_body_value());
+        assert_eq!(
+            event["response_body"],
+            non_empty_body_value(b"0123456789abcdef")
+        );
     }
 
     #[tokio::test]

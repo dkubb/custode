@@ -4,9 +4,9 @@ use crate::allowlist::AllowedTarget;
 use crate::audit::{
     AuditDenial, AuditError, AuditEvent, AuditEventInput, AuditRequestInput, AuditResponseError,
     AuditResponseHeaderError, AuditUpstreamError, ObservedAuditRequestInput, ObservedBodySummary,
-    RequestId, ResponseBodyPrefix,
+    RequestId,
 };
-use crate::body::{AccountedBody, BodyError, ResponseAccount};
+use crate::body::{AccountedBody, OversizedResponseBody, ResponseAccount};
 use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdError, RequestIdSource};
@@ -33,10 +33,6 @@ pub(crate) enum GatewayError {
     /// Audit log failed.
     #[error("{0}")]
     Audit(#[from] AuditError),
-
-    /// Body accounting failed.
-    #[error("{0}")]
-    Body(#[from] BodyError),
 
     /// Header filtering failed.
     #[error("{0}")]
@@ -92,8 +88,8 @@ enum ResponseAuditOutcomeKind {
 
     /// Response body exceeded the configured limit.
     ResponseBodyTooLarge {
-        /// Accepted response body prefix.
-        response_body: ResponseBodyPrefix,
+        /// Observed oversized response body.
+        response_body: OversizedResponseBody,
         /// Response status returned to the harness.
         status: StatusCode,
     },
@@ -161,13 +157,13 @@ impl ResponseAuditOutcome {
 
     /// Creates a response-body-too-large outcome.
     #[must_use]
-    pub(crate) fn response_body_too_large(
-        response_account: &ResponseAccount,
+    pub(crate) const fn response_body_too_large(
+        response_body: OversizedResponseBody,
         status: StatusCode,
     ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::ResponseBodyTooLarge {
-                response_body: ResponseBodyPrefix::from_response_account(response_account),
+                response_body,
                 status,
             },
         }
