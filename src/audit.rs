@@ -3974,6 +3974,27 @@ mod tests {
         assert!(matches!(result, Err(super::AuditError::CorruptLog { .. })));
     }
 
+    /// Covers distinct request-id acceptance for existing audit logs.
+    pub(super) async fn distinct_existing_request_ids_open() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("distinct.ndjson");
+        let first = serialized_event_line_with_field(
+            "request_id",
+            Value::String("req-000000000000000a-000000000000000b-0000000000000001".to_owned()),
+        );
+        let second = serialized_event_line_with_field(
+            "request_id",
+            Value::String("req-000000000000000a-000000000000000b-0000000000000002".to_owned()),
+        );
+        let contents = [first.as_slice(), second.as_slice()].concat();
+
+        fs::write(&audit_log, contents).expect("distinct log should be written");
+        let result =
+            AuditWriter::open(&GatewayConfig::for_test(audit_log, roomy_event_limit())).await;
+
+        result.expect("distinct request ids should be accepted");
+    }
+
     #[test]
     fn required_nullable_fields_deserialize_in_place_in_unit_tests() {
         required_nullable_fields_deserialize_in_place();
@@ -3983,6 +4004,11 @@ mod tests {
     #[tokio::test]
     async fn duplicate_existing_request_ids_reject_in_unit_tests() {
         duplicate_existing_request_ids_reject().await;
+    }
+
+    #[tokio::test]
+    async fn distinct_existing_request_ids_open_in_unit_tests() {
+        distinct_existing_request_ids_open().await;
     }
 
     /// Builds one valid non-empty body summary with a custom digest.
@@ -6742,8 +6768,8 @@ mod tests {
 mod proptests {
     use super::tests::{
         FailingWriter, PartialWriteThenFailWriter, TailReader, TailReaderFailure, WriterFailure,
-        denial_existing_event_lines, duplicate_existing_request_ids_reject,
-        existing_denial_error_classes_bind_statuses,
+        denial_existing_event_lines, distinct_existing_request_ids_open,
+        duplicate_existing_request_ids_reject, existing_denial_error_classes_bind_statuses,
         existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
         existing_error_class_guard_binds_decisions,
@@ -7395,6 +7421,7 @@ mod proptests {
         existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
         existing_upstream_error_classes_bind_statuses();
+        audit_runtime().block_on(distinct_existing_request_ids_open());
         audit_runtime().block_on(duplicate_existing_request_ids_reject());
         assert!(!is_existing_request_id("request-id"));
         assert!(!is_existing_request_id("req-000000000000000a"));
