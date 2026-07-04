@@ -35,6 +35,7 @@ allow = []
 deny = []
 skip = [
   { crate = "syn@1.0.109", reason = "non-empty-string 0.2.6 depends on delegate, whose proc macro still uses syn 1; no newer non-empty-string release is available" },
+  { crate = "getrandom@0.2.17", reason = "ring 0.17 via rustls still depends on getrandom 0.2 while custode and current dev tooling use getrandom 0.3" },
   { crate = "windows-sys@0.52.0", reason = "ring 0.17 depends on this Windows support crate while current CLI/runtime dependencies use windows-sys 0.61" },
 ]
 
