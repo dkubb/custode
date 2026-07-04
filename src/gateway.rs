@@ -11,6 +11,7 @@ use crate::config::GatewayConfig;
 use crate::headers::HeaderError;
 use crate::ports::{AuditSink, Clock, RequestIdError, RequestIdSource};
 use ::http::{Error as HttpError, StatusCode};
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -19,6 +20,8 @@ use thiserror::Error;
 pub(crate) struct Gateway {
     /// Audit log writer.
     audit: Arc<dyn AuditSink>,
+    /// True after a required audit event failed to write.
+    audit_failed: Arc<AtomicBool>,
     /// Audit timestamp source.
     clock: Arc<dyn Clock>,
     /// Parsed gateway configuration.
@@ -33,6 +36,10 @@ pub(crate) enum GatewayError {
     /// Audit log failed.
     #[error("{0}")]
     Audit(#[from] AuditError),
+
+    /// Audit log is unavailable after a previous required audit failure.
+    #[error("audit is unavailable after a previous required audit failure")]
+    AuditUnavailable,
 
     /// Header filtering failed.
     #[error("{0}")]
@@ -233,6 +240,22 @@ impl<'request> ResponseAuditInput<'request> {
 }
 
 impl Gateway {
+    /// Writes one required audit event and records permanent audit failure.
+    async fn append_required_audit_event(&self, event: &AuditEvent) -> Result<(), GatewayError> {
+        if let Err(error) = self.audit.append_event(event).await {
+            self.audit_failed.store(true, Ordering::SeqCst);
+            Err(GatewayError::Audit(error))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Returns true when required audit writes are still available.
+    #[must_use]
+    pub(crate) fn audit_available(&self) -> bool {
+        !self.audit_failed.load(Ordering::SeqCst)
+    }
+
     /// Writes an audit event for a denied request.
     ///
     /// # Errors
@@ -251,8 +274,7 @@ impl Gateway {
             self.config.upstream_origin().clone(),
         );
         let event = AuditEvent::new_at(AuditEventInput::denied(request), self.clock.now());
-        self.audit.append_event(&event).await?;
-        Ok(())
+        self.append_required_audit_event(&event).await
     }
 
     /// Writes an audit event for a completed upstream response.
@@ -313,8 +335,7 @@ impl Gateway {
             }
         };
         let event = AuditEvent::new_at(event_input, self.clock.now());
-        self.audit.append_event(&event).await?;
-        Ok(())
+        self.append_required_audit_event(&event).await
     }
 
     /// Returns the parsed configuration.
@@ -333,6 +354,7 @@ impl Gateway {
     ) -> Self {
         Self {
             audit: Arc::new(audit),
+            audit_failed: Arc::new(AtomicBool::new(false)),
             clock: Arc::new(clock),
             config: Arc::new(config),
             request_ids: Arc::new(request_ids),
@@ -345,6 +367,15 @@ impl Gateway {
     /// cross-run collisions negligible under the OS RNG assumption.
     pub(crate) fn next_request_id(&self) -> Result<RequestId, RequestIdError> {
         self.request_ids.next_request_id()
+    }
+
+    /// Returns an error when a previous required audit event failed.
+    pub(crate) fn require_audit_available(&self) -> Result<(), GatewayError> {
+        if self.audit_available() {
+            Ok(())
+        } else {
+            Err(GatewayError::AuditUnavailable)
+        }
     }
 }
 
@@ -364,6 +395,7 @@ mod tests {
     };
     use crate::body::{AccountedBody, ResponseAccount};
     use crate::config::{GatewayConfig, RequestBodyBytes};
+    use crate::sim::{FixedClock, MemoryAuditSink};
     use ::http::{Method, StatusCode, Uri};
     use axum::body::Body;
     use core::num::{NonZeroU64, NonZeroUsize};
@@ -426,6 +458,45 @@ mod tests {
     fn allowed_target(gateway: &Gateway, path: &str, query: Option<&str>) -> AllowedTarget {
         let target = AcceptedTarget::new(path, query).expect("target should parse");
         allow_target(gateway.config(), &Method::GET, target).expect("target should be allowed")
+    }
+
+    /// Asserts that a required audit failure makes the gateway unavailable.
+    async fn assert_failed_audit_marks_gateway_unavailable() {
+        let config = GatewayConfig::for_runtime_test(
+            Path::new("unused-audit.ndjson").to_owned(),
+            "https://api.openai.com",
+        );
+        let (audit, _audit_recorder) =
+            MemoryAuditSink::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"));
+        let gateway = Gateway::from_ports(
+            config,
+            audit,
+            FixedClock,
+            SequentialRequestIds::new(RunToken::for_test("000000000000000a-000000000000000b")),
+        );
+
+        let result = gateway
+            .audit_denial(
+                RequestId::from_parts(
+                    &RunToken::for_test("000000000000000a-000000000000000b"),
+                    NonZeroU64::new(1).expect("sequence should be non-zero"),
+                ),
+                AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(
+                    &Uri::from_static("/"),
+                )),
+                None,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(GatewayError::Audit(AuditError::Write(_)))
+        ));
+        assert!(!gateway.audit_available());
+        assert!(matches!(
+            gateway.require_audit_available(),
+            Err(GatewayError::AuditUnavailable)
+        ));
     }
 
     /// Expected serialized empty body summary.
@@ -630,6 +701,16 @@ mod tests {
         let config = gateway.config();
 
         assert_eq!(config.upstream_origin().as_str(), "https://api.openai.com");
+    }
+
+    #[tokio::test]
+    async fn failed_audit_marks_gateway_unavailable() {
+        assert_failed_audit_marks_gateway_unavailable().await;
+    }
+
+    #[tokio::test]
+    async fn proptests_failed_audit_marks_gateway_unavailable() {
+        assert_failed_audit_marks_gateway_unavailable().await;
     }
 
     #[tokio::test]

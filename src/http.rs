@@ -302,6 +302,11 @@ async fn proxy(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
+    if !state.gateway.audit_available() {
+        report_fatal_error(&state.fatal_errors, GatewayError::AuditUnavailable);
+        return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
     let permit = match Arc::clone(&state.concurrency).try_acquire_owned() {
         Ok(permit) => permit,
         Err(_error) => {
@@ -321,6 +326,7 @@ async fn proxy(
                 .gateway
                 .audit_denial(request_id, denial, None)
                 .await
+                .map_err(|error| report_request_failure(&state.fatal_errors, error))
                 .is_err()
             {
                 return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -331,7 +337,7 @@ async fn proxy(
 
     Ok(
         match handle_request(
-            state.fatal_errors,
+            state.fatal_errors.clone(),
             state.gateway,
             state.client,
             permit,
@@ -340,10 +346,7 @@ async fn proxy(
         .await
         {
             Ok(response) => response,
-            Err(error) => {
-                tracing::error!(%error, "request failed");
-                StatusCode::INTERNAL_SERVER_ERROR.into_response()
-            }
+            Err(error) => report_request_failure(&state.fatal_errors, error),
         },
     )
 }
@@ -449,6 +452,8 @@ async fn forward_request(
         request_id,
         target,
     } = accepted_request;
+    gateway.require_audit_available()?;
+
     let upstream_request = UpstreamRequest::from_target(
         gateway.config().upstream_origin(),
         &target,
@@ -639,6 +644,26 @@ fn report_fatal_error(fatal_errors: &mpsc::UnboundedSender<GatewayError>, error:
     }
 }
 
+/// Returns a closed harness response for request handling errors.
+fn report_request_failure(
+    fatal_errors: &mpsc::UnboundedSender<GatewayError>,
+    error: GatewayError,
+) -> Response<Body> {
+    tracing::error!(%error, "request failed");
+    if is_fatal_request_failure(&error) {
+        report_fatal_error(fatal_errors, error);
+    }
+    StatusCode::INTERNAL_SERVER_ERROR.into_response()
+}
+
+/// Returns true when a pre-response request failure must stop the server.
+const fn is_fatal_request_failure(error: &GatewayError) -> bool {
+    matches!(
+        error,
+        GatewayError::Audit(_) | GatewayError::AuditUnavailable
+    )
+}
+
 /// Starts the gateway HTTP server.
 ///
 /// # Errors
@@ -792,9 +817,10 @@ mod tests {
     )]
     mod proptests {
         use super::{
-            SCRIPTED_AUDIT_WRITE_ERROR, ScenarioBody, ScenarioFatalError, ScenarioRun,
-            audit_denial_from_allowlist_rejection, audit_denial_from_target_rejection,
-            rejected_audit_target, run_request_id_exhaustion_scenario, run_scenario,
+            AuditUnavailableRun, SCRIPTED_AUDIT_WRITE_ERROR, ScenarioBody, ScenarioFatalError,
+            ScenarioRun, audit_denial_from_allowlist_rejection, audit_denial_from_target_rejection,
+            rejected_audit_target, run_audit_unavailable_scenario,
+            run_request_id_exhaustion_scenario, run_scenario,
         };
         use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
         use crate::audit::{
@@ -1114,14 +1140,8 @@ mod tests {
             scenario: &Scenario,
             fatal_errors: &[ScenarioFatalError],
         ) -> Result<(), TestCaseError> {
-            match (scenario.admission(), scenario.audit(), scenario.upstream()) {
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::EventTooLarge,
-                    ScenarioUpstream::Respond
-                    | ScenarioUpstream::StreamError
-                    | ScenarioUpstream::BodyTimeout,
-                ) => {
+            match scenario.audit() {
+                ScenarioAudit::EventTooLarge => {
                     prop_assert_eq!(fatal_errors.len(), 1);
                     prop_assert!(
                         matches!(
@@ -1132,13 +1152,7 @@ mod tests {
                         "unexpected fatal errors: {fatal_errors:?}"
                     );
                 }
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::FailFirst,
-                    ScenarioUpstream::Respond
-                    | ScenarioUpstream::StreamError
-                    | ScenarioUpstream::BodyTimeout,
-                ) => {
+                ScenarioAudit::FailFirst => {
                     prop_assert_eq!(
                         fatal_errors,
                         [ScenarioFatalError::AuditWrite {
@@ -1146,25 +1160,7 @@ mod tests {
                         }]
                     );
                 }
-                (
-                    ScenarioAdmission::Open,
-                    ScenarioAudit::Record,
-                    ScenarioUpstream::Respond
-                    | ScenarioUpstream::StreamError
-                    | ScenarioUpstream::BodyTimeout,
-                )
-                | (
-                    ScenarioAdmission::Saturated | ScenarioAdmission::Open,
-                    ScenarioAudit::Record | ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
-                    ScenarioUpstream::Timeout,
-                )
-                | (
-                    ScenarioAdmission::Saturated,
-                    ScenarioAudit::Record | ScenarioAudit::EventTooLarge | ScenarioAudit::FailFirst,
-                    ScenarioUpstream::Respond
-                    | ScenarioUpstream::StreamError
-                    | ScenarioUpstream::BodyTimeout,
-                ) => {
+                ScenarioAudit::Record => {
                     prop_assert!(fatal_errors.is_empty());
                 }
             }
@@ -1430,6 +1426,16 @@ mod tests {
                 .block_on(run_request_id_exhaustion_scenario(permits))
         }
 
+        /// Runs an audit-unavailable scenario on a paused runtime.
+        fn run_poisoned_audit_scenario() -> AuditUnavailableRun {
+            Builder::new_current_thread()
+                .enable_time()
+                .start_paused(true)
+                .build()
+                .expect("paused scenario runtime should build")
+                .block_on(run_audit_unavailable_scenario())
+        }
+
         /// Builds one denied audit event for direct audit-sink coverage.
         fn denied_event() -> AuditEvent {
             let request_id = RequestId::from_parts(
@@ -1583,16 +1589,36 @@ mod tests {
                 );
             }
         }
+
+        #[test]
+        fn audit_write_failure_blocks_later_requests() {
+            let run = run_poisoned_audit_scenario();
+
+            assert_eq!(run.first_status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(run.second_status, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(run.audit_attempts, 1);
+            assert!(run.audit_events.is_empty());
+            assert!(run.upstream_requests.is_empty());
+            assert_eq!(
+                run.fatal_errors,
+                vec![
+                    ScenarioFatalError::AuditWrite {
+                        message: SCRIPTED_AUDIT_WRITE_ERROR.to_owned()
+                    },
+                    ScenarioFatalError::AuditUnavailable
+                ]
+            );
+        }
     }
 
     use super::{
-        AppState, ProductionAdapters, ResponseAuditContext, ResponseAuditFailure,
-        ResponseStreamOutcome, ServeError, TERMINAL_STREAM_ABORT_ERROR,
+        AppState, ForwardRequestInput, ProductionAdapters, ResponseAuditContext,
+        ResponseAuditFailure, ResponseStreamOutcome, ServeError, TERMINAL_STREAM_ABORT_ERROR,
         audit_denial_from_allowlist_rejection, audit_denial_from_request_body,
         audit_denial_from_request_header, audit_denial_from_target_rejection,
-        audit_response_header_error, audit_upstream_error, production_gateway, proxy,
-        report_fatal_error, response_stream, run_until_server_stops, send_stream_error, serve,
-        serve_with_adapter_result,
+        audit_response_header_error, audit_upstream_error, forward_request,
+        is_fatal_request_failure, production_gateway, proxy, report_fatal_error, response_stream,
+        run_until_server_stops, send_stream_error, serve, serve_with_adapter_result,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -1603,15 +1629,16 @@ mod tests {
         allow_target,
     };
     use crate::audit::{
-        AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError, AuditTarget,
-        AuditUpstreamError, RejectedAuditTarget, RequestId, RunToken,
+        AuditDenial, AuditDenialReason, AuditError, AuditEvent, AuditResponseHeaderError,
+        AuditTarget, AuditUpstreamError, PreparsedAuditTarget, RejectedAuditTarget, RequestId,
+        RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
     use crate::config::{
         AllowedOperation, GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs,
     };
     use crate::gateway::{Gateway, GatewayError};
-    use crate::headers::HeaderError;
+    use crate::headers::{HeaderError, forward_request_headers};
     use crate::ports::{
         AuditSink, BoxFuture, RequestIdError, RequestIdSource, UpstreamBodyError, UpstreamDeadline,
         UpstreamError, UpstreamErrorKind, UpstreamResponse,
@@ -1665,6 +1692,9 @@ mod tests {
             max: usize,
         },
 
+        /// Audit was already unavailable before request handling.
+        AuditUnavailable,
+
         /// Audit event write failed after the response started.
         AuditWrite {
             /// Rendered audit write failure.
@@ -1698,6 +1728,23 @@ mod tests {
         response_body: ScenarioBody,
         /// Captured response status.
         status: StatusCode,
+        /// Captured upstream requests.
+        upstream_requests: Vec<RecordedUpstreamRequest>,
+    }
+
+    /// Observations from the audit-unavailable fail-closed scenario.
+    #[derive(Debug, Eq, PartialEq)]
+    struct AuditUnavailableRun {
+        /// Number of attempted audit writes.
+        audit_attempts: usize,
+        /// Captured audit events.
+        audit_events: Vec<Value>,
+        /// Captured fatal gateway errors.
+        fatal_errors: Vec<ScenarioFatalError>,
+        /// Captured response status for the request that poisons audit.
+        first_status: StatusCode,
+        /// Captured response status after audit is unavailable.
+        second_status: StatusCode,
         /// Captured upstream requests.
         upstream_requests: Vec<RecordedUpstreamRequest>,
     }
@@ -2315,6 +2362,61 @@ mod tests {
         }
     }
 
+    /// Runs a deterministic audit-unavailable fail-closed scenario.
+    async fn run_audit_unavailable_scenario() -> AuditUnavailableRun {
+        let (audit, audit_recorder) =
+            MemoryAuditSink::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"));
+        let audit_observer = audit.clone();
+        let (client, upstream_recorder) = ScriptedUpstreamClient::new();
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let gateway = Gateway::from_ports(config, audit, FixedClock, fixed_request_ids());
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+
+        let first_response = router
+            .clone()
+            .oneshot(build_request(Method::DELETE, "/v1/models"))
+            .await
+            .expect("first proxy request should respond");
+        let second_response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("second proxy request should respond");
+
+        let first_status = first_response.status();
+        let second_status = second_response.status();
+        let captured_upstream_requests = upstream_recorder
+            .lock()
+            .expect("scripted upstream should not be poisoned")
+            .clone();
+        let captured_audit_events = audit_recorder
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        yield_now().await;
+        let audit_attempts = audit_observer.event_count();
+        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver)
+            .expect("scenario fatal channel should contain only observed fatal variants");
+
+        AuditUnavailableRun {
+            audit_attempts,
+            audit_events: captured_audit_events,
+            first_status,
+            fatal_errors: reported_fatal_errors,
+            second_status,
+            upstream_requests: captured_upstream_requests,
+        }
+    }
+
     /// Drains every currently reported fatal error from a test receiver.
     fn drain_fatal_errors(
         fatal_receiver: &mut mpsc::UnboundedReceiver<GatewayError>,
@@ -2340,6 +2442,7 @@ mod tests {
             GatewayError::RequestId(RequestIdError::SequenceExhausted) => {
                 Ok(ScenarioFatalError::RequestIdSequenceExhausted)
             }
+            GatewayError::AuditUnavailable => Ok(ScenarioFatalError::AuditUnavailable),
             unexpected @ (GatewayError::Audit(_)
             | GatewayError::Header(_)
             | GatewayError::ResponseBuild(_)) => Err(unexpected),
@@ -3458,6 +3561,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forward_request_fails_before_upstream_when_audit_is_unavailable() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let target = allowed_target(&config, "/v1/models");
+        let request_headers =
+            forward_request_headers(&HeaderMap::new(), config.max_request_header_bytes())
+                .expect("empty headers should forward");
+        let request_body = AccountedBody::read_request(Body::empty(), config.max_request_bytes())
+            .await
+            .expect("empty request body should be accounted");
+        let (audit, _audit_recorder) =
+            MemoryAuditSink::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"));
+        let (client, upstream_recorder) = ScriptedUpstreamClient::new();
+        let gateway = Gateway::from_ports(config, audit, FixedClock, fixed_request_ids());
+        let request_id = RequestId::from_parts(
+            &RunToken::for_test("0000000000007e57-000000000000c0de"),
+            NonZeroU64::new(1).expect("sequence should be non-zero"),
+        );
+        gateway
+            .audit_denial(
+                request_id.clone(),
+                AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(
+                    &Uri::from_static("/"),
+                )),
+                None,
+            )
+            .await
+            .expect_err("first audit should fail and make audit unavailable");
+        let result = {
+            let accepted_request = ForwardRequestInput {
+                permit: test_permit(),
+                request_body,
+                request_headers,
+                request_id,
+                target,
+            };
+
+            forward_request(
+                mpsc::unbounded_channel().0,
+                gateway,
+                Arc::new(client),
+                accepted_request,
+            )
+            .await
+        };
+        let recorded_upstream_requests = upstream_recorder
+            .lock()
+            .expect("scripted upstream recorder should not be poisoned")
+            .clone();
+
+        assert!(matches!(result, Err(GatewayError::AuditUnavailable)));
+        assert!(recorded_upstream_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_blocks_upstream_after_pre_response_audit_failure() {
+        let config = GatewayConfig::for_runtime_test(
+            PathBuf::from("unused-audit.ndjson"),
+            "https://api.openai.com",
+        );
+        let (audit, audit_recorder) =
+            MemoryAuditSink::failing_on(NonZeroUsize::new(1).expect("literal should be non-zero"));
+        let audit_observer = audit.clone();
+        let (client, upstream_recorder) = ScriptedUpstreamClient::new();
+        let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
+        let gateway = Gateway::from_ports(config, audit, FixedClock, fixed_request_ids());
+        let state = AppState {
+            client: Arc::new(client),
+            concurrency: Arc::new(Semaphore::new(1)),
+            fatal_errors,
+            gateway,
+        };
+        let router = Router::new().fallback(any(proxy)).with_state(state);
+
+        let first_response = router
+            .clone()
+            .oneshot(build_request(Method::DELETE, "/v1/models"))
+            .await
+            .expect("first proxy request should respond");
+        let second_response = router
+            .oneshot(build_request(Method::GET, "/v1/models"))
+            .await
+            .expect("second proxy request should respond");
+        let recorded_audit_events = audit_recorder
+            .lock()
+            .expect("memory audit recorder should not be poisoned")
+            .clone();
+        let recorded_upstream_requests = upstream_recorder
+            .lock()
+            .expect("scripted upstream recorder should not be poisoned")
+            .clone();
+        let first_fatal = fatal_receiver
+            .try_recv()
+            .expect("first audit failure should be fatal");
+        let second_fatal = fatal_receiver
+            .try_recv()
+            .expect("second request should report unavailable audit");
+
+        assert_eq!(first_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(second_response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(audit_observer.event_count(), 1);
+        assert!(recorded_audit_events.is_empty());
+        assert!(recorded_upstream_requests.is_empty());
+        assert_scripted_fatal_audit_write(&first_fatal);
+        assert!(matches!(second_fatal, GatewayError::AuditUnavailable));
+    }
+
+    #[tokio::test]
     async fn serve_handles_requests_until_aborted() {
         let directory = tempdir().expect("temporary directory should be created");
         let upstream = spawn_upstream(hello_upstream_router()).await;
@@ -4340,6 +4553,17 @@ mod tests {
         );
 
         assert!(fatal_errors.is_closed(), "receiver should be gone");
+    }
+
+    #[test]
+    fn request_failure_classification_marks_only_audit_failures_fatal() {
+        assert!(is_fatal_request_failure(&GatewayError::AuditUnavailable));
+        assert!(is_fatal_request_failure(&GatewayError::Audit(
+            AuditError::EventTooLarge { bytes: 2, max: 1 }
+        )));
+        assert!(!is_fatal_request_failure(&GatewayError::Header(
+            HeaderError::TooLarge
+        )));
     }
 
     #[tokio::test]
