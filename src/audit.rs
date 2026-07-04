@@ -157,6 +157,14 @@ enum AuditResponseErrorKind {
         /// Response status returned to the harness.
         status: StatusCode,
     },
+
+    /// Upstream response stream timed out after upstream I/O started.
+    UpstreamResponseTimeout {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
 }
 
 /// Closed response-header audit error.
@@ -458,6 +466,9 @@ enum ExistingAuditErrorClass {
     /// Upstream response stream failed after upstream I/O started.
     UpstreamResponseStreamFailed,
 
+    /// Upstream response stream timed out after upstream I/O started.
+    UpstreamResponseTimeout,
+
     /// Upstream request timed out.
     UpstreamTimeout,
 }
@@ -507,7 +518,8 @@ impl ExistingAuditErrorClass {
             Self::UpstreamTimeout => Some(StatusCode::GATEWAY_TIMEOUT),
             Self::DownstreamClosed
             | Self::ResponseBodyTooLarge
-            | Self::UpstreamResponseStreamFailed => None,
+            | Self::UpstreamResponseStreamFailed
+            | Self::UpstreamResponseTimeout => None,
         }
     }
 
@@ -543,6 +555,7 @@ impl ExistingAuditErrorClass {
                 | Self::ResponseBodyTooLarge
                 | Self::ResponseHeadersTooLarge
                 | Self::UpstreamResponseStreamFailed
+                | Self::UpstreamResponseTimeout
         )
     }
 
@@ -668,6 +681,7 @@ impl ExistingAuditEventFields {
             | ExistingAuditErrorClass::UpstreamConnectFailed
             | ExistingAuditErrorClass::UpstreamRequestFailed
             | ExistingAuditErrorClass::UpstreamResponseStreamFailed
+            | ExistingAuditErrorClass::UpstreamResponseTimeout
             | ExistingAuditErrorClass::UpstreamTimeout => {
                 Err("audit error class does not match decision")
             }
@@ -777,7 +791,8 @@ impl ExistingAuditEventFields {
             }
             Some(
                 ExistingAuditErrorClass::DownstreamClosed
-                | ExistingAuditErrorClass::UpstreamResponseStreamFailed,
+                | ExistingAuditErrorClass::UpstreamResponseStreamFailed
+                | ExistingAuditErrorClass::UpstreamResponseTimeout,
             ) if self.response_body.is_observed() => Ok(()),
             _ => Err("audit response body summary does not match decision"),
         }
@@ -1325,6 +1340,14 @@ impl AuditResponseError {
                 response_body.into_summary(),
                 status,
             ),
+            AuditResponseErrorKind::UpstreamResponseTimeout {
+                response_body,
+                status,
+            } => (
+                "upstream_response_timeout",
+                response_body.into_summary(),
+                status,
+            ),
         }
     }
 
@@ -1358,6 +1381,20 @@ impl AuditResponseError {
     ) -> Self {
         Self {
             kind: AuditResponseErrorKind::UpstreamResponseStreamFailed {
+                response_body,
+                status,
+            },
+        }
+    }
+
+    /// Creates an upstream-response-timeout response error.
+    #[must_use]
+    pub(crate) const fn upstream_response_timeout(
+        response_body: ObservedBodySummary,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: AuditResponseErrorKind::UpstreamResponseTimeout {
                 response_body,
                 status,
             },
@@ -3388,7 +3425,7 @@ mod tests {
     }
 
     /// Builds valid response-error existing audit event lines.
-    pub(super) fn response_error_existing_event_lines() -> [(&'static str, Vec<u8>); 5] {
+    pub(super) fn response_error_existing_event_lines() -> [(&'static str, Vec<u8>); 6] {
         [
             (
                 "invalid response connection header",
@@ -3430,6 +3467,14 @@ mod tests {
                     non_empty_body_value(),
                 ),
             ),
+            (
+                "upstream response timeout",
+                response_error_existing_event_line(
+                    "upstream_response_timeout",
+                    Value::from(200_u64),
+                    non_empty_body_value(),
+                ),
+            ),
         ]
     }
 
@@ -3449,7 +3494,7 @@ mod tests {
     }
 
     /// Builds response-level semantically invalid existing audit event lines.
-    fn semantic_invalid_response_lines() -> [(&'static str, Vec<u8>); 7] {
+    fn semantic_invalid_response_lines() -> [(&'static str, Vec<u8>); 8] {
         [
             (
                 "response error with denial class",
@@ -3514,6 +3559,18 @@ mod tests {
                     (
                         "error_class",
                         Value::String("upstream_response_stream_failed".to_owned()),
+                    ),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "upstream response timeout with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("upstream_response_timeout".to_owned()),
                     ),
                     ("status", Value::from(200_u64)),
                     ("upstream_path", Value::String("/v1/models".to_owned())),
@@ -4176,6 +4233,7 @@ mod tests {
                 Some(StatusCode::BAD_GATEWAY),
             ),
             (ExistingAuditErrorClass::UpstreamResponseStreamFailed, None),
+            (ExistingAuditErrorClass::UpstreamResponseTimeout, None),
         ];
 
         for (error_class, status) in cases {
@@ -5685,7 +5743,7 @@ mod proptests {
         fn event_serialization_preserves_variant_semantics(
             outcome_kind in 0_u8..4,
             denial_kind in 0_u8..16,
-            response_error_kind in 0_u8..5,
+            response_error_kind in 0_u8..6,
             upstream_error_kind in 0_u8..3,
             method in method_text(),
             path in raw_path(),
@@ -5764,8 +5822,15 @@ mod proptests {
                             AuditResponseError::response_header(response_header_error(1)),
                             not_observed_body_value(),
                         ),
-                        _ => (
+                        4 => (
                             AuditResponseError::upstream_response_stream_failed(
+                                observed_response_body,
+                                status,
+                            ),
+                            body_value(response_bytes, &response_digest),
+                        ),
+                        _ => (
+                            AuditResponseError::upstream_response_timeout(
                                 observed_response_body,
                                 status,
                             ),

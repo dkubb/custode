@@ -159,6 +159,9 @@ pub(super) struct ScenarioRequest {
 /// Scripted upstream outcome for a deterministic gateway scenario.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ScenarioUpstream {
+    /// Return a timeout after streaming one response chunk.
+    BodyTimeout,
+
     /// Return the fixed success response immediately.
     Respond,
 
@@ -172,6 +175,9 @@ pub(super) enum ScenarioUpstream {
 /// Scripted upstream behavior for deterministic handler tests.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScriptedUpstreamBehavior {
+    /// Return a timeout after streaming one response chunk.
+    BodyTimeout,
+
     /// Return the fixed success response immediately.
     Respond,
 
@@ -220,7 +226,12 @@ impl ScenarioDownstream {
 
 impl ScenarioUpstream {
     /// Every scenario upstream variant.
-    const ALL: [Self; 3] = [Self::Respond, Self::StreamError, Self::Timeout];
+    const ALL: [Self; 4] = [
+        Self::BodyTimeout,
+        Self::Respond,
+        Self::StreamError,
+        Self::Timeout,
+    ];
 }
 
 /// Scripted upstream client for deterministic handler tests.
@@ -544,6 +555,7 @@ impl ScriptedUpstreamClient {
         let behavior = match upstream {
             ScenarioUpstream::Respond => ScriptedUpstreamBehavior::Respond,
             ScenarioUpstream::StreamError => ScriptedUpstreamBehavior::StreamError,
+            ScenarioUpstream::BodyTimeout => ScriptedUpstreamBehavior::BodyTimeout,
             ScenarioUpstream::Timeout => ScriptedUpstreamBehavior::Stall {
                 duration: Duration::from_secs(10),
             },
@@ -627,6 +639,9 @@ impl UpstreamClient for ScriptedUpstreamClient {
             ScriptedUpstreamBehavior::StreamError => {
                 Box::pin(future::ready(Ok(scripted_stream_error_response())))
             }
+            ScriptedUpstreamBehavior::BodyTimeout => {
+                Box::pin(future::ready(Ok(scripted_body_timeout_response())))
+            }
         }
     }
 }
@@ -662,7 +677,22 @@ fn scripted_stream_error_response() -> UpstreamResponse {
         ::http::HeaderMap::new(),
         stream::iter([
             Ok(Bytes::from_static(b"first")),
-            Err(UpstreamBodyError::new("scripted upstream stream failed")),
+            Err(UpstreamBodyError::stream("scripted upstream stream failed")),
+        ])
+        .boxed(),
+    )
+}
+
+/// Returns a response that times out after one body chunk.
+fn scripted_body_timeout_response() -> UpstreamResponse {
+    UpstreamResponse::new(
+        StatusCode::CREATED,
+        ::http::HeaderMap::new(),
+        stream::iter([
+            Ok(Bytes::from_static(b"first")),
+            Err(UpstreamBodyError::timeout(
+                "scripted upstream body timed out",
+            )),
         ])
         .boxed(),
     )
@@ -902,6 +932,8 @@ mod tests {
         let (audit, audit_events) = MemoryAuditSink::from_audit(ScenarioAudit::FailFirst);
         let (_stream_client, stream_requests) =
             ScriptedUpstreamClient::from_upstream(ScenarioUpstream::StreamError);
+        let (_body_timeout_client, body_timeout_requests) =
+            ScriptedUpstreamClient::from_upstream(ScenarioUpstream::BodyTimeout);
         let (_timeout_client, timeout_requests) =
             ScriptedUpstreamClient::from_upstream(ScenarioUpstream::Timeout);
 
@@ -922,6 +954,12 @@ mod tests {
             timeout_requests
                 .lock()
                 .expect("timeout requests should lock")
+                .is_empty()
+        );
+        assert!(
+            body_timeout_requests
+                .lock()
+                .expect("body timeout requests should lock")
                 .is_empty()
         );
     }

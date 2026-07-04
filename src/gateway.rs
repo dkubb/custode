@@ -117,6 +117,14 @@ enum ResponseAuditOutcomeKind {
         /// Response status returned to the harness.
         status: StatusCode,
     },
+
+    /// Upstream response stream timed out after upstream I/O started.
+    UpstreamResponseTimeout {
+        /// Response body summary.
+        response_body: ObservedBodySummary,
+        /// Response status returned to the harness.
+        status: StatusCode,
+    },
 }
 
 impl ResponseAuditOutcome {
@@ -186,6 +194,20 @@ impl ResponseAuditOutcome {
     ) -> Self {
         Self {
             kind: ResponseAuditOutcomeKind::UpstreamResponseStreamFailed {
+                response_body: ObservedBodySummary::from_response_account(response_account),
+                status,
+            },
+        }
+    }
+
+    /// Creates an upstream-response-timeout outcome.
+    #[must_use]
+    pub(crate) fn upstream_response_timeout(
+        response_account: ResponseAccount,
+        status: StatusCode,
+    ) -> Self {
+        Self {
+            kind: ResponseAuditOutcomeKind::UpstreamResponseTimeout {
                 response_body: ObservedBodySummary::from_response_account(response_account),
                 status,
             },
@@ -282,6 +304,13 @@ impl Gateway {
             } => {
                 let error =
                     AuditResponseError::upstream_response_stream_failed(response_body, status);
+                AuditEventInput::response_error(request, error)
+            }
+            ResponseAuditOutcomeKind::UpstreamResponseTimeout {
+                response_body,
+                status,
+            } => {
+                let error = AuditResponseError::upstream_response_timeout(response_body, status);
                 AuditEventInput::response_error(request, error)
             }
             ResponseAuditOutcomeKind::UpstreamError { error } => {

@@ -122,8 +122,20 @@ pub(crate) struct UpstreamError {
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("{message}")]
 pub(crate) struct UpstreamBodyError {
+    /// Stable response-body failure kind.
+    kind: UpstreamBodyErrorKind,
     /// Source error message.
     message: UpstreamErrorMessage,
+}
+
+/// Upstream response body failure kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UpstreamBodyErrorKind {
+    /// Upstream response body stream failed.
+    Stream,
+
+    /// Upstream response body timed out after response headers arrived.
+    Timeout,
 }
 
 /// Bounded non-empty upstream diagnostic message.
@@ -150,11 +162,33 @@ impl UpstreamDeadline {
 }
 
 impl UpstreamBodyError {
-    /// Creates an upstream body error.
+    /// Returns the stable failure kind.
     #[must_use]
-    pub(crate) fn new(message: impl Into<String>) -> Self {
+    pub(crate) const fn kind(&self) -> UpstreamBodyErrorKind {
+        self.kind
+    }
+
+    /// Creates an upstream body stream error.
+    #[must_use]
+    pub(crate) fn stream(message: impl Into<String>) -> Self {
         Self {
-            message: UpstreamErrorMessage::new(message, "upstream response body failed"),
+            kind: UpstreamBodyErrorKind::Stream,
+            message: UpstreamErrorMessage::new(
+                message,
+                default_upstream_body_error_message(UpstreamBodyErrorKind::Stream),
+            ),
+        }
+    }
+
+    /// Creates an upstream body timeout error.
+    #[must_use]
+    pub(crate) fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            kind: UpstreamBodyErrorKind::Timeout,
+            message: UpstreamErrorMessage::new(
+                message,
+                default_upstream_body_error_message(UpstreamBodyErrorKind::Timeout),
+            ),
         }
     }
 }
@@ -322,6 +356,14 @@ const fn default_upstream_error_message(kind: UpstreamErrorKind) -> &'static str
     }
 }
 
+/// Returns the fallback message for an upstream body failure kind.
+const fn default_upstream_body_error_message(kind: UpstreamBodyErrorKind) -> &'static str {
+    match kind {
+        UpstreamBodyErrorKind::Stream => "upstream response body failed",
+        UpstreamBodyErrorKind::Timeout => "upstream response body timed out",
+    }
+}
+
 /// Truncates a string to a byte limit without splitting a UTF-8 code point.
 fn truncate_utf8(message: &mut String, max_bytes: usize) {
     let mut end = max_bytes.min(message.len());
@@ -341,8 +383,8 @@ fn truncate_utf8(message: &mut String, max_bytes: usize) {
 )]
 mod tests {
     use super::{
-        MAX_UPSTREAM_ERROR_MESSAGE_BYTES, UpstreamBodyError, UpstreamError, UpstreamErrorKind,
-        UpstreamResponse,
+        MAX_UPSTREAM_ERROR_MESSAGE_BYTES, UpstreamBodyError, UpstreamBodyErrorKind, UpstreamError,
+        UpstreamErrorKind, UpstreamResponse,
     };
     use futures_util::{StreamExt as _, stream};
     use http::{HeaderMap, StatusCode};
@@ -364,21 +406,36 @@ mod tests {
 
     #[test]
     fn upstream_body_error_preserves_non_empty_messages() {
-        let error = UpstreamBodyError::new("stream failed");
+        let error = UpstreamBodyError::stream("stream failed");
 
+        assert_eq!(error.kind(), UpstreamBodyErrorKind::Stream);
         assert_eq!(error.to_string(), "stream failed");
     }
 
     #[test]
-    fn upstream_body_error_replaces_empty_messages() {
-        let error = UpstreamBodyError::new("");
+    fn upstream_body_error_replaces_empty_messages_by_kind() {
+        let cases = [
+            (
+                UpstreamBodyError::stream(""),
+                UpstreamBodyErrorKind::Stream,
+                "upstream response body failed",
+            ),
+            (
+                UpstreamBodyError::timeout(""),
+                UpstreamBodyErrorKind::Timeout,
+                "upstream response body timed out",
+            ),
+        ];
 
-        assert_eq!(error.to_string(), "upstream response body failed");
+        for (error, kind, expected) in cases {
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), expected);
+        }
     }
 
     #[test]
     fn upstream_body_error_truncates_long_unicode_messages() {
-        let error = UpstreamBodyError::new("\u{20ac}".repeat(2_000));
+        let error = UpstreamBodyError::stream("\u{20ac}".repeat(2_000));
 
         assert_eq!(
             error.to_string().len(),
@@ -438,7 +495,10 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::{UpstreamDeadline, UpstreamRequest};
+    use super::{
+        MAX_UPSTREAM_ERROR_MESSAGE_BYTES, UpstreamBodyError, UpstreamBodyErrorKind,
+        UpstreamDeadline, UpstreamRequest,
+    };
     use crate::allowlist::{AcceptedTarget, allow_target};
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, RequestBodyBytes, RequestHeaderBytes, UpstreamOrigin};
@@ -457,6 +517,38 @@ mod proptests {
 
     fn request_header_limit(value: usize) -> RequestHeaderBytes {
         RequestHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    #[test]
+    fn upstream_body_errors_bound_every_message_shape() {
+        let short_message = "body failed".to_owned();
+        let long_ascii_message = "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES + 1);
+        let long_unicode_message = "\u{20ac}".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+        let cases = [
+            (UpstreamBodyErrorKind::Stream, ""),
+            (UpstreamBodyErrorKind::Stream, short_message.as_str()),
+            (UpstreamBodyErrorKind::Stream, long_ascii_message.as_str()),
+            (UpstreamBodyErrorKind::Stream, long_unicode_message.as_str()),
+            (UpstreamBodyErrorKind::Timeout, ""),
+            (UpstreamBodyErrorKind::Timeout, short_message.as_str()),
+            (UpstreamBodyErrorKind::Timeout, long_ascii_message.as_str()),
+            (
+                UpstreamBodyErrorKind::Timeout,
+                long_unicode_message.as_str(),
+            ),
+        ];
+
+        for (kind, message) in cases {
+            let error = match kind {
+                UpstreamBodyErrorKind::Stream => UpstreamBodyError::stream(message),
+                UpstreamBodyErrorKind::Timeout => UpstreamBodyError::timeout(message),
+            };
+            let rendered = error.to_string();
+
+            assert_eq!(error.kind(), kind);
+            assert!(!rendered.is_empty());
+            assert!(rendered.len() <= MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+        }
     }
 
     proptest! {

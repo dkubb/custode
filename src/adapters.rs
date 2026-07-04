@@ -223,7 +223,11 @@ const fn request_id_source_build_error(source: io::Error) -> RequestIdSourceBuil
 
 /// Creates an upstream body error from reqwest.
 fn upstream_body_error_from_reqwest(error: &reqwest::Error) -> UpstreamBodyError {
-    UpstreamBodyError::new(error.to_string())
+    if error.is_timeout() {
+        UpstreamBodyError::timeout(error.to_string())
+    } else {
+        UpstreamBodyError::stream(error.to_string())
+    }
 }
 
 /// Creates an upstream client build error from reqwest.
@@ -306,8 +310,8 @@ mod tests {
     };
     use crate::headers::forward_request_headers;
     use crate::ports::{
-        Clock as _, RequestIdError, RequestIdSource as _, UpstreamClient as _, UpstreamDeadline,
-        UpstreamErrorKind, UpstreamRequest,
+        Clock as _, RequestIdError, RequestIdSource as _, UpstreamBodyErrorKind,
+        UpstreamClient as _, UpstreamDeadline, UpstreamErrorKind, UpstreamRequest,
     };
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
@@ -653,7 +657,48 @@ mod tests {
             .next()
             .await
             .expect("invalid chunk should produce a body item");
+        let error = chunk.expect_err("invalid chunk should map to a body error");
 
-        assert!(chunk.is_err(), "invalid chunk should map to a body error");
+        assert_eq!(error.kind(), UpstreamBodyErrorKind::Stream);
+    }
+
+    #[tokio::test]
+    async fn reqwest_upstream_client_classifies_body_stream_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind an ephemeral port");
+        let address = listener
+            .local_addr()
+            .expect("listener should expose its address");
+        drop(tokio::spawn(async move {
+            let (mut socket, _peer) = listener
+                .accept()
+                .await
+                .expect("stalling upstream should accept");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .expect("stalling upstream should write headers");
+            sleep(Duration::from_secs(10)).await;
+        }));
+        let client = ReqwestUpstreamClient::new().expect("upstream client should build");
+        let request = empty_upstream_request(
+            &format!("http://{address}"),
+            RequestTimeout::from_duration(Duration::from_millis(50)),
+        )
+        .await;
+
+        let response = client
+            .send(request)
+            .await
+            .expect("stalling body response should still return headers");
+        let chunk = response
+            .into_body()
+            .next()
+            .await
+            .expect("stalling body should produce a body item");
+        let error = chunk.expect_err("stalling body should time out");
+
+        assert_eq!(error.kind(), UpstreamBodyErrorKind::Timeout);
     }
 }

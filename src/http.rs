@@ -16,8 +16,8 @@ use crate::headers::{
     ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
 };
 use crate::ports::{
-    UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamRequest,
-    UpstreamResponse,
+    UpstreamBodyErrorKind, UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind,
+    UpstreamRequest, UpstreamResponse,
 };
 use ::http::{Method, Uri};
 use axum::body::{Body, Bytes};
@@ -158,6 +158,9 @@ enum ResponseStreamOutcome {
 
     /// Upstream response stream failed after upstream I/O started.
     UpstreamResponseStreamFailed,
+
+    /// Upstream response stream timed out after upstream I/O started.
+    UpstreamResponseTimeout,
 }
 
 /// Server task future shape observed by the shutdown coordinator.
@@ -177,6 +180,10 @@ enum StreamAbortReason {
     /// Upstream response body stream failed.
     #[error("upstream_response_stream_failed")]
     UpstreamBody,
+
+    /// Upstream response body stream timed out.
+    #[error("upstream_response_timeout")]
+    UpstreamBodyTimeout,
 }
 
 impl ResponseAuditContext {
@@ -203,6 +210,9 @@ impl ResponseAuditContext {
             }
             ResponseStreamOutcome::UpstreamResponseStreamFailed => {
                 ResponseAuditOutcome::upstream_response_stream_failed(response_account, status)
+            }
+            ResponseStreamOutcome::UpstreamResponseTimeout => {
+                ResponseAuditOutcome::upstream_response_timeout(response_account, status)
             }
         };
         let input = ResponseAuditInput::new(target, audit_outcome, request_body, request_id);
@@ -538,7 +548,7 @@ fn response_stream(
         while let Some(chunk_result) = stream.next().await {
             let chunk = match chunk_result {
                 Ok(bytes) => bytes,
-                Err(_upstream_body_error) => {
+                Err(upstream_body_error) => {
                     if let Some(previous_chunk) = pending.take()
                         && sender.send(Ok(previous_chunk)).await.is_err()
                     {
@@ -550,14 +560,20 @@ fn response_stream(
                         }
                         return;
                     }
+                    let (outcome, stream_error) = match upstream_body_error.kind() {
+                        UpstreamBodyErrorKind::Stream => (
+                            ResponseStreamOutcome::UpstreamResponseStreamFailed,
+                            StreamAbortReason::UpstreamBody,
+                        ),
+                        UpstreamBodyErrorKind::Timeout => (
+                            ResponseStreamOutcome::UpstreamResponseTimeout,
+                            StreamAbortReason::UpstreamBodyTimeout,
+                        ),
+                    };
                     send_stream_error(
                         &sender,
-                        context
-                            .audit_after_response_started(
-                                ResponseStreamOutcome::UpstreamResponseStreamFailed,
-                            )
-                            .await,
-                        StreamAbortReason::UpstreamBody,
+                        context.audit_after_response_started(outcome).await,
+                        stream_error,
                     )
                     .await;
                     return;
@@ -934,6 +950,19 @@ mod tests {
                 (
                     ScenarioAdmission::Open,
                     ScenarioBounds::Roomy,
+                    _,
+                    ScenarioUpstream::BodyTimeout,
+                ) => Ok((
+                    "response_error",
+                    Value::String("upstream_response_timeout".to_owned()),
+                    StatusCode::CREATED,
+                    5,
+                    audit_body_value(b"first")?,
+                    true,
+                )),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioBounds::Roomy,
                     ScenarioDownstream::ConsumeAll,
                     ScenarioUpstream::Respond,
                 ) => Ok((
@@ -991,7 +1020,9 @@ mod tests {
                     ScenarioAudit::FailFirst,
                     ScenarioBounds::Roomy | ScenarioBounds::TinyResponse,
                     _,
-                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
                 ) => ScenarioBody::Error("audit_failed".to_owned()),
                 (
                     ScenarioAdmission::Open,
@@ -1005,7 +1036,9 @@ mod tests {
                     ScenarioAudit::Record,
                     ScenarioBounds::TinyResponse,
                     _,
-                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
                 ) => ScenarioBody::Error("response_body_too_large".to_owned()),
                 (
                     ScenarioAdmission::Open,
@@ -1028,6 +1061,13 @@ mod tests {
                     _,
                     ScenarioUpstream::StreamError,
                 ) => ScenarioBody::Error("upstream_response_stream_failed".to_owned()),
+                (
+                    ScenarioAdmission::Open,
+                    ScenarioAudit::Record,
+                    ScenarioBounds::Roomy,
+                    _,
+                    ScenarioUpstream::BodyTimeout,
+                ) => ScenarioBody::Error("upstream_response_timeout".to_owned()),
             }
         }
 
@@ -1054,7 +1094,9 @@ mod tests {
                 (
                     ScenarioAdmission::Open,
                     _,
-                    ScenarioUpstream::Respond | ScenarioUpstream::StreamError,
+                    ScenarioUpstream::Respond
+                    | ScenarioUpstream::StreamError
+                    | ScenarioUpstream::BodyTimeout,
                 ) => StatusCode::CREATED,
             }
         }
@@ -2043,6 +2085,44 @@ mod tests {
         assert_eq!(
             event["error_class"],
             Value::String("upstream_response_stream_failed".to_owned())
+        );
+        assert_eq!(event["response_body"], non_empty_body_value(b"first"));
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn scenario_runner_handles_upstream_body_timeouts() {
+        let scenario = Scenario::new(
+            ScenarioRequest::new(
+                b"hello".to_vec(),
+                vec![("authorization".to_owned(), "Bearer harness".to_owned())],
+                Method::GET,
+                "/v1/models?limit=1",
+            ),
+            ScenarioUpstream::BodyTimeout,
+        );
+
+        let run = run_scenario(scenario).await;
+
+        assert_eq!(run.status, StatusCode::CREATED);
+        assert_eq!(
+            run.response_body,
+            ScenarioBody::Error("upstream_response_timeout".to_owned())
+        );
+        assert_eq!(run.fatal_error, None);
+        assert_eq!(run.upstream_requests.len(), 1);
+        assert_eq!(run.audit_events.len(), 1);
+        let event = run
+            .audit_events
+            .first()
+            .and_then(Value::as_object)
+            .expect("audit event should be an object");
+        assert_eq!(
+            event["decision"],
+            Value::String("response_error".to_owned())
+        );
+        assert_eq!(
+            event["error_class"],
+            Value::String("upstream_response_timeout".to_owned())
         );
         assert_eq!(event["response_body"], non_empty_body_value(b"first"));
     }
@@ -3373,7 +3453,7 @@ mod tests {
         let (audit, audit_events) = MemoryAuditSink::new();
         let max_response_bytes = response_body_limit(1_024);
         let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
-        let upstream_body = stream::iter([Err(UpstreamBodyError::new(
+        let upstream_body = stream::iter([Err(UpstreamBodyError::stream(
             "scripted upstream stream failed",
         ))]);
         let upstream_response =
@@ -3399,6 +3479,47 @@ mod tests {
         let event = events.first().expect("stream error should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "upstream_response_stream_failed");
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_reports_body_timeouts_without_pending_chunks() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let upstream_body = stream::iter([Err(UpstreamBodyError::timeout(
+            "scripted upstream body timeout",
+        ))]);
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let mut response_body = response_stream(context, upstream_response, test_permit());
+
+        let result = response_body
+            .next()
+            .await
+            .expect("terminal stream error should be sent");
+
+        let error = result.expect_err("terminal item should be an error");
+        assert_eq!(error.to_string(), "upstream_response_timeout");
+        assert!(
+            response_body.next().await.is_none(),
+            "stream should close after terminal error"
+        );
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("timeout should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_timeout");
         let fatal_result = fatal_receiver.try_recv();
         assert!(
             matches!(
@@ -3531,7 +3652,7 @@ mod tests {
                 Some(true) => {
                     sleep(Duration::from_secs(1)).await;
                     Some((
-                        Err(UpstreamBodyError::new("scripted upstream stream failed")),
+                        Err(UpstreamBodyError::stream("scripted upstream stream failed")),
                         None,
                     ))
                 }
@@ -3575,7 +3696,7 @@ mod tests {
                 Some(true) => {
                     sleep(Duration::from_secs(1)).await;
                     Some((
-                        Err(UpstreamBodyError::new("scripted upstream stream failed")),
+                        Err(UpstreamBodyError::stream("scripted upstream stream failed")),
                         None,
                     ))
                 }
