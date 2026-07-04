@@ -488,6 +488,12 @@ At startup, a non-empty existing audit log MUST end with a newline. If the
 final byte is not a newline, the gateway MUST reject the log before appending
 so a partial final event cannot be joined with a later event.
 If the gateway cannot inspect the existing log tail, it MUST fail startup.
+The audit log path and its containing directory MUST be writable by the
+gateway UID. The containing directory and any created ancestors MUST also be
+openable for metadata sync by that UID. If Docker volume permissions prevent
+creating the log, creating a parent directory, or syncing the relevant
+directory entry, the gateway MUST fail startup rather than accept traffic with
+an unverifiable audit sink.
 
 The event schema is:
 
