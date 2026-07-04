@@ -1,0 +1,14 @@
+# file	regions	functions	lines	branches
+src/adapters.rs	149	24	89	6
+src/allowlist.rs	4	1	2	0
+src/audit.rs	79	20	62	8
+src/body.rs	8	3	7	2
+src/config.rs	13	0	11	4
+src/gateway.rs	10	3	6	0
+src/headers.rs	3	0	3	0
+src/health.rs	6	2	5	0
+src/http.rs	278	25	156	11
+src/ports.rs	14	5	14	0
+src/process.rs	26	6	17	0
+src/sim.rs	16	3	13	1
+src/target.rs	4	0	4	3

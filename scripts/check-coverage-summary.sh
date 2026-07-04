@@ -8,6 +8,7 @@ main() {
   local max_branches=0
   local summary_path=""
   local exclude_test_mods=0
+  local per_file_ratchet_path=""
 
   while [[ "${#}" -gt 0 ]]; do
     case "${1}" in
@@ -33,6 +34,14 @@ main() {
       --max-missed-branches)
         require_count_option "${1}" "${2-}"
         max_branches="${2}"
+        shift 2
+        ;;
+      --per-file-ratchet)
+        if [[ -z "${2-}" ]]; then
+          printf '%s requires a value\n' "${1}" >&2
+          return 2
+        fi
+        per_file_ratchet_path="${2}"
         shift 2
         ;;
       --help | -h)
@@ -66,6 +75,11 @@ main() {
     return 2
   fi
 
+  if [[ -n "${per_file_ratchet_path}" && ! -f "${per_file_ratchet_path}" ]]; then
+    printf 'coverage file ratchet not found: %s\n' "${per_file_ratchet_path}" >&2
+    return 2
+  fi
+
   local report_path
   report_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-report.XXXXXX")
   if [[ "${exclude_test_mods}" -eq 0 ]]; then
@@ -95,6 +109,21 @@ main() {
   done <"${report_path}"
 
   rm -f "${report_path}"
+
+  if [[ -n "${per_file_ratchet_path}" ]]; then
+    if [[ "${exclude_test_mods}" -eq 0 ]]; then
+      printf '%s\n' '--per-file-ratchet requires --exclude-test-mods' >&2
+      return 2
+    fi
+
+    local file_report_path
+    file_report_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-files.XXXXXX")
+    detailed_file_report_excluding_test_modules "${summary_path}" >"${file_report_path}"
+    if ! check_file_ratchet "${file_report_path}" "${per_file_ratchet_path}"; then
+      failed=1
+    fi
+    rm -f "${file_report_path}"
+  fi
 
   if [[ "${failed}" -ne 0 ]]; then
     return 1
@@ -332,6 +361,227 @@ detailed_report_excluding_test_modules() {
     "${exclusions_path}" "${events_path}"
 
   rm -f "${exclusions_path}" "${events_path}"
+}
+
+detailed_file_report_excluding_test_modules() {
+  local summary_path="${1}"
+  local exclusions_path
+  local events_path
+
+  validate_summary_totals "${summary_path}"
+
+  if ! jq --exit-status '
+    .data[0].functions != null
+      and (.data[0].files | all(.segments != null and .branches != null))
+  ' "${summary_path}" >/dev/null; then
+    printf 'detailed coverage JSON is required with --per-file-ratchet\n' >&2
+    return 2
+  fi
+  validate_detailed_events_present "${summary_path}"
+
+  exclusions_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-exclusions.XXXXXX")
+  events_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-events.XXXXXX")
+  build_exclusion_table "${summary_path}" >"${exclusions_path}"
+
+  jq --raw-output '
+    def as_bool:
+      if type == "boolean" then . else . != 0 end;
+
+    .data[0] as $data |
+    [
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        select($line > 0 and $has_count and $count == 0) |
+        ["line", $filename, $line]
+      ),
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        (($segment[4] // false) | as_bool) as $is_region_entry |
+        select($line > 0 and $has_count and $count == 0 and $is_region_entry) |
+        ["region", $filename, $line]
+      ),
+      (
+        $data.files[] as $file |
+        ($file.filename) as $filename |
+        ($file.branches // [])[] |
+        . as $branch |
+        ($branch[0] // 0) as $line |
+        ($branch[1] // 0) as $start_column |
+        ($branch[2] // 0) as $end_line |
+        ($branch[3] // 0) as $end_column |
+        [
+          [0, ($branch[4] // 0)],
+          [1, ($branch[5] // 0)]
+        ][] as $arm |
+        ($arm[0]) as $arm_index |
+        ($arm[1]) as $count |
+        select($line > 0 and $count == 0) |
+        [
+          "branch",
+          $filename,
+          $line,
+          $start_column,
+          $end_line,
+          $end_column,
+          $arm_index
+        ]
+      ),
+      (
+        ($data.functions // [])[] |
+        select((.count // 0) == 0) |
+        (.filenames[0] // "") as $filename |
+        ((.regions[0][0]) // 0) as $line |
+        select($filename != "" and $line > 0) |
+        ["function", $filename, $line]
+      )
+    ][] |
+    @tsv
+  ' "${summary_path}" >"${events_path}"
+
+  awk -F '\t' -v exclusions_path="${exclusions_path}" '
+      function short_file(filename) {
+        if (filename ~ /\/\.cargo\/registry\// || filename ~ /\/index\.crates\.io-/) {
+          return ""
+        }
+        if (match(filename, /\/src\//)) {
+          return "src/" substr(filename, RSTART + 5)
+        }
+        if (match(filename, /\/tests\//)) {
+          return "tests/" substr(filename, RSTART + 7)
+        }
+        sub(/^.*\//, "", filename)
+        return filename
+      }
+      FILENAME == exclusions_path {
+        span_count[$1] += 1
+        key = $1 SUBSEP span_count[$1]
+        excluded_start[key] = $2
+        excluded_end[key] = $3
+        next
+      }
+      {
+        metric = $1
+        filename = $2
+        line = $3
+        excluded = 0
+        for (span_index = 1; span_index <= span_count[filename]; span_index += 1) {
+          key = filename SUBSEP span_index
+          if (line >= excluded_start[key] && line <= excluded_end[key]) {
+            excluded = 1
+          }
+        }
+        if (excluded == 1) {
+          next
+        }
+        file = short_file(filename)
+        if (file == "") {
+          next
+        }
+        files[file] = 1
+        if (metric == "line") {
+          missed_lines[file, line] = 1
+        } else if (metric == "branch") {
+          missed_branches[file, line, $4, $5, $6, $7] = 1
+        } else {
+          missed[file, metric] += 1
+        }
+      }
+      END {
+        for (line_key in missed_lines) {
+          split(line_key, parts, SUBSEP)
+          missed[parts[1], "lines"] += 1
+        }
+        for (branch_key in missed_branches) {
+          split(branch_key, parts, SUBSEP)
+          missed[parts[1], "branches"] += 1
+        }
+        for (file in files) {
+          printf "%s\t%d\t%d\t%d\t%d\n",
+            file,
+            missed[file, "region"],
+            missed[file, "function"],
+            missed[file, "lines"],
+            missed[file, "branches"]
+        }
+      }
+    ' "${exclusions_path}" "${events_path}" | sort
+
+  rm -f "${exclusions_path}" "${events_path}"
+}
+
+check_file_ratchet() {
+  local file_report_path="${1}"
+  local per_file_ratchet_path="${2}"
+
+  awk -F '\t' '
+      function require_count(value, field, file) {
+        if (value !~ /^[0-9]+$/) {
+          printf "coverage file ratchet has invalid %s for %s: %s\n",
+            field, file, value >"/dev/stderr"
+          failed = 1
+        }
+      }
+      FILENAME == ARGV[1] {
+        actual[$1, "regions"] = $2
+        actual[$1, "functions"] = $3
+        actual[$1, "lines"] = $4
+        actual[$1, "branches"] = $5
+        actual_files[$1] = 1
+        next
+      }
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ {
+        next
+      }
+      NF != 5 {
+        printf "coverage file ratchet row must have 5 tab-separated fields: %s\n",
+          $0 >"/dev/stderr"
+        failed = 1
+        next
+      }
+      {
+        ratchet_files[$1] = 1
+        require_count($2, "regions", $1)
+        require_count($3, "functions", $1)
+        require_count($4, "lines", $1)
+        require_count($5, "branches", $1)
+        maximum[$1, "regions"] = $2
+        maximum[$1, "functions"] = $3
+        maximum[$1, "lines"] = $4
+        maximum[$1, "branches"] = $5
+      }
+      END {
+        split("regions functions lines branches", metrics, " ")
+        for (file in actual_files) {
+          if (!(file in ratchet_files)) {
+            printf "coverage file %s is missing from ratchet\n",
+              file >"/dev/stderr"
+            failed = 1
+            continue
+          }
+          for (metric_index = 1; metric_index <= 4; metric_index += 1) {
+            metric = metrics[metric_index]
+            if (actual[file, metric] > maximum[file, metric]) {
+              printf "coverage file %s metric %s has %d missed states; max is %d\n",
+                file, metric, actual[file, metric], maximum[file, metric] >"/dev/stderr"
+              failed = 1
+            }
+          }
+        }
+        exit failed
+      }
+    ' "${file_report_path}" "${per_file_ratchet_path}"
 }
 
 validate_detailed_events_present() {
@@ -612,6 +862,7 @@ usage() {
   printf '  --max-missed-functions <count>\n'
   printf '  --max-missed-lines <count>\n'
   printf '  --max-missed-branches <count>\n'
+  printf '  --per-file-ratchet <path>\n'
 }
 
 require_count_option() {

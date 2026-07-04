@@ -54,6 +54,7 @@ coverage-proptests:
         --max-missed-functions 121 \
         --max-missed-lines 521 \
         --max-missed-branches 41 \
+        --per-file-ratchet tests/coverage_summary/proptests-ratchet.tsv \
         target/coverage/proptests.json
 
 mutants:

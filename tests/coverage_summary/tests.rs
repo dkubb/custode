@@ -72,6 +72,32 @@ fn run_coverage_summary_for_source(
         .expect("coverage script should run")
 }
 
+fn run_file_ratchet_for_source(source_text: &str, segments: &str, ratchet: &str) -> Output {
+    let directory = tempdir().expect("temporary directory should be created");
+    let source = directory.path().join("fixture.rs");
+    let summary = directory.path().join("coverage.json");
+    let ratchet_path = directory.path().join("ratchet.tsv");
+    fs::write(&source, source_text).expect("source fixture should be written");
+    fs::write(&ratchet_path, ratchet).expect("ratchet fixture should be written");
+    let filename = serde_json::to_string(&source.to_string_lossy())
+        .expect("source path should serialize as JSON");
+    let fixture = format!(
+        r#"{{"data":[{{{ZERO_TOTALS},"functions":[],"files":[{{"filename":{filename},"segments":{segments},"branches":[]}}]}}]}}"#
+    );
+    fs::write(&summary, fixture).expect("coverage fixture should be written");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-coverage-summary.sh");
+    Command::new(script)
+        .arg("--exclude-test-mods")
+        .arg("--max-missed-lines")
+        .arg("1")
+        .arg("--per-file-ratchet")
+        .arg(ratchet_path)
+        .arg(summary)
+        .output()
+        .expect("coverage script should run")
+}
+
 fn run_summary_fixture(fixture: &str) -> Output {
     let directory = tempdir().expect("temporary directory should be created");
     let summary = directory.path().join("coverage.json");
@@ -116,6 +142,18 @@ fn assert_line_failure(output: Output, missed: u32, maximum: u32) {
     assert!(
         stderr.contains(&format!(
             "coverage metric lines has {missed} missed states; max is {maximum}"
+        )),
+        "{stderr}"
+    );
+}
+
+fn assert_file_line_failure(output: Output, missed: u32, maximum: u32) {
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_eq!(output.status.code(), Some(1_i32));
+    assert!(
+        stderr.contains(&format!(
+            "coverage file fixture.rs metric lines has {missed} missed states; max is {maximum}"
         )),
         "{stderr}"
     );
@@ -246,4 +284,26 @@ fn exclude_test_modules_ignores_alphabetic_char_literals() {
     );
 
     assert_line_failure(output, 1, 0);
+}
+
+#[test]
+fn file_ratchet_allows_known_missed_lines_outside_test_modules() {
+    let output = run_file_ratchet_for_source(
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[[6,1,0,true,false]]",
+        "fixture.rs\t0\t0\t1\t0\n",
+    );
+
+    assert!(output.status.success(), "known file miss should pass");
+}
+
+#[test]
+fn file_ratchet_rejects_new_missed_lines_outside_test_modules() {
+    let output = run_file_ratchet_for_source(
+        "fn before() {}\nmod tests {\n    #[test]\n    fn it_works() {}\n}\nfn after() {}\n",
+        "[[6,1,0,true,false]]",
+        "fixture.rs\t0\t0\t0\t0\n",
+    );
+
+    assert_file_line_failure(output, 1, 0);
 }
