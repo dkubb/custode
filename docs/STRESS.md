@@ -15,8 +15,8 @@ The repo-local stress gate succeeds when all of the following are true:
 - audit-log verifier fixture tests pass;
 - container topology tests prove the harness cannot use direct egress paths
   covered by the test harness;
-- the proxy audit log emitted during container tests is valid NDJSON under
-  `scripts/verify-audit-log.sh`;
+- the proxy audit log emitted during container tests has valid NDJSON events
+  under `scripts/verify-audit-log.sh`;
 - bounded fuzz smoke tests run for the parser oracles that are exposed only
   under `cfg(fuzzing)`.
 
@@ -57,6 +57,11 @@ closed when:
 - the file is missing or unreadable;
 - a non-empty file is not newline terminated;
 - any line is invalid NDJSON or not a JSON object;
+- any event is missing a documented audit field or contains an unknown field;
+- any event has an unknown schema version, decision, error class, status
+  shape, timestamp shape, or body-summary shape;
+- any event records a decision, error class, upstream target, or body-summary
+  state combination that contradicts the audit schema;
 - any event has a missing, malformed, or duplicate `request_id`;
 - any request sequence is zero.
 
