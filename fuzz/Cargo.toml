@@ -19,5 +19,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "allowed_operation_parse"
+path = "fuzz_targets/allowed_operation_parse.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
 members = ["."]

@@ -1033,6 +1033,19 @@ impl UpstreamOrigin {
     }
 }
 
+#[cfg(fuzzing)]
+/// Fuzz-only configuration parser oracles.
+pub mod fuzzing {
+    use super::AllowedOperation;
+
+    /// Parses arbitrary bytes as a lossy allowed-operation string.
+    pub fn allowed_operation_parse(input: &[u8]) {
+        let raw = String::from_utf8_lossy(input);
+
+        let _result = AllowedOperation::parse(raw.as_ref());
+    }
+}
+
 /// Returns a non-zero `u64` or the matching configuration error.
 fn non_zero_u64(name: &'static str, value: u64) -> Result<NonZeroU64, ConfigError> {
     NonZeroU64::new(value).ok_or(ConfigError::ZeroBound { name })
