@@ -518,8 +518,10 @@ collision-resistant under the operating system random source assumption; the
 gateway does not persist a registry of prior run tokens.
 
 `path` is the accepted request path. For denied non-origin-form requests it
-records the full raw request target, including the requested authority, such
-as `http://evil.example/steal` or `evil.example:443`.
+records the bounded raw request target, including the requested authority when
+it fits, such as `http://evil.example/steal` or `evil.example:443`. Overlong
+raw target text keeps a prefix and records the original byte count in the
+audited string.
 `upstream_path` and `upstream_query` are null when no upstream request is
 attempted. When an upstream request is attempted, `upstream_query` equals the
 accepted incoming query. `status` is the response status returned to the
@@ -815,7 +817,7 @@ binary against a local recording upstream and cover:
 - denied method does not reach a local test upstream;
 - denied path does not reach a local test upstream;
 - raw absolute-form, authority-form, and `CONNECT` request lines are denied
-  without reaching a local test upstream and audited with the raw
+  without reaching a local test upstream and audited with the bounded
   authority-bearing target;
 - harness-supplied authorization reaches the local test upstream for allowed
   requests;
