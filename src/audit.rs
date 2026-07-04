@@ -33,6 +33,9 @@ const MAX_AUDIT_TARGET_PATH_BYTES: usize = MAX_ORIGIN_FORM_PATH_BYTES;
 /// Maximum audited request query bytes.
 const MAX_AUDIT_TARGET_QUERY_BYTES: usize = MAX_ORIGIN_FORM_QUERY_BYTES;
 
+/// Maximum audited request method bytes.
+const MAX_AUDIT_METHOD_BYTES: usize = 64;
+
 /// Hex bytes in one half of a per-run token.
 #[cfg(test)]
 const RUN_TOKEN_HEX_HALF_BYTES: usize = 16;
@@ -263,7 +266,7 @@ pub(crate) struct AuditEvent {
     /// Stable error class for failed decisions.
     error_class: Option<String>,
     /// Request method.
-    method: String,
+    method: AuditMethod,
     /// Accepted request path, or the raw request target for denied
     /// non-origin-form requests.
     path: String,
@@ -458,6 +461,14 @@ pub(crate) struct AuditTarget {
     path: String,
     /// Request query string without `?`.
     query: Option<String>,
+}
+
+/// Request method recorded in the audit log.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+struct AuditMethod {
+    /// Bounded method text.
+    value: String,
 }
 
 /// Newline-delimited JSON audit writer.
@@ -999,6 +1010,16 @@ impl AuditTarget {
     }
 }
 
+impl AuditMethod {
+    /// Creates a bounded audit method from an HTTP method.
+    #[must_use]
+    fn from_method(method: &Method) -> Self {
+        Self {
+            value: bounded_audit_text(method.as_str(), MAX_AUDIT_METHOD_BYTES),
+        }
+    }
+}
+
 #[cfg(test)]
 impl AuditUpstreamTarget {
     /// Creates an upstream target from forwarded path and query.
@@ -1106,7 +1127,7 @@ impl AuditEvent {
         Self {
             decision,
             error_class,
-            method: method.to_string(),
+            method: AuditMethod::from_method(&method),
             path: target.path().to_owned(),
             query: target.query().map(str::to_owned),
             request_body,
@@ -2161,6 +2182,26 @@ mod tests {
 
         assert_eq!(event.path, "/v1/responses/%2e%2e/models");
         assert_eq!(event.query.as_deref(), Some("limit=1"));
+    }
+
+    #[test]
+    fn new_truncates_overlong_methods_with_original_length() {
+        let method = "A".repeat(super::MAX_AUDIT_METHOD_BYTES + 1);
+        let target = AuditTarget::from_uri_parts("/v1/models", None);
+        let input = denied_input(&method, target, AuditDenialReason::MethodDenied);
+        let suffix = format!("...[truncated original_bytes={}]", method.len());
+
+        let event = AuditEvent::new(input);
+        let value = serde_json::to_value(event).expect("event should serialize");
+        let audited_method = value
+            .as_object()
+            .and_then(|object| object.get("method"))
+            .expect("method should exist")
+            .as_str()
+            .expect("method should serialize as a string");
+
+        assert_eq!(audited_method.len(), super::MAX_AUDIT_METHOD_BYTES);
+        assert!(audited_method.ends_with(&suffix));
     }
 
     #[test]
