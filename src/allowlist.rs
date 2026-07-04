@@ -33,7 +33,7 @@ impl AcceptedTarget {
     /// delimiter, when the path contains a forbidden literal or percent-encoded
     /// separator, or when the path contains a literal or percent-encoded dot
     /// segment.
-    pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, RejectionReason> {
+    pub(crate) fn new(path: &str, query: Option<&str>) -> Result<Self, TargetRejectionReason> {
         let accepted_path = OriginFormPath::parse(path).map_err(rejection_from_path_error)?;
         let accepted_query = query
             .map(OriginFormQuery::parse)
@@ -85,9 +85,9 @@ impl AllowedTarget {
     }
 }
 
-/// Reason a request is rejected before upstream forwarding.
+/// Reason a request target is rejected before allowlist checks.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum RejectionReason {
+pub(crate) enum TargetRejectionReason {
     /// The path contained a literal or percent-encoded `.` or `..` segment.
     DotSegment,
 
@@ -97,20 +97,24 @@ pub(crate) enum RejectionReason {
     /// The path contained invalid percent-encoding.
     InvalidPercentEncoding,
 
-    /// The method was not in the allowlist.
-    MethodDenied,
-
     /// The target was not an origin-form path beginning with `/`.
     NonOriginForm,
-
-    /// The path was not in the allowlist.
-    PathDenied,
 
     /// The path exceeded the supported byte limit.
     PathTooLong,
 
     /// The query exceeded the supported byte limit.
     QueryTooLong,
+}
+
+/// Reason an accepted request target is rejected by the allowlist.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum AllowlistRejectionReason {
+    /// The method was not in the allowlist.
+    MethodDenied,
+
+    /// The path was not in the allowlist.
+    PathDenied,
 }
 
 /// Checks whether a request is allowed by the configured method and path sets.
@@ -134,38 +138,44 @@ fn allowed_method<'config>(
 
 /// Returns the rejection reason for a denied method.
 #[must_use]
-fn rejection_for(config: &GatewayConfig, method: &Method) -> RejectionReason {
+fn rejection_for(config: &GatewayConfig, method: &Method) -> AllowlistRejectionReason {
     if config
         .allowed_operations()
         .iter()
         .any(|operation| operation.has_method(method))
     {
-        RejectionReason::PathDenied
+        AllowlistRejectionReason::PathDenied
     } else {
-        RejectionReason::MethodDenied
+        AllowlistRejectionReason::MethodDenied
     }
 }
 
 /// Maps origin-form path errors into request rejection reasons.
-const fn rejection_from_path_error(error: OriginFormPathError) -> RejectionReason {
+const fn rejection_from_path_error(error: OriginFormPathError) -> TargetRejectionReason {
     match error {
-        OriginFormPathError::DotSegment => RejectionReason::DotSegment,
-        OriginFormPathError::EncodedSeparator => RejectionReason::EncodedSeparator,
-        OriginFormPathError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
-        OriginFormPathError::InvalidRequestTargetCharacter | OriginFormPathError::NonOriginForm => {
-            RejectionReason::NonOriginForm
+        OriginFormPathError::DotSegment => TargetRejectionReason::DotSegment,
+        OriginFormPathError::EncodedSeparator => TargetRejectionReason::EncodedSeparator,
+        OriginFormPathError::InvalidPercentEncoding => {
+            TargetRejectionReason::InvalidPercentEncoding
         }
-        OriginFormPathError::TooLong => RejectionReason::PathTooLong,
+        OriginFormPathError::InvalidRequestTargetCharacter | OriginFormPathError::NonOriginForm => {
+            TargetRejectionReason::NonOriginForm
+        }
+        OriginFormPathError::TooLong => TargetRejectionReason::PathTooLong,
     }
 }
 
 /// Maps origin-form query errors into request rejection reasons.
-const fn rejection_from_query_error(error: OriginFormQueryError) -> RejectionReason {
+const fn rejection_from_query_error(error: OriginFormQueryError) -> TargetRejectionReason {
     match error {
-        OriginFormQueryError::InvalidPercentEncoding => RejectionReason::InvalidPercentEncoding,
+        OriginFormQueryError::InvalidPercentEncoding => {
+            TargetRejectionReason::InvalidPercentEncoding
+        }
         OriginFormQueryError::FragmentDelimiter
-        | OriginFormQueryError::InvalidRequestTargetCharacter => RejectionReason::NonOriginForm,
-        OriginFormQueryError::TooLong => RejectionReason::QueryTooLong,
+        | OriginFormQueryError::InvalidRequestTargetCharacter => {
+            TargetRejectionReason::NonOriginForm
+        }
+        OriginFormQueryError::TooLong => TargetRejectionReason::QueryTooLong,
     }
 }
 
@@ -179,7 +189,7 @@ pub(crate) fn allow_target(
     config: &GatewayConfig,
     method: &Method,
     target: AcceptedTarget,
-) -> Result<AllowedTarget, RejectionReason> {
+) -> Result<AllowedTarget, AllowlistRejectionReason> {
     allowed_method(config, method, &target).map_or_else(
         || Err(rejection_for(config, method)),
         |allowed_method| {
@@ -198,7 +208,9 @@ pub(crate) fn allow_target(
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
+    use super::{
+        AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason, is_allowed, rejection_for,
+    };
     use crate::config::{AllowedPath, GatewayConfig};
     use crate::target::{
         MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
@@ -234,11 +246,11 @@ mod tests {
     fn target_rejects_invalid_percent_encoding() {
         assert_eq!(
             AcceptedTarget::new("/v1/%zz", None),
-            Err(RejectionReason::InvalidPercentEncoding),
+            Err(TargetRejectionReason::InvalidPercentEncoding),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some("bad=%zz")),
-            Err(RejectionReason::InvalidPercentEncoding),
+            Err(TargetRejectionReason::InvalidPercentEncoding),
         );
     }
 
@@ -246,11 +258,11 @@ mod tests {
     fn target_rejects_invalid_request_target_characters_as_non_origin_form() {
         assert_eq!(
             AcceptedTarget::new("/v1/models with-space", None),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some("q=hello world")),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
     }
 
@@ -258,11 +270,11 @@ mod tests {
     fn target_rejects_literal_dot_segments() {
         assert_eq!(
             AcceptedTarget::new("/v1/responses/../models", None),
-            Err(RejectionReason::DotSegment),
+            Err(TargetRejectionReason::DotSegment),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/responses/./models", None),
-            Err(RejectionReason::DotSegment),
+            Err(TargetRejectionReason::DotSegment),
         );
     }
 
@@ -270,11 +282,11 @@ mod tests {
     fn target_rejects_percent_encoded_dot_segments() {
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%2e%2e/models", None),
-            Err(RejectionReason::DotSegment),
+            Err(TargetRejectionReason::DotSegment),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%2E/models", None),
-            Err(RejectionReason::DotSegment),
+            Err(TargetRejectionReason::DotSegment),
         );
     }
 
@@ -282,15 +294,15 @@ mod tests {
     fn target_rejects_percent_encoded_separators() {
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%2e%2e%2fmodels", None),
-            Err(RejectionReason::EncodedSeparator),
+            Err(TargetRejectionReason::EncodedSeparator),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/responses/%5cmodels", None),
-            Err(RejectionReason::EncodedSeparator),
+            Err(TargetRejectionReason::EncodedSeparator),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/responses\\models", None),
-            Err(RejectionReason::EncodedSeparator),
+            Err(TargetRejectionReason::EncodedSeparator),
         );
     }
 
@@ -311,7 +323,7 @@ mod tests {
     fn target_rejects_non_origin_form_paths() {
         assert_eq!(
             AcceptedTarget::new("v1/models", None),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
     }
 
@@ -319,19 +331,19 @@ mod tests {
     fn target_rejects_component_delimiters() {
         assert_eq!(
             AcceptedTarget::new("/v1/models?limit=1", None),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/models#fragment", None),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some("limit=1#fragment")),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some(r"q=\")),
-            Err(RejectionReason::NonOriginForm),
+            Err(TargetRejectionReason::NonOriginForm),
         );
     }
 
@@ -339,11 +351,11 @@ mod tests {
     fn target_rejects_truncated_percent_escapes() {
         assert_eq!(
             AcceptedTarget::new("/v1/%", None),
-            Err(RejectionReason::InvalidPercentEncoding),
+            Err(TargetRejectionReason::InvalidPercentEncoding),
         );
         assert_eq!(
             AcceptedTarget::new("/v1/%2", None),
-            Err(RejectionReason::InvalidPercentEncoding),
+            Err(TargetRejectionReason::InvalidPercentEncoding),
         );
     }
 
@@ -353,7 +365,7 @@ mod tests {
 
         assert_eq!(
             AcceptedTarget::new(&path, None),
-            Err(RejectionReason::PathTooLong),
+            Err(TargetRejectionReason::PathTooLong),
         );
     }
 
@@ -363,7 +375,7 @@ mod tests {
 
         assert_eq!(
             AcceptedTarget::new("/v1/models", Some(&query)),
-            Err(RejectionReason::QueryTooLong),
+            Err(TargetRejectionReason::QueryTooLong),
         );
     }
 
@@ -394,7 +406,7 @@ mod tests {
 
         assert_eq!(
             rejection_for(&config, &Method::GET),
-            RejectionReason::PathDenied,
+            AllowlistRejectionReason::PathDenied,
         );
     }
 
@@ -404,7 +416,7 @@ mod tests {
 
         assert_eq!(
             rejection_for(&config, &Method::DELETE),
-            RejectionReason::MethodDenied,
+            AllowlistRejectionReason::MethodDenied,
         );
     }
 }
@@ -416,7 +428,9 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::{AcceptedTarget, RejectionReason, is_allowed, rejection_for};
+    use super::{
+        AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason, is_allowed, rejection_for,
+    };
     use crate::config::GatewayConfig;
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
     use ::http::Method;
@@ -612,7 +626,7 @@ mod proptests {
         fn new_rejects_every_dot_segment_path(path in path_with_dot_segment()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::DotSegment)
+                Err(TargetRejectionReason::DotSegment)
             );
         }
 
@@ -620,7 +634,7 @@ mod proptests {
         fn new_rejects_every_invalid_percent_escape(path in path_with_invalid_percent()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::InvalidPercentEncoding)
+                Err(TargetRejectionReason::InvalidPercentEncoding)
             );
         }
 
@@ -628,7 +642,7 @@ mod proptests {
         fn new_rejects_every_forbidden_separator(path in path_with_forbidden_separator()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::EncodedSeparator)
+                Err(TargetRejectionReason::EncodedSeparator)
             );
         }
 
@@ -638,7 +652,7 @@ mod proptests {
         ) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::NonOriginForm)
+                Err(TargetRejectionReason::NonOriginForm)
             );
         }
 
@@ -648,7 +662,7 @@ mod proptests {
         ) {
             prop_assert_eq!(
                 AcceptedTarget::new("/v1/models", Some(&query)),
-                Err(RejectionReason::NonOriginForm)
+                Err(TargetRejectionReason::NonOriginForm)
             );
         }
 
@@ -656,7 +670,7 @@ mod proptests {
         fn new_rejects_every_non_origin_form_path(path in path_non_origin_form()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::NonOriginForm)
+                Err(TargetRejectionReason::NonOriginForm)
             );
         }
 
@@ -664,7 +678,7 @@ mod proptests {
         fn new_rejects_every_too_long_path(path in path_too_long()) {
             prop_assert_eq!(
                 AcceptedTarget::new(&path, None),
-                Err(RejectionReason::PathTooLong)
+                Err(TargetRejectionReason::PathTooLong)
             );
         }
 
@@ -672,7 +686,7 @@ mod proptests {
         fn new_rejects_every_too_long_query(query in query_too_long()) {
             prop_assert_eq!(
                 AcceptedTarget::new("/v1/models", Some(&query)),
-                Err(RejectionReason::QueryTooLong)
+                Err(TargetRejectionReason::QueryTooLong)
             );
         }
 
@@ -698,9 +712,9 @@ mod proptests {
             let rejection = rejection_for(&config, &method);
 
             let expected = if method == Method::GET {
-                RejectionReason::PathDenied
+                AllowlistRejectionReason::PathDenied
             } else {
-                RejectionReason::MethodDenied
+                AllowlistRejectionReason::MethodDenied
             };
             prop_assert_eq!(rejection, expected);
         }

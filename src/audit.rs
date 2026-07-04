@@ -1,6 +1,6 @@
 //! Audit event schema and writer.
 
-use crate::allowlist::{AcceptedTarget, AllowedTarget, RejectionReason};
+use crate::allowlist::{AcceptedTarget, AllowedTarget, TargetRejectionReason};
 use crate::body::{
     AccountedBody, BodyDigest, BodyObservation, NonEmptyBodyObservation, OversizedResponseBody,
     ResponseAccount,
@@ -831,7 +831,7 @@ impl ExistingAuditEventFields {
     /// Validates that the audit target is rejected without carrying authority.
     fn expect_non_authority_target_rejection(
         &self,
-        expected: RejectionReason,
+        expected: TargetRejectionReason,
         message: &'static str,
     ) -> Result<(), &'static str> {
         if self.target_has_authority() {
@@ -844,7 +844,7 @@ impl ExistingAuditEventFields {
     /// Validates that the audit target reproduces the expected parser rejection.
     fn expect_target_rejection(
         &self,
-        expected: RejectionReason,
+        expected: TargetRejectionReason,
         message: &'static str,
     ) -> Result<(), &'static str> {
         match AcceptedTarget::new(&self.path, self.query.as_deref()) {
@@ -916,19 +916,19 @@ impl ExistingAuditEventFields {
                 self.expect_authority_target("audit target does not match absolute-form denial")
             }
             ExistingAuditErrorClass::NonOriginForm => self.expect_non_authority_target_rejection(
-                RejectionReason::NonOriginForm,
+                TargetRejectionReason::NonOriginForm,
                 "audit target does not match non-origin-form denial",
             ),
             ExistingAuditErrorClass::DotSegment => self.expect_target_rejection(
-                RejectionReason::DotSegment,
+                TargetRejectionReason::DotSegment,
                 "audit target does not match dot-segment denial",
             ),
             ExistingAuditErrorClass::EncodedSeparator => self.expect_target_rejection(
-                RejectionReason::EncodedSeparator,
+                TargetRejectionReason::EncodedSeparator,
                 "audit target does not match encoded-separator denial",
             ),
             ExistingAuditErrorClass::InvalidPercentEncoding => self.expect_target_rejection(
-                RejectionReason::InvalidPercentEncoding,
+                TargetRejectionReason::InvalidPercentEncoding,
                 "audit target does not match invalid-percent denial",
             ),
             ExistingAuditErrorClass::PathTooLong => {
@@ -6752,14 +6752,33 @@ mod proptests {
         ));
     }
 
+    #[test]
+    fn every_audit_denial_constructor_preserves_reason_and_status() {
+        for index in 0_u8..16 {
+            let (denial, expected_reason) = audit_denial(index);
+            let expected_status = expected_reason.status();
+            let actual_status = denial.status();
+            let (method, _target, reason) = denial.into_parts();
+
+            assert_eq!(reason, expected_reason);
+            assert_eq!(actual_status, expected_status);
+            assert_eq!(expected_status, reason.status());
+            if expected_reason == AuditDenialReason::ConnectUnsupported {
+                assert_eq!(method, Method::CONNECT);
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn audit_denial_constructors_preserve_reason_and_status(index in 0_u8..16) {
             let (denial, expected_reason) = audit_denial(index);
             let expected_status = expected_reason.status();
+            let actual_status = denial.status();
             let (method, _target, reason) = denial.into_parts();
 
             prop_assert_eq!(reason, expected_reason);
+            prop_assert_eq!(actual_status, expected_status);
             prop_assert_eq!(expected_status, reason.status());
             if expected_reason == AuditDenialReason::ConnectUnsupported {
                 prop_assert_eq!(method, Method::CONNECT);
