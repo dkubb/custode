@@ -16,8 +16,8 @@ use crate::headers::{
     ForwardedRequestHeaders, HeaderError, forward_request_headers, forward_response_headers,
 };
 use crate::ports::{
-    UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind, UpstreamRequest,
-    UpstreamResponse,
+    UpstreamBodyError, UpstreamClient, UpstreamDeadline, UpstreamError, UpstreamErrorKind,
+    UpstreamRequest, UpstreamResponse,
 };
 use ::http::{Method, Uri};
 use axum::body::{Body, Bytes};
@@ -125,6 +125,14 @@ struct ResponseAuditContext {
     target: AllowedTarget,
 }
 
+/// Audit failure observed after response streaming started.
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct ResponseAuditFailure {
+    /// Error message safe to send as a terminal stream error.
+    message: String,
+}
+
 /// Terminal response stream outcome.
 #[derive(Debug)]
 enum ResponseStreamOutcome {
@@ -143,6 +151,22 @@ enum ResponseStreamOutcome {
 
 /// Server task future shape observed by the shutdown coordinator.
 type ServerFuture = Pin<Box<dyn Future<Output = Result<(), io::Error>> + Send>>;
+
+/// Terminal stream error reason sent to the harness.
+#[derive(Debug, Error)]
+enum StreamAbortReason {
+    /// Audit failed after response streaming started.
+    #[error("{0}")]
+    Audit(ResponseAuditFailure),
+
+    /// Response body exceeded the configured byte limit.
+    #[error("response_body_too_large")]
+    ResponseBodyTooLarge,
+
+    /// Upstream response body stream failed.
+    #[error("{0}")]
+    UpstreamBody(UpstreamBodyError),
+}
 
 impl ResponseAuditContext {
     /// Writes the terminal response audit event.
@@ -178,14 +202,14 @@ impl ResponseAuditContext {
     async fn audit_after_response_started(
         self,
         outcome: ResponseStreamOutcome,
-    ) -> Result<(), String> {
+    ) -> Result<(), ResponseAuditFailure> {
         let fatal_errors = self.fatal_errors.clone();
         match self.audit(outcome).await {
             Ok(()) => Ok(()),
             Err(error) => {
                 let message = error.to_string();
                 report_fatal_error(&fatal_errors, error);
-                Err(message)
+                Err(ResponseAuditFailure { message })
             }
         }
     }
@@ -510,7 +534,7 @@ fn response_stream(
                                 ResponseStreamOutcome::UpstreamResponseStreamFailed,
                             )
                             .await,
-                        upstream_body_error.to_string(),
+                        StreamAbortReason::UpstreamBody(upstream_body_error),
                     )
                     .await;
                     return;
@@ -530,13 +554,12 @@ fn response_stream(
             }
 
             if let Err(_error) = context.response_account.add_chunk(&chunk) {
-                let error_class = "response_body_too_large".to_owned();
                 send_stream_error(
                     &sender,
                     context
                         .audit_after_response_started(ResponseStreamOutcome::ResponseBodyTooLarge)
                         .await,
-                    error_class,
+                    StreamAbortReason::ResponseBodyTooLarge,
                 )
                 .await;
                 return;
@@ -560,7 +583,7 @@ fn response_stream(
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
         if let Err(error) = audit_result {
-            send_stream_error(&sender, Err(error), "audit failed".to_owned()).await;
+            send_terminal_stream_error(&sender, StreamAbortReason::Audit(error)).await;
             return;
         }
 
@@ -580,14 +603,21 @@ fn response_stream(
 /// Sends a stream error, preferring audit failure over upstream failure.
 async fn send_stream_error(
     sender: &mpsc::Sender<Result<Bytes, io::Error>>,
-    audit_result: Result<(), String>,
-    stream_error: String,
+    audit_result: Result<(), ResponseAuditFailure>,
+    stream_error: StreamAbortReason,
 ) {
-    let message = match audit_result {
-        Ok(()) => stream_error,
-        Err(error) => error,
-    };
-    let send_result = sender.send(Err(io::Error::other(message))).await;
+    let terminal_error = audit_result.map_or_else(StreamAbortReason::Audit, |_ok| stream_error);
+    send_terminal_stream_error(sender, terminal_error).await;
+}
+
+/// Sends one terminal stream error to the harness.
+async fn send_terminal_stream_error(
+    sender: &mpsc::Sender<Result<Bytes, io::Error>>,
+    stream_error: StreamAbortReason,
+) {
+    let send_result = sender
+        .send(Err(io::Error::other(stream_error.to_string())))
+        .await;
     if send_result.is_err() {
         tracing::debug!("failed to send terminal stream error");
     }
@@ -1277,11 +1307,12 @@ mod tests {
     }
 
     use super::{
-        AppState, ProductionAdapters, ResponseAuditContext, ResponseStreamOutcome, ServeError,
-        audit_response_header_error, audit_upstream_error, denial_reason_from_rejection,
-        denial_reason_from_request_body, denial_reason_from_request_header, production_gateway,
-        proxy, report_fatal_error, response_stream, run_until_server_stops, send_stream_error,
-        serve, serve_with_adapter_result, synthetic_target,
+        AppState, ProductionAdapters, ResponseAuditContext, ResponseAuditFailure,
+        ResponseStreamOutcome, ServeError, StreamAbortReason, audit_response_header_error,
+        audit_upstream_error, denial_reason_from_rejection, denial_reason_from_request_body,
+        denial_reason_from_request_header, production_gateway, proxy, report_fatal_error,
+        response_stream, run_until_server_stops, send_stream_error, serve,
+        serve_with_adapter_result, synthetic_target,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -3245,8 +3276,10 @@ mod tests {
 
         send_stream_error(
             &sender,
-            Err("audit failed".to_owned()),
-            "stream failed".to_owned(),
+            Err(ResponseAuditFailure {
+                message: "audit failed".to_owned(),
+            }),
+            StreamAbortReason::UpstreamBody(UpstreamBodyError::new("stream failed")),
         )
         .await;
 
@@ -3262,7 +3295,12 @@ mod tests {
     async fn send_stream_error_sends_the_stream_error_when_audit_succeeds() {
         let (sender, mut receiver) = mpsc::channel(1);
 
-        send_stream_error(&sender, Ok(()), "stream failed".to_owned()).await;
+        send_stream_error(
+            &sender,
+            Ok(()),
+            StreamAbortReason::UpstreamBody(UpstreamBodyError::new("stream failed")),
+        )
+        .await;
 
         let outcome = receiver
             .recv()
@@ -3277,7 +3315,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
 
-        send_stream_error(&sender, Ok(()), "stream failed".to_owned()).await;
+        send_stream_error(&sender, Ok(()), StreamAbortReason::ResponseBodyTooLarge).await;
 
         assert!(sender.is_closed(), "receiver should be gone");
     }
