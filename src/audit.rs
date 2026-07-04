@@ -825,8 +825,8 @@ impl ExistingAuditEventFields {
             | ExistingAuditDecision::ResponseError
             | ExistingAuditDecision::UpstreamError => {
                 let expected = self.expected_upstream_target()?;
-                if self.upstream_path.as_deref() == Some(expected.path.as_str())
-                    && self.upstream_query == expected.query
+                if self.upstream_path.as_deref() == Some(expected.path())
+                    && self.upstream_query.as_deref() == expected.query()
                 {
                     Ok(())
                 } else {
@@ -1058,9 +1058,9 @@ pub(crate) struct ObservedAuditRequestInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AuditUpstreamTarget {
     /// Upstream request path.
-    path: String,
+    path: OriginFormPath,
     /// Upstream request query.
-    query: Option<String>,
+    query: Option<OriginFormQuery>,
 }
 
 /// Request target recorded in the audit log.
@@ -1661,8 +1661,13 @@ impl AuditMethod {
 impl AuditUpstreamTarget {
     /// Creates an upstream target from forwarded path and query.
     #[must_use]
-    const fn new(path: String, query: Option<String>) -> Self {
-        Self { path, query }
+    fn new(path: &str, query: Option<&str>) -> Self {
+        Self {
+            path: OriginFormPath::parse(path).expect("test upstream path should parse"),
+            query: query.map(|value| {
+                OriginFormQuery::parse(value).expect("test upstream query should parse")
+            }),
+        }
     }
 }
 
@@ -1671,17 +1676,40 @@ impl AuditUpstreamTarget {
     #[must_use]
     fn from_url(url: &Url) -> Self {
         Self {
-            path: url.path().to_owned(),
-            query: url.query().map(str::to_owned),
+            path: OriginFormPath::parse(url.path()).expect("joined upstream path should parse"),
+            query: url.query().map(|query| {
+                OriginFormQuery::parse(query).expect("joined upstream query should parse")
+            }),
         }
+    }
+
+    /// Consumes the upstream target into audit event fields.
+    #[must_use]
+    fn into_parts(self) -> (String, Option<String>) {
+        (
+            self.path.as_str().to_owned(),
+            self.query.map(|query| query.as_str().to_owned()),
+        )
+    }
+
+    /// Returns the upstream request path.
+    #[must_use]
+    fn path(&self) -> &str {
+        self.path.as_str()
+    }
+
+    /// Returns the upstream request query.
+    #[must_use]
+    fn query(&self) -> Option<&str> {
+        self.query.as_ref().map(OriginFormQuery::as_str)
     }
 }
 
 impl From<&AcceptedTarget> for AuditUpstreamTarget {
     fn from(target: &AcceptedTarget) -> Self {
         Self {
-            path: target.path().to_owned(),
-            query: target.query().map(str::to_owned),
+            path: target.origin_form_path().clone(),
+            query: target.origin_form_query().cloned(),
         }
     }
 }
@@ -1768,10 +1796,10 @@ impl AuditEvent {
                 Some(upstream),
             ),
         };
-        let (upstream_path, upstream_query) = match upstream {
-            Some(upstream_target) => (Some(upstream_target.path), upstream_target.query),
-            None => (None, None),
-        };
+        let (upstream_path, upstream_query) = upstream.map_or((None, None), |upstream_target| {
+            let (path, query) = upstream_target.into_parts();
+            (Some(path), query)
+        });
         Self {
             decision,
             error_class,
@@ -3891,10 +3919,10 @@ mod tests {
 
     #[test]
     fn upstream_target_test_constructor_preserves_parts() {
-        let target = AuditUpstreamTarget::new("/v1/models".to_owned(), Some("limit=1".to_owned()));
+        let target = AuditUpstreamTarget::new("/v1/models", Some("limit=1"));
 
-        assert_eq!(target.path, "/v1/models");
-        assert_eq!(target.query.as_deref(), Some("limit=1"));
+        assert_eq!(target.path(), "/v1/models");
+        assert_eq!(target.query(), Some("limit=1"));
     }
 
     #[test]
@@ -5765,8 +5793,7 @@ mod proptests {
             let observed_response_body = observed_body_summary(&response_body_bytes);
             let response_bytes = body_len(&response_body_bytes);
             let response_digest = BodyDigest::from_bytes(&response_body_bytes).to_hex_string();
-            let upstream =
-                AuditUpstreamTarget::new(upstream_path.clone(), upstream_query.clone());
+            let upstream = AuditUpstreamTarget::new(&upstream_path, upstream_query.as_deref());
             let (
                 outcome,
                 decision,
