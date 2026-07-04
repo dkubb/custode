@@ -1,7 +1,7 @@
 #!/usr/bin/env -S bash --noprofile --norc -o errexit -o errtrace -o nounset -o pipefail
 # Fixture tests for scripts/verify-audit-log.sh.
 
-readonly TAP_TEST_COUNT=7
+readonly TAP_TEST_COUNT=8
 readonly RUN_A="000000000000000a-000000000000000b"
 readonly RUN_B="000000000000000c-000000000000000d"
 
@@ -111,6 +111,9 @@ printf '%s' "$(event "${RUN_A}" 1)" >"${torn_log}"
 invalid_json_log=$(fixture_log "invalid-json")
 write_log "${invalid_json_log}" "$(event "${RUN_A}" 1)" "{"
 
+multi_object_line_log=$(fixture_log "multi-object-line")
+printf '%s %s\n' "$(event "${RUN_A}" 1)" "$(event "${RUN_A}" 2)" >"${multi_object_line_log}"
+
 duplicate_log=$(fixture_log "duplicate")
 write_log "${duplicate_log}" "$(event "${RUN_A}" 1)" "$(event "${RUN_A}" 1)"
 
@@ -127,6 +130,7 @@ run_ok "accepts valid audit logs" scripts/verify-audit-log.sh "${valid_log}"
 run_fails "rejects missing audit logs" scripts/verify-audit-log.sh "${missing_log}"
 run_fails "rejects non-newline-terminated audit logs" scripts/verify-audit-log.sh "${torn_log}"
 run_fails "rejects invalid NDJSON" scripts/verify-audit-log.sh "${invalid_json_log}"
+run_fails "rejects multiple events on one line" scripts/verify-audit-log.sh "${multi_object_line_log}"
 run_fails "rejects duplicate request IDs" scripts/verify-audit-log.sh "${duplicate_log}"
 run_ok "accepts out-of-order run sequences" scripts/verify-audit-log.sh "${out_of_order_log}"
 run_fails "rejects zero request sequences" scripts/verify-audit-log.sh "${zero_sequence_log}"

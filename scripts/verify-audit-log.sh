@@ -45,10 +45,15 @@ require_newline_terminated() {
 
 require_valid_ndjson() {
   local audit_log="${1}"
+  local line
+  local line_number=0
 
-  if ! jq -c . <"${audit_log}" >/dev/null; then
-    fail "audit log contains invalid NDJSON: ${audit_log}"
-  fi
+  while IFS= read -r line; do
+    line_number=$((line_number + 1))
+    if ! jq -e -s 'length == 1 and (.[0] | type) == "object"' <<<"${line}" >/dev/null; then
+      fail "audit log line ${line_number} is not one JSON object: ${audit_log}"
+    fi
+  done <"${audit_log}"
 }
 
 require_valid_request_ids() {
