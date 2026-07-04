@@ -3,7 +3,9 @@
 use crate::allowlist::AcceptedTarget;
 use crate::body::{AccountedBody, BodyDigest, ResponseAccount};
 use crate::config::{AuditEventBytes, GatewayConfig, MAX_ALLOWED_METHOD_BYTES, UpstreamOrigin};
-use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES};
+use crate::target::{
+    MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath, OriginFormQuery,
+};
 use ::http::{Method, StatusCode};
 use core::fmt;
 use core::num::NonZeroU64;
@@ -292,8 +294,16 @@ pub(crate) struct AuditEvent {
 
 /// Existing audit event parsed at startup before appending.
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ExistingAuditEventFields")]
 struct ExistingAuditEvent {
+    /// Semantically validated existing audit event fields.
+    fields: ExistingAuditEventFields,
+}
+
+/// Existing audit event fields parsed at startup before appending.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExistingAuditEventFields {
     /// Final audit decision.
     decision: ExistingAuditDecision,
     /// Stable error class for failed decisions.
@@ -356,7 +366,7 @@ enum ExistingAuditBodySummary {
 }
 
 /// Existing audit decision parsed at startup.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ExistingAuditDecision {
     /// Request was allowed and completed normally.
@@ -373,7 +383,7 @@ enum ExistingAuditDecision {
 }
 
 /// Existing audit error class parsed at startup.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
 enum ExistingAuditErrorClass {
     /// Absolute-form request target was rejected.
@@ -389,6 +399,7 @@ enum ExistingAuditErrorClass {
     DownstreamClosed,
 
     /// Encoded separator was rejected.
+    #[serde(rename = "encoded_path_separator")]
     EncodedSeparator,
 
     /// Invalid percent encoding was rejected.
@@ -457,12 +468,226 @@ impl ExistingAuditBodySummary {
             Self::NonEmpty { blake3, bytes } => drop((blake3, bytes)),
         }
     }
+
+    /// Returns true when the body bytes were not observed.
+    const fn is_not_observed(&self) -> bool {
+        matches!(self, Self::NotObserved)
+    }
+
+    /// Returns true when the body bytes were observed.
+    const fn is_observed(&self) -> bool {
+        matches!(self, Self::Empty | Self::NonEmpty { .. })
+    }
+}
+
+impl ExistingAuditErrorClass {
+    /// Returns the fixed status for error classes that choose the response.
+    const fn fixed_status(self) -> Option<StatusCode> {
+        match self {
+            Self::AbsoluteFormUnsupported
+            | Self::DotSegment
+            | Self::EncodedSeparator
+            | Self::InvalidPercentEncoding
+            | Self::InvalidRequestConnectionHeader
+            | Self::NonOriginForm
+            | Self::RequestBodyReadFailed => Some(StatusCode::BAD_REQUEST),
+            Self::ConnectUnsupported => Some(StatusCode::METHOD_NOT_ALLOWED),
+            Self::InvalidResponseConnectionHeader
+            | Self::ResponseHeadersTooLarge
+            | Self::UpstreamConnectFailed
+            | Self::UpstreamRequestFailed => Some(StatusCode::BAD_GATEWAY),
+            Self::MethodDenied | Self::PathDenied => Some(StatusCode::FORBIDDEN),
+            Self::PathTooLong | Self::QueryTooLong => Some(StatusCode::URI_TOO_LONG),
+            Self::RequestBodyTimeout => Some(StatusCode::REQUEST_TIMEOUT),
+            Self::RequestBodyTooLarge => Some(StatusCode::PAYLOAD_TOO_LARGE),
+            Self::RequestHeadersTooLarge => Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            Self::TooManyRequests => Some(StatusCode::TOO_MANY_REQUESTS),
+            Self::UpstreamTimeout => Some(StatusCode::GATEWAY_TIMEOUT),
+            Self::DownstreamClosed
+            | Self::ResponseBodyTooLarge
+            | Self::UpstreamResponseStreamFailed => None,
+        }
+    }
+
+    /// Returns true when the error class belongs to denied decisions.
+    const fn is_denial(self) -> bool {
+        matches!(
+            self,
+            Self::AbsoluteFormUnsupported
+                | Self::ConnectUnsupported
+                | Self::DotSegment
+                | Self::EncodedSeparator
+                | Self::InvalidPercentEncoding
+                | Self::InvalidRequestConnectionHeader
+                | Self::MethodDenied
+                | Self::NonOriginForm
+                | Self::PathDenied
+                | Self::PathTooLong
+                | Self::QueryTooLong
+                | Self::RequestBodyReadFailed
+                | Self::RequestBodyTimeout
+                | Self::RequestBodyTooLarge
+                | Self::RequestHeadersTooLarge
+                | Self::TooManyRequests
+        )
+    }
+
+    /// Returns true when the error class belongs to response-error decisions.
+    const fn is_response_error(self) -> bool {
+        matches!(
+            self,
+            Self::DownstreamClosed
+                | Self::InvalidResponseConnectionHeader
+                | Self::ResponseBodyTooLarge
+                | Self::ResponseHeadersTooLarge
+                | Self::UpstreamResponseStreamFailed
+        )
+    }
+
+    /// Returns true when the error class belongs to upstream-error decisions.
+    const fn is_upstream_error(self) -> bool {
+        matches!(
+            self,
+            Self::UpstreamConnectFailed | Self::UpstreamRequestFailed | Self::UpstreamTimeout
+        )
+    }
+}
+
+impl ExistingAuditEventFields {
+    /// Validates cross-field invariants that JSON shape alone cannot encode.
+    fn validate(&self) -> Result<(), &'static str> {
+        let error_class = self.validate_error_class()?;
+        self.validate_request_body()?;
+        self.validate_response_body(error_class)?;
+        self.validate_status(error_class)?;
+        self.validate_upstream_target()?;
+        Ok(())
+    }
+
+    /// Validates that the decision and error class agree.
+    const fn validate_error_class(&self) -> Result<Option<ExistingAuditErrorClass>, &'static str> {
+        match (self.decision, self.error_class) {
+            (ExistingAuditDecision::Allowed, None) => Ok(None),
+            (ExistingAuditDecision::Allowed, Some(_error_class)) => {
+                Err("allowed audit events must not have an error class")
+            }
+            (ExistingAuditDecision::Denied, Some(error_class)) if error_class.is_denial() => {
+                Ok(Some(error_class))
+            }
+            (ExistingAuditDecision::ResponseError, Some(error_class))
+                if error_class.is_response_error() =>
+            {
+                Ok(Some(error_class))
+            }
+            (ExistingAuditDecision::UpstreamError, Some(error_class))
+                if error_class.is_upstream_error() =>
+            {
+                Ok(Some(error_class))
+            }
+            (_, None) => Err("failed audit events must have an error class"),
+            (_, Some(_error_class)) => Err("audit error class does not match decision"),
+        }
+    }
+
+    /// Validates the request body summary for the decision.
+    fn validate_request_body(&self) -> Result<(), &'static str> {
+        if self.decision == ExistingAuditDecision::Denied || self.request_body.is_observed() {
+            Ok(())
+        } else {
+            Err("upstream-attempted audit events must observe the request body")
+        }
+    }
+
+    /// Validates the response body summary for the decision.
+    const fn validate_response_body(
+        &self,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        match self.decision {
+            ExistingAuditDecision::Allowed => {
+                if self.response_body.is_observed() {
+                    Ok(())
+                } else {
+                    Err("audit response body summary does not match decision")
+                }
+            }
+            ExistingAuditDecision::Denied | ExistingAuditDecision::UpstreamError => {
+                if self.response_body.is_not_observed() {
+                    Ok(())
+                } else {
+                    Err("audit response body summary does not match decision")
+                }
+            }
+            ExistingAuditDecision::ResponseError => self.validate_response_error_body(error_class),
+        }
+    }
+
+    /// Validates the response body summary for response-error decisions.
+    const fn validate_response_error_body(
+        &self,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        match error_class {
+            Some(
+                ExistingAuditErrorClass::InvalidResponseConnectionHeader
+                | ExistingAuditErrorClass::ResponseHeadersTooLarge,
+            ) if self.response_body.is_not_observed() => Ok(()),
+            Some(ExistingAuditErrorClass::ResponseBodyTooLarge)
+                if !matches!(self.response_body, ExistingAuditBodySummary::Empty) =>
+            {
+                Ok(())
+            }
+            Some(
+                ExistingAuditErrorClass::DownstreamClosed
+                | ExistingAuditErrorClass::UpstreamResponseStreamFailed,
+            ) if self.response_body.is_observed() => Ok(()),
+            _ => Err("audit response body summary does not match decision"),
+        }
+    }
+
+    /// Validates fixed statuses implied by the error class.
+    fn validate_status(
+        &self,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        if let Some(expected) = error_class.and_then(ExistingAuditErrorClass::fixed_status)
+            && self.status != expected
+        {
+            return Err("audit status does not match error class");
+        }
+        Ok(())
+    }
+
+    /// Validates the upstream target relationship for the decision.
+    fn validate_upstream_target(&self) -> Result<(), &'static str> {
+        match self.decision {
+            ExistingAuditDecision::Denied => {
+                if self.upstream_path.is_none() && self.upstream_query.is_none() {
+                    Ok(())
+                } else {
+                    Err("denied audit events must not record an upstream target")
+                }
+            }
+            ExistingAuditDecision::Allowed
+            | ExistingAuditDecision::ResponseError
+            | ExistingAuditDecision::UpstreamError => {
+                if self.upstream_path.as_deref() == Some(self.path.as_str())
+                    && self.upstream_query == self.query
+                {
+                    Ok(())
+                } else {
+                    Err("upstream audit target must match the accepted request target")
+                }
+            }
+        }
+    }
 }
 
 impl ExistingAuditEvent {
     /// Consumes all validated event fields.
     fn consume(self) {
-        let Self {
+        let Self { fields } = self;
+        let ExistingAuditEventFields {
             decision,
             error_class,
             method,
@@ -477,7 +702,7 @@ impl ExistingAuditEvent {
             upstream_path,
             upstream_query,
             version,
-        } = self;
+        } = fields;
         request_body.consume();
         response_body.consume();
         drop((
@@ -494,6 +719,15 @@ impl ExistingAuditEvent {
             upstream_query,
             version,
         ));
+    }
+}
+
+impl TryFrom<ExistingAuditEventFields> for ExistingAuditEvent {
+    type Error = &'static str;
+
+    fn try_from(fields: ExistingAuditEventFields) -> Result<Self, Self::Error> {
+        fields.validate()?;
+        Ok(Self { fields })
     }
 }
 
@@ -1632,14 +1866,80 @@ fn deserialize_existing_method<'de, D>(deserializer: D) -> Result<String, D::Err
 where
     D: Deserializer<'de>,
 {
-    let value = String::deserialize(deserializer)?;
-    if value.is_empty() {
-        return Err(D::Error::invalid_value(
-            Unexpected::Str(&value),
-            &"a non-empty audited method string",
-        ));
+    let raw_value = String::deserialize(deserializer)?;
+    let bounded_value =
+        deserialize_existing_string_bounded(raw_value, MAX_ALLOWED_METHOD_BYTES, "audited method")?;
+    if is_existing_audit_method(&bounded_value) {
+        Ok(bounded_value)
+    } else {
+        Err(D::Error::invalid_value(
+            Unexpected::Str(&bounded_value),
+            &"a valid or truncated audited HTTP method",
+        ))
     }
-    deserialize_existing_string_bounded(value, MAX_ALLOWED_METHOD_BYTES, "audited method")
+}
+
+/// Returns true for method strings emitted by the current audit schema.
+fn is_existing_audit_method(value: &str) -> bool {
+    Method::from_bytes(value.as_bytes()).is_ok() || is_truncated_audit_method(value)
+}
+
+/// Returns true for writer-shaped truncated method strings.
+fn is_truncated_audit_method(value: &str) -> bool {
+    let Some((prefix, suffix)) = value.split_once(AUDIT_TRUNCATION_PREFIX) else {
+        return false;
+    };
+    let Some(original_bytes_text) = suffix.strip_suffix(AUDIT_TRUNCATION_SUFFIX) else {
+        return false;
+    };
+    let Ok(original_byte_count) = original_bytes_text.parse::<usize>() else {
+        return false;
+    };
+    if value.len() != MAX_ALLOWED_METHOD_BYTES || original_byte_count <= MAX_ALLOWED_METHOD_BYTES {
+        return false;
+    }
+
+    Method::from_bytes(prefix.as_bytes()).is_ok()
+}
+
+/// Validates an existing audit upstream path string.
+fn deserialize_existing_origin_path<E>(
+    raw_value: String,
+    field_name: &'static str,
+) -> Result<String, E>
+where
+    E: SerdeError,
+{
+    let bounded_value =
+        deserialize_existing_string_bounded(raw_value, MAX_AUDIT_TARGET_PATH_BYTES, field_name)?;
+    if OriginFormPath::parse(&bounded_value).is_ok() {
+        Ok(bounded_value)
+    } else {
+        Err(E::invalid_value(
+            Unexpected::Str(&bounded_value),
+            &"an origin-form path accepted by the gateway",
+        ))
+    }
+}
+
+/// Validates an existing audit upstream query string.
+fn deserialize_existing_origin_query<E>(
+    raw_value: String,
+    field_name: &'static str,
+) -> Result<String, E>
+where
+    E: SerdeError,
+{
+    let bounded_value =
+        deserialize_existing_string_bounded(raw_value, MAX_AUDIT_TARGET_QUERY_BYTES, field_name)?;
+    if OriginFormQuery::parse(&bounded_value).is_ok() {
+        Ok(bounded_value)
+    } else {
+        Err(E::invalid_value(
+            Unexpected::Str(&bounded_value),
+            &"an origin-form query accepted by the gateway",
+        ))
+    }
 }
 
 /// Deserializes and validates the existing audit path string.
@@ -1733,9 +2033,7 @@ where
 {
     let value = Option::<String>::deserialize(deserializer)?;
     value
-        .map(|path| {
-            deserialize_existing_string_bounded(path, MAX_AUDIT_TARGET_PATH_BYTES, "upstream path")
-        })
+        .map(|path| deserialize_existing_origin_path(path, "upstream path"))
         .transpose()
 }
 
@@ -1746,13 +2044,7 @@ where
 {
     let value = Option::<String>::deserialize(deserializer)?;
     value
-        .map(|query| {
-            deserialize_existing_string_bounded(
-                query,
-                MAX_AUDIT_TARGET_QUERY_BYTES,
-                "upstream query",
-            )
-        })
+        .map(|query| deserialize_existing_origin_query(query, "upstream query"))
         .transpose()
 }
 
@@ -1823,9 +2115,15 @@ fn is_existing_request_id(value: &str) -> bool {
         return false;
     }
 
-    [first, second, sequence]
+    [first, second]
         .into_iter()
         .all(|part| part.len() == 16 && part.bytes().all(is_lower_hex_byte))
+        && sequence.len() == 16
+        && sequence.bytes().all(is_lower_hex_byte)
+        && u64::from_str_radix(sequence, 16)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .is_some()
 }
 
 /// Validates newline-terminated events in an existing audit log.
@@ -2062,8 +2360,9 @@ mod tests {
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
         AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
-        ObservedBodySummary, RUN_TOKEN_BYTES, RequestId, ResponseBodyPrefix, RunToken,
-        RunTokenError, classify_audit_log_tail, inspect_audit_log_tail, is_existing_request_id,
+        ExistingAuditErrorClass, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
+        ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
+        inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
         validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::AcceptedTarget;
@@ -2422,11 +2721,20 @@ mod tests {
 
     /// Builds one serialized audit event line with one field replaced.
     pub(super) fn serialized_event_line_with_field(field: &'static str, value: Value) -> Vec<u8> {
+        serialized_event_line_with_fields([(field, value)])
+    }
+
+    /// Builds one serialized audit event line with fields replaced.
+    pub(super) fn serialized_event_line_with_fields<const N: usize>(
+        fields: [(&'static str, Value); N],
+    ) -> Vec<u8> {
         let mut event = serialized_denied_event_value();
         let object = event
             .as_object_mut()
             .expect("serialized event should be an object");
-        object.insert(field.to_owned(), value);
+        for (field, value) in fields {
+            object.insert(field.to_owned(), value);
+        }
         serialized_event_value_line(&event)
     }
 
@@ -2440,27 +2748,29 @@ mod tests {
     }
 
     /// Builds schema-invalid existing audit event lines.
-    pub(super) fn schema_invalid_existing_event_lines() -> [(&'static str, Vec<u8>); 14] {
+    pub(super) fn schema_invalid_existing_event_lines() -> Vec<(&'static str, Vec<u8>)> {
         let too_long_method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
         let too_long_path = "x".repeat(MAX_ORIGIN_FORM_PATH_BYTES + 1);
         let too_long_query = "x".repeat(MAX_ORIGIN_FORM_QUERY_BYTES + 1);
+
+        let mut lines = Vec::new();
+        lines.extend(schema_invalid_existing_target_lines(
+            too_long_method,
+            too_long_path.clone(),
+            too_long_query.clone(),
+        ));
+        lines.extend(schema_invalid_existing_body_lines());
+        lines.extend(schema_invalid_existing_identity_lines());
+        lines.extend(schema_invalid_existing_metadata_lines(
+            too_long_path,
+            too_long_query,
+        ));
+        lines
+    }
+
+    /// Builds schema-invalid body field lines.
+    fn schema_invalid_existing_body_lines() -> [(&'static str, Vec<u8>); 2] {
         [
-            (
-                "empty method",
-                serialized_event_line_with_field("method", Value::String(String::new())),
-            ),
-            (
-                "too-long method",
-                serialized_event_line_with_field("method", Value::String(too_long_method)),
-            ),
-            (
-                "too-long path",
-                serialized_event_line_with_field("path", Value::String(too_long_path.clone())),
-            ),
-            (
-                "too-long query",
-                serialized_event_line_with_field("query", Value::String(too_long_query.clone())),
-            ),
             (
                 "invalid body digest",
                 serialized_event_line_with_field(
@@ -2475,6 +2785,12 @@ mod tests {
                     non_empty_body_value_with_digest("0".repeat(63)),
                 ),
             ),
+        ]
+    }
+
+    /// Builds schema-invalid request identity lines.
+    fn schema_invalid_existing_identity_lines() -> [(&'static str, Vec<u8>); 5] {
+        [
             (
                 "invalid request id",
                 serialized_event_line_with_field(
@@ -2491,6 +2807,42 @@ mod tests {
                     ),
                 ),
             ),
+            (
+                "zero request id sequence",
+                serialized_event_line_with_field(
+                    "request_id",
+                    Value::String(
+                        "req-000000000000000a-000000000000000b-0000000000000000".to_owned(),
+                    ),
+                ),
+            ),
+            (
+                "short request id sequence",
+                serialized_event_line_with_field(
+                    "request_id",
+                    Value::String(
+                        "req-000000000000000a-000000000000000b-00000000000000".to_owned(),
+                    ),
+                ),
+            ),
+            (
+                "invalid request id sequence hex",
+                serialized_event_line_with_field(
+                    "request_id",
+                    Value::String(
+                        "req-000000000000000a-000000000000000b-000000000000000g".to_owned(),
+                    ),
+                ),
+            ),
+        ]
+    }
+
+    /// Builds schema-invalid metadata and upstream field lines.
+    fn schema_invalid_existing_metadata_lines(
+        too_long_path: String,
+        too_long_query: String,
+    ) -> [(&'static str, Vec<u8>); 8] {
+        [
             (
                 "invalid status",
                 serialized_event_line_with_field("status", Value::from(99_u64)),
@@ -2514,12 +2866,313 @@ mod tests {
                 serialized_event_line_with_field("upstream_path", Value::String(too_long_path)),
             ),
             (
+                "invalid upstream path",
+                serialized_event_line_with_field(
+                    "upstream_path",
+                    Value::String("not-origin-form".to_owned()),
+                ),
+            ),
+            (
                 "too-long upstream query",
                 serialized_event_line_with_field("upstream_query", Value::String(too_long_query)),
             ),
             (
+                "invalid upstream query",
+                serialized_event_line_with_field(
+                    "upstream_query",
+                    Value::String("bad=%zz".to_owned()),
+                ),
+            ),
+            (
                 "invalid version",
                 serialized_event_line_with_field("version", Value::from(4_u64)),
+            ),
+        ]
+    }
+
+    /// Builds schema-invalid method and target field lines.
+    fn schema_invalid_existing_target_lines(
+        too_long_method: String,
+        too_long_path: String,
+        too_long_query: String,
+    ) -> [(&'static str, Vec<u8>); 5] {
+        [
+            (
+                "empty method",
+                serialized_event_line_with_field("method", Value::String(String::new())),
+            ),
+            (
+                "too-long method",
+                serialized_event_line_with_field("method", Value::String(too_long_method)),
+            ),
+            (
+                "invalid method token",
+                serialized_event_line_with_field("method", Value::String("bad method".to_owned())),
+            ),
+            (
+                "too-long path",
+                serialized_event_line_with_field("path", Value::String(too_long_path)),
+            ),
+            (
+                "too-long query",
+                serialized_event_line_with_field("query", Value::String(too_long_query)),
+            ),
+        ]
+    }
+
+    /// Builds semantically invalid existing audit event lines.
+    pub(super) fn semantic_invalid_existing_event_lines() -> Vec<(&'static str, Vec<u8>)> {
+        let mut lines = Vec::new();
+        lines.extend(semantic_invalid_decision_lines());
+        lines.extend(semantic_invalid_response_lines());
+        lines.extend(semantic_invalid_upstream_lines());
+        lines
+    }
+
+    /// Builds decision-level semantically invalid existing audit event lines.
+    fn semantic_invalid_decision_lines() -> [(&'static str, Vec<u8>); 7] {
+        [
+            (
+                "allowed with error class",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("allowed".to_owned())),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "allowed with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("allowed".to_owned())),
+                    ("error_class", Value::Null),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "denied with response error class",
+                serialized_event_line_with_field(
+                    "error_class",
+                    Value::String("response_headers_too_large".to_owned()),
+                ),
+            ),
+            (
+                "failed without error class",
+                serialized_event_line_with_field("error_class", Value::Null),
+            ),
+            (
+                "denied with response body",
+                serialized_event_line_with_field("response_body", non_empty_body_value()),
+            ),
+            (
+                "denied with upstream path",
+                serialized_event_line_with_field(
+                    "upstream_path",
+                    Value::String("/v1/models".to_owned()),
+                ),
+            ),
+            (
+                "denied with upstream query",
+                serialized_event_line_with_field(
+                    "upstream_query",
+                    Value::String("limit=1".to_owned()),
+                ),
+            ),
+        ]
+    }
+
+    /// Builds valid response-error existing audit event lines.
+    pub(super) fn response_error_existing_event_lines() -> [(&'static str, Vec<u8>); 5] {
+        [
+            (
+                "invalid response connection header",
+                response_error_existing_event_line(
+                    "invalid_response_connection_header",
+                    Value::from(502_u64),
+                    not_observed_body_value(),
+                ),
+            ),
+            (
+                "response header error",
+                response_error_existing_event_line(
+                    "response_headers_too_large",
+                    Value::from(502_u64),
+                    not_observed_body_value(),
+                ),
+            ),
+            (
+                "response body too large",
+                response_error_existing_event_line(
+                    "response_body_too_large",
+                    Value::from(200_u64),
+                    non_empty_body_value(),
+                ),
+            ),
+            (
+                "downstream closed",
+                response_error_existing_event_line(
+                    "downstream_closed",
+                    Value::from(200_u64),
+                    non_empty_body_value(),
+                ),
+            ),
+            (
+                "upstream response stream failed",
+                response_error_existing_event_line(
+                    "upstream_response_stream_failed",
+                    Value::from(200_u64),
+                    non_empty_body_value(),
+                ),
+            ),
+        ]
+    }
+
+    /// Builds one valid response-error existing audit event line.
+    fn response_error_existing_event_line(
+        error_class: &'static str,
+        status: Value,
+        response_body: Value,
+    ) -> Vec<u8> {
+        serialized_event_line_with_fields([
+            ("decision", Value::String("response_error".to_owned())),
+            ("error_class", Value::String(error_class.to_owned())),
+            ("status", status),
+            ("upstream_path", Value::String("/v1/models".to_owned())),
+            ("response_body", response_body),
+        ])
+    }
+
+    /// Builds response-level semantically invalid existing audit event lines.
+    fn semantic_invalid_response_lines() -> [(&'static str, Vec<u8>); 7] {
+        [
+            (
+                "response error with denial class",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    ("error_class", Value::String("method_denied".to_owned())),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "invalid response connection header with observed response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("invalid_response_connection_header".to_owned()),
+                    ),
+                    ("status", Value::from(502_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                    ("response_body", non_empty_body_value()),
+                ]),
+            ),
+            (
+                "response header error with observed response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("response_headers_too_large".to_owned()),
+                    ),
+                    ("status", Value::from(502_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                    ("response_body", non_empty_body_value()),
+                ]),
+            ),
+            (
+                "downstream closed with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    ("error_class", Value::String("downstream_closed".to_owned())),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "response body too large with empty response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("response_body_too_large".to_owned()),
+                    ),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                    ("response_body", empty_body_value()),
+                ]),
+            ),
+            (
+                "stream response error with unobserved response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("response_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("upstream_response_stream_failed".to_owned()),
+                    ),
+                    ("status", Value::from(200_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "upstream error with observed response body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                    ("response_body", non_empty_body_value()),
+                ]),
+            ),
+        ]
+    }
+
+    /// Builds upstream-level semantically invalid existing audit event lines.
+    fn semantic_invalid_upstream_lines() -> [(&'static str, Vec<u8>); 5] {
+        [
+            (
+                "upstream error with response error class",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    (
+                        "error_class",
+                        Value::String("response_headers_too_large".to_owned()),
+                    ),
+                    ("status", Value::from(502_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "upstream error with target mismatch",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/other".to_owned())),
+                ]),
+            ),
+            (
+                "upstream error with query mismatch",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("query", Value::String("limit=1".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                    ("upstream_query", Value::String("limit=2".to_owned())),
+                ]),
+            ),
+            (
+                "upstream attempted without observed request body",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("request_body", not_observed_body_value()),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "denied with status mismatch",
+                serialized_event_line_with_field("status", Value::from(200_u64)),
             ),
         ]
     }
@@ -2904,6 +3557,132 @@ mod tests {
     }
 
     #[test]
+    pub(super) fn existing_denial_error_classes_bind_statuses() {
+        let cases = [
+            (
+                ExistingAuditErrorClass::AbsoluteFormUnsupported,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::ConnectUnsupported,
+                Some(StatusCode::METHOD_NOT_ALLOWED),
+            ),
+            (
+                ExistingAuditErrorClass::DotSegment,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::EncodedSeparator,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::InvalidPercentEncoding,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::InvalidRequestConnectionHeader,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::MethodDenied,
+                Some(StatusCode::FORBIDDEN),
+            ),
+            (
+                ExistingAuditErrorClass::NonOriginForm,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::PathDenied,
+                Some(StatusCode::FORBIDDEN),
+            ),
+            (
+                ExistingAuditErrorClass::PathTooLong,
+                Some(StatusCode::URI_TOO_LONG),
+            ),
+            (
+                ExistingAuditErrorClass::QueryTooLong,
+                Some(StatusCode::URI_TOO_LONG),
+            ),
+            (
+                ExistingAuditErrorClass::RequestBodyReadFailed,
+                Some(StatusCode::BAD_REQUEST),
+            ),
+            (
+                ExistingAuditErrorClass::RequestBodyTimeout,
+                Some(StatusCode::REQUEST_TIMEOUT),
+            ),
+            (
+                ExistingAuditErrorClass::RequestBodyTooLarge,
+                Some(StatusCode::PAYLOAD_TOO_LARGE),
+            ),
+            (
+                ExistingAuditErrorClass::RequestHeadersTooLarge,
+                Some(StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE),
+            ),
+            (
+                ExistingAuditErrorClass::TooManyRequests,
+                Some(StatusCode::TOO_MANY_REQUESTS),
+            ),
+        ];
+
+        for (error_class, status) in cases {
+            assert_eq!(error_class.fixed_status(), status);
+            assert!(error_class.is_denial());
+            assert!(!error_class.is_response_error());
+            assert!(!error_class.is_upstream_error());
+        }
+    }
+
+    #[test]
+    pub(super) fn existing_response_error_classes_bind_statuses() {
+        let cases = [
+            (ExistingAuditErrorClass::DownstreamClosed, None),
+            (
+                ExistingAuditErrorClass::InvalidResponseConnectionHeader,
+                Some(StatusCode::BAD_GATEWAY),
+            ),
+            (ExistingAuditErrorClass::ResponseBodyTooLarge, None),
+            (
+                ExistingAuditErrorClass::ResponseHeadersTooLarge,
+                Some(StatusCode::BAD_GATEWAY),
+            ),
+            (ExistingAuditErrorClass::UpstreamResponseStreamFailed, None),
+        ];
+
+        for (error_class, status) in cases {
+            assert_eq!(error_class.fixed_status(), status);
+            assert!(!error_class.is_denial());
+            assert!(error_class.is_response_error());
+            assert!(!error_class.is_upstream_error());
+        }
+    }
+
+    #[test]
+    pub(super) fn existing_upstream_error_classes_bind_statuses() {
+        let cases = [
+            (
+                ExistingAuditErrorClass::UpstreamConnectFailed,
+                Some(StatusCode::BAD_GATEWAY),
+            ),
+            (
+                ExistingAuditErrorClass::UpstreamRequestFailed,
+                Some(StatusCode::BAD_GATEWAY),
+            ),
+            (
+                ExistingAuditErrorClass::UpstreamTimeout,
+                Some(StatusCode::GATEWAY_TIMEOUT),
+            ),
+        ];
+
+        for (error_class, status) in cases {
+            assert_eq!(error_class.fixed_status(), status);
+            assert!(!error_class.is_denial());
+            assert!(!error_class.is_response_error());
+            assert!(error_class.is_upstream_error());
+        }
+    }
+
+    #[test]
     fn event_serializes_documented_fields_and_null_semantics() {
         let input = denied_input(
             "DELETE",
@@ -2946,6 +3725,29 @@ mod tests {
         assert_eq!(object["request_body"], empty_body_value());
         assert_eq!(object["response_body"], not_observed_body_value());
         assert_eq!(object["status"], 403_u64);
+    }
+
+    #[test]
+    pub(super) fn truncated_audit_methods_reject_non_writer_shapes() {
+        let marker = super::AUDIT_TRUNCATION_PREFIX;
+        let suffix = super::AUDIT_TRUNCATION_SUFFIX;
+        let valid_suffix = format!("{marker}65{suffix}");
+        let prefix_len = MAX_ALLOWED_METHOD_BYTES
+            .checked_sub(valid_suffix.len())
+            .expect("test suffix should fit in the audited method bound");
+        let valid_shape = format!("{}{valid_suffix}", "A".repeat(prefix_len));
+        let too_small_suffix = format!("{marker}64{suffix}");
+        let too_small_prefix_len = MAX_ALLOWED_METHOD_BYTES
+            .checked_sub(too_small_suffix.len())
+            .expect("test suffix should fit in the audited method bound");
+        let too_small_original = format!("{}{too_small_suffix}", "A".repeat(too_small_prefix_len));
+
+        assert!(is_truncated_audit_method(&valid_shape));
+        assert!(!is_truncated_audit_method("GET"));
+        assert!(!is_truncated_audit_method(&format!("A{marker}65")));
+        assert!(!is_truncated_audit_method(&format!("A{marker}not{suffix}")));
+        assert!(!is_truncated_audit_method(&format!("A{valid_suffix}")));
+        assert!(!is_truncated_audit_method(&too_small_original));
     }
 
     #[test]
@@ -3163,8 +3965,15 @@ mod tests {
         let object = event
             .as_object_mut()
             .expect("serialized event should be an object");
+        object.insert("decision".to_owned(), Value::String("allowed".to_owned()));
+        object.insert("error_class".to_owned(), Value::Null);
         object.insert("request_body".to_owned(), non_empty_body_value());
         object.insert("response_body".to_owned(), non_empty_body_value());
+        object.insert("status".to_owned(), Value::from(200_u64));
+        object.insert(
+            "upstream_path".to_owned(),
+            Value::String("/v1/models".to_owned()),
+        );
         fs::write(&audit_log, serialized_event_value_line(&event))
             .expect("existing log should be written");
         let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
@@ -3178,11 +3987,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn open_accepts_existing_encoded_separator_denials() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let event = AuditEvent::new(denied_input(
+            "GET",
+            AuditTarget::from_uri_parts("/v1/%2fmodels", None),
+            AuditDenialReason::EncodedSeparator,
+        ));
+        let mut line = serde_json::to_vec(&event).expect("event should serialize");
+        line.push(b'\n');
+        fs::write(&audit_log, line).expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(
+            result.is_ok(),
+            "encoded-separator denials should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_logs_with_truncated_methods() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        let method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
+        let event = AuditEvent::new(denied_input(
+            &method,
+            AuditTarget::from_uri_parts("/v1/models", None),
+            AuditDenialReason::MethodDenied,
+        ));
+        let mut line = serde_json::to_vec(&event).expect("event should serialize");
+        line.push(b'\n');
+        fs::write(&audit_log, line).expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(
+            result.is_ok(),
+            "truncated audited methods should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_response_error_shapes() {
+        for (case_name, contents) in response_error_existing_event_lines() {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("existing log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            assert!(result.is_ok(), "{case_name} should be accepted");
+        }
+    }
+
+    #[tokio::test]
     async fn open_rejects_schema_invalid_existing_audit_fields() {
         for (case_name, contents) in schema_invalid_existing_event_lines() {
             let directory = tempdir().expect("temporary directory should be created");
             let audit_log = directory.path().join("audit.ndjson");
             fs::write(&audit_log, contents).expect("schema-invalid log should be written");
+            let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
+
+            let result = AuditWriter::open(&config).await;
+
+            let first_line = NonZeroU64::new(1).expect("literal should be non-zero");
+            assert!(
+                matches!(
+                    result,
+                    Err(AuditError::CorruptLog {
+                        path,
+                        line: audit_line,
+                        ..
+                    }) if path == audit_log && audit_line == first_line
+                ),
+                "{case_name} should be rejected"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn open_rejects_semantic_invalid_existing_audit_fields() {
+        for (case_name, contents) in semantic_invalid_existing_event_lines() {
+            let directory = tempdir().expect("temporary directory should be created");
+            let audit_log = directory.path().join("audit.ndjson");
+            fs::write(&audit_log, contents).expect("semantic-invalid log should be written");
             let config = GatewayConfig::for_test(audit_log.clone(), roomy_event_limit());
 
             let result = AuditWriter::open(&config).await;
@@ -3282,6 +4175,7 @@ mod tests {
             "req-00000000000000-000000000000000b-0000000000000001",
             "req-000000000000000a-000000000000000b-0000000000000001-extra",
             "req-000000000000000g-000000000000000b-0000000000000001",
+            "req-000000000000000a-000000000000000b-0000000000000000",
         ];
 
         assert!(is_existing_request_id(accepted));
@@ -3615,8 +4509,13 @@ mod tests {
 )]
 mod proptests {
     use super::tests::{
-        TailReader, TailReaderFailure, non_empty_body_value, schema_invalid_existing_event_lines,
-        serialized_denied_event_line, serialized_denied_event_value, serialized_event_value_line,
+        TailReader, TailReaderFailure, existing_denial_error_classes_bind_statuses,
+        existing_response_error_classes_bind_statuses,
+        existing_upstream_error_classes_bind_statuses, non_empty_body_value,
+        response_error_existing_event_lines, schema_invalid_existing_event_lines,
+        semantic_invalid_existing_event_lines, serialized_denied_event_line,
+        serialized_denied_event_value, serialized_event_value_line,
+        truncated_audit_methods_reject_non_writer_shapes,
     };
     use super::{
         AuditBodySummary, AuditDenialReason, AuditEvent, AuditEventInput, AuditOutcome,
@@ -3922,6 +4821,60 @@ mod proptests {
         open_writer(&GatewayConfig::for_test(valid_log, roomy_event_limit()))
             .expect("valid existing log should open");
 
+        let valid_query_log = directory.path().join("valid-query.ndjson");
+        let valid_query_line = serialized_event_value_line(&Value::Object(Map::from_iter([
+            ("decision".to_owned(), Value::String("allowed".to_owned())),
+            ("error_class".to_owned(), Value::Null),
+            ("method".to_owned(), Value::String("GET".to_owned())),
+            ("path".to_owned(), Value::String("/v1/models".to_owned())),
+            ("query".to_owned(), Value::String("limit=1".to_owned())),
+            ("request_body".to_owned(), non_empty_body_value()),
+            (
+                "request_id".to_owned(),
+                Value::String("req-000000000000000a-000000000000000b-0000000000000001".to_owned()),
+            ),
+            ("response_body".to_owned(), non_empty_body_value()),
+            ("status".to_owned(), Value::from(200_u64)),
+            (
+                "timestamp".to_owned(),
+                Value::String("1970-01-01T00:00:00.000000000Z".to_owned()),
+            ),
+            (
+                "upstream_origin".to_owned(),
+                Value::String("https://api.openai.com".to_owned()),
+            ),
+            (
+                "upstream_path".to_owned(),
+                Value::String("/v1/models".to_owned()),
+            ),
+            (
+                "upstream_query".to_owned(),
+                Value::String("limit=1".to_owned()),
+            ),
+            ("version".to_owned(), Value::from(3_u64)),
+        ])));
+        fs::write(&valid_query_log, valid_query_line).expect("valid log should be written");
+
+        open_writer(&GatewayConfig::for_test(
+            valid_query_log,
+            roomy_event_limit(),
+        ))
+        .expect("valid query-bearing existing log should open");
+
+        for (index, (case_name, contents)) in response_error_existing_event_lines()
+            .into_iter()
+            .enumerate()
+        {
+            let audit_log = directory
+                .path()
+                .join(format!("valid-response-error-{index}.ndjson"));
+            fs::write(&audit_log, contents).expect("valid response-error log should be written");
+
+            let result = open_writer(&GatewayConfig::for_test(audit_log, roomy_event_limit()));
+
+            assert!(result.is_ok(), "{case_name} should be accepted");
+        }
+
         for (index, (case_name, contents)) in schema_invalid_existing_event_lines()
             .into_iter()
             .enumerate()
@@ -3942,6 +4895,37 @@ mod proptests {
                 "{case_name} should be rejected"
             );
         }
+
+        for (index, (case_name, contents)) in semantic_invalid_existing_event_lines()
+            .into_iter()
+            .enumerate()
+        {
+            let audit_log = directory
+                .path()
+                .join(format!("semantic-invalid-{index}.ndjson"));
+            fs::write(&audit_log, contents).expect("invalid log should be written");
+
+            let result = open_writer(&GatewayConfig::for_test(
+                audit_log.clone(),
+                roomy_event_limit(),
+            ));
+
+            assert!(
+                matches!(
+                    result,
+                    Err(super::AuditError::CorruptLog { path, .. }) if path == audit_log
+                ),
+                "{case_name} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_audit_helpers_cover_closed_domains_under_property_filter() {
+        existing_denial_error_classes_bind_statuses();
+        existing_response_error_classes_bind_statuses();
+        existing_upstream_error_classes_bind_statuses();
+        truncated_audit_methods_reject_non_writer_shapes();
     }
 
     #[test]
