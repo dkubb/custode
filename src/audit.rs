@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 use thiserror::Error;
-use tokio::fs::{File, OpenOptions, create_dir_all};
+use tokio::fs::{File, OpenOptions, create_dir_all, metadata};
 use tokio::io::{
     AsyncBufReadExt as _, AsyncRead, AsyncReadExt as _, AsyncSeek, AsyncSeekExt as _, AsyncWrite,
     AsyncWriteExt as _, BufReader,
@@ -2530,7 +2530,7 @@ impl AuditWriter {
     pub(crate) async fn open(config: &GatewayConfig) -> Result<Self, AuditError> {
         let path = config.audit_log();
         if let Some(parent) = path.parent() {
-            create_dir_all(parent)
+            create_dir_all_durable(parent)
                 .await
                 .map_err(|source| AuditError::Open {
                     path: parent.to_owned(),
@@ -2547,6 +2547,7 @@ impl AuditWriter {
                 path: path.to_owned(),
                 source,
             })?;
+        sync_audit_log_directory(path).await?;
         match inspect_audit_log_tail(path, &mut audit_file).await? {
             AuditLogTail::Empty => {}
             AuditLogTail::Complete => validate_existing_audit_events(path, &mut audit_file).await?,
@@ -2691,6 +2692,74 @@ impl AuditTimestamp {
     pub(crate) fn now() -> Self {
         Self(humantime::format_rfc3339_nanos(SystemTime::now()).to_string())
     }
+}
+
+/// Creates every missing directory and durably commits each new directory entry.
+async fn create_dir_all_durable(path: &Path) -> io::Result<()> {
+    if path.as_os_str().is_empty() {
+        return Ok(());
+    }
+
+    let mut missing = Vec::new();
+    let mut current = path;
+    let mut existing = None;
+    loop {
+        match metadata(current).await {
+            Ok(metadata) if metadata.is_dir() => {
+                existing = Some(current.to_owned());
+                break;
+            }
+            Ok(_metadata) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "path exists and is not a directory",
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(current.to_owned());
+                let Some(parent) = current
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty())
+                else {
+                    break;
+                };
+                current = parent;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    if let Some(directory) = existing {
+        sync_containing_directory(&directory).await?;
+    }
+    for directory in missing.iter().rev() {
+        create_dir_all(directory).await?;
+        sync_containing_directory(directory).await?;
+    }
+    Ok(())
+}
+
+/// Durably commits an audit log path's containing directory.
+async fn sync_audit_log_directory(path: &Path) -> Result<(), AuditError> {
+    sync_containing_directory(path)
+        .await
+        .map_err(|source| AuditError::Open {
+            path: path.to_owned(),
+            source,
+        })
+}
+
+/// Durably commits the directory entry containing a file or child directory.
+async fn sync_containing_directory(path: &Path) -> io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let directory = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    File::open(directory).await?.sync_all().await
 }
 
 /// Returns audit text bounded to `max_bytes`, with original byte count if cut.
@@ -3293,8 +3362,9 @@ mod tests {
         ExistingAuditDecision, ExistingAuditErrorClass, ExistingAuditEventFields,
         MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES, ObservedBodySummary,
         PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId, RequiredOption,
-        RunToken, RunTokenError, classify_audit_log_tail, inspect_audit_log_tail,
-        is_existing_request_id, is_truncated_audit_method, validate_existing_audit_events,
+        RunToken, RunTokenError, classify_audit_log_tail, create_dir_all_durable,
+        inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
+        sync_audit_log_directory, sync_containing_directory, validate_existing_audit_events,
         write_serialized_event,
     };
     use crate::allowlist::{
@@ -3316,6 +3386,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serde_json::{Map, Value};
     use std::io::SeekFrom;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     #[cfg(unix)]
     use std::process::Command;
@@ -5940,6 +6012,140 @@ mod tests {
         assert!(matches!(result, Err(AuditError::Open { path, .. }) if path == blocking_file));
     }
 
+    pub(super) async fn durable_directory_helpers_cover_reachable_paths() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let nested = directory.path().join("nested/logs");
+        let blocking_file = directory.path().join("occupied");
+        let relative_suffix = directory
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("temporary directory should have a UTF-8 name");
+        let relative = PathBuf::from(format!("custode-audit-durable-{relative_suffix}"));
+        fs::write(&blocking_file, b"not a directory").expect("blocking file should be written");
+        if let Err(error) = fs::remove_dir_all(&relative) {
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::NotFound,
+                "relative coverage directory should be removable"
+            );
+        }
+
+        create_dir_all_durable(Path::new(""))
+            .await
+            .expect("empty path should be a no-op");
+        create_dir_all_durable(directory.path())
+            .await
+            .expect("existing directory should be accepted");
+        create_dir_all_durable(&nested)
+            .await
+            .expect("missing nested directories should be created");
+        create_dir_all_durable(&relative)
+            .await
+            .expect("single relative directory should be created");
+        sync_containing_directory(Path::new(""))
+            .await
+            .expect("empty path should have no containing directory");
+        sync_containing_directory(Path::new("audit.ndjson"))
+            .await
+            .expect("parentless relative path should sync the current directory");
+
+        let result = create_dir_all_durable(&blocking_file).await;
+        let invalid_result = create_dir_all_durable(Path::new("bad\0name")).await;
+        let sync_result =
+            sync_audit_log_directory(&directory.path().join("missing/audit.ndjson")).await;
+
+        assert!(nested.is_dir());
+        assert!(relative.is_dir());
+        assert!(matches!(
+            result,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists
+        ));
+        assert!(matches!(
+            invalid_result,
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput
+        ));
+        assert!(matches!(sync_result, Err(AuditError::Open { .. })));
+
+        #[cfg(unix)]
+        durable_directory_helpers_cover_unix_permission_errors(directory.path()).await;
+
+        if let Err(error) = fs::remove_dir_all(&relative) {
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::NotFound,
+                "relative coverage directory should be removable"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    async fn durable_directory_helpers_cover_unix_permission_errors(directory: &Path) {
+        let create_denied = directory.join("create-denied");
+        let existing_sync_denied = directory.join("existing-sync-denied");
+        let sync_denied = directory.join("sync-denied");
+        let open_sync_denied = directory.join("open-sync-denied");
+        fs::create_dir_all(&create_denied).expect("create-denied directory should be created");
+        fs::create_dir_all(existing_sync_denied.join("child"))
+            .expect("existing-sync-denied child directory should be created");
+        fs::create_dir_all(&sync_denied).expect("sync-denied directory should be created");
+        fs::create_dir_all(&open_sync_denied)
+            .expect("open-sync-denied directory should be created");
+        let audit_log = open_sync_denied.join("audit.ndjson");
+        fs::write(&audit_log, b"").expect("audit log should be created before permissions change");
+
+        set_directory_mode(&create_denied, 0o500);
+        let create_result = create_dir_all_durable(&create_denied.join("child")).await;
+        set_directory_mode(&create_denied, 0o700);
+
+        set_directory_mode(&existing_sync_denied, 0o300);
+        let existing_sync_result =
+            create_dir_all_durable(&existing_sync_denied.join("child")).await;
+        set_directory_mode(&existing_sync_denied, 0o700);
+
+        set_directory_mode(&sync_denied, 0o300);
+        let sync_result = create_dir_all_durable(&sync_denied.join("child")).await;
+        set_directory_mode(&sync_denied, 0o700);
+        let sync_retry_result = create_dir_all_durable(&sync_denied.join("child")).await;
+
+        set_directory_mode(&open_sync_denied, 0o300);
+        let open_result = AuditWriter::open(&GatewayConfig::for_test(
+            audit_log.clone(),
+            roomy_event_limit(),
+        ))
+        .await;
+        set_directory_mode(&open_sync_denied, 0o700);
+
+        assert!(matches!(
+            create_result,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            existing_sync_result,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        assert!(matches!(
+            sync_result,
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied
+        ));
+        sync_retry_result.expect("retry should sync an existing created directory");
+        assert!(matches!(open_result, Err(AuditError::Open { path, .. }) if path == audit_log));
+    }
+
+    #[cfg(unix)]
+    fn set_directory_mode(path: &Path, mode: u32) {
+        let mut permissions = fs::metadata(path)
+            .expect("directory metadata should be readable")
+            .permissions();
+        permissions.set_mode(mode);
+        fs::set_permissions(path, permissions).expect("directory permissions should be set");
+    }
+
+    #[tokio::test]
+    async fn durable_directory_helpers_cover_reachable_states() {
+        durable_directory_helpers_cover_reachable_paths().await;
+    }
+
     #[tokio::test]
     async fn open_accepts_newline_terminated_audit_logs() {
         let directory = tempdir().expect("temporary directory should be created");
@@ -6769,7 +6975,8 @@ mod proptests {
     use super::tests::{
         FailingWriter, PartialWriteThenFailWriter, TailReader, TailReaderFailure, WriterFailure,
         denial_existing_event_lines, distinct_existing_request_ids_open,
-        duplicate_existing_request_ids_reject, existing_denial_error_classes_bind_statuses,
+        duplicate_existing_request_ids_reject, durable_directory_helpers_cover_reachable_paths,
+        existing_denial_error_classes_bind_statuses,
         existing_denied_target_distinguishes_authority_targets,
         existing_denied_target_rejects_non_denial_error_classes,
         existing_error_class_guard_binds_decisions,
@@ -7423,6 +7630,7 @@ mod proptests {
         existing_upstream_error_classes_bind_statuses();
         audit_runtime().block_on(distinct_existing_request_ids_open());
         audit_runtime().block_on(duplicate_existing_request_ids_reject());
+        audit_runtime().block_on(durable_directory_helpers_cover_reachable_paths());
         assert!(!is_existing_request_id("request-id"));
         assert!(!is_existing_request_id("req-000000000000000a"));
         assert!(!is_existing_request_id(
