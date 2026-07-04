@@ -24,6 +24,7 @@ use tokio::io::{
     AsyncWriteExt as _, BufReader,
 };
 use tokio::sync::Mutex;
+use url::Url;
 
 /// Suffix added when audit target text is truncated.
 const AUDIT_TRUNCATION_PREFIX: &str = "...[truncated original_bytes=";
@@ -334,7 +335,7 @@ struct ExistingAuditEventFields {
     timestamp: String,
     /// Configured upstream origin.
     #[serde(deserialize_with = "deserialize_existing_upstream_origin")]
-    upstream_origin: String,
+    upstream_origin: UpstreamOrigin,
     /// Upstream path, when an upstream request was attempted.
     #[serde(deserialize_with = "deserialize_existing_upstream_path")]
     upstream_path: Option<String>,
@@ -575,6 +576,16 @@ impl ExistingAuditEventFields {
         }
     }
 
+    /// Returns the upstream URL target implied by the accepted request target.
+    fn expected_upstream_target(&self) -> Result<AuditUpstreamTarget, &'static str> {
+        let accepted = AcceptedTarget::new(&self.path, self.query.as_deref())
+            .map_err(|_error| "upstream-attempted audit target must be accepted")?;
+        let url = self
+            .upstream_origin
+            .join_path_query(accepted.origin_form_path(), accepted.origin_form_query());
+        Ok(AuditUpstreamTarget::from_url(&url))
+    }
+
     /// Validates cross-field invariants that JSON shape alone cannot encode.
     fn validate(&self) -> Result<(), &'static str> {
         let error_class = self.validate_error_class()?;
@@ -798,12 +809,13 @@ impl ExistingAuditEventFields {
             ExistingAuditDecision::Allowed
             | ExistingAuditDecision::ResponseError
             | ExistingAuditDecision::UpstreamError => {
-                if self.upstream_path.as_deref() == Some(self.path.as_str())
-                    && self.upstream_query == self.query
+                let expected = self.expected_upstream_target()?;
+                if self.upstream_path.as_deref() == Some(expected.path.as_str())
+                    && self.upstream_query == expected.query
                 {
                     Ok(())
                 } else {
-                    Err("upstream audit target must match the accepted request target")
+                    Err("upstream audit target must match the joined upstream URL")
                 }
             }
         }
@@ -1558,6 +1570,11 @@ impl ObservedAuditRequestInput {
         body: &AccountedBody,
         upstream_origin: UpstreamOrigin,
     ) -> Self {
+        let upstream_url = upstream_origin.join_path_query(
+            target.target().origin_form_path(),
+            target.target().origin_form_query(),
+        );
+        let upstream = AuditUpstreamTarget::from_url(&upstream_url);
         let request = AuditRequestInput::new(
             target.method().clone(),
             AuditTarget::from(target.target()),
@@ -1565,7 +1582,6 @@ impl ObservedAuditRequestInput {
             AuditBodySummary::from_request_body(body),
             upstream_origin,
         );
-        let upstream = AuditUpstreamTarget::from(target.target());
         Self { request, upstream }
     }
 }
@@ -1610,6 +1626,17 @@ impl AuditUpstreamTarget {
     #[must_use]
     const fn new(path: String, query: Option<String>) -> Self {
         Self { path, query }
+    }
+}
+
+impl AuditUpstreamTarget {
+    /// Creates an upstream target from the actual forwarded URL.
+    #[must_use]
+    fn from_url(url: &Url) -> Self {
+        Self {
+            path: url.path().to_owned(),
+            query: url.query().map(str::to_owned),
+        }
     }
 }
 
@@ -2164,19 +2191,14 @@ where
 }
 
 /// Deserializes and validates the existing audit upstream origin.
-fn deserialize_existing_upstream_origin<'de, D>(deserializer: D) -> Result<String, D::Error>
+fn deserialize_existing_upstream_origin<'de, D>(deserializer: D) -> Result<UpstreamOrigin, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = String::deserialize(deserializer)?;
-    if UpstreamOrigin::parse(&value).is_ok() {
-        Ok(value)
-    } else {
-        Err(D::Error::invalid_value(
-            Unexpected::Str(&value),
-            &"a supported upstream origin",
-        ))
-    }
+    UpstreamOrigin::parse(&value).map_err(|_error| {
+        D::Error::invalid_value(Unexpected::Str(&value), &"a supported upstream origin")
+    })
 }
 
 /// Deserializes and validates the existing audit upstream path field.
@@ -2813,6 +2835,11 @@ mod tests {
         NonZeroU64::new(value).expect("test request sequence should be non-zero")
     }
 
+    /// Returns the fixed upstream origin used by unit-test fixtures.
+    fn upstream_origin() -> UpstreamOrigin {
+        UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse")
+    }
+
     /// Builds common request audit input for tests.
     fn request_input(
         method: &str,
@@ -2827,7 +2854,7 @@ mod tests {
                 request_sequence(1),
             ),
             body,
-            UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse"),
+            upstream_origin(),
         )
     }
 
@@ -3506,7 +3533,7 @@ mod tests {
     }
 
     /// Builds upstream-level semantically invalid existing audit event lines.
-    fn semantic_invalid_upstream_lines() -> [(&'static str, Vec<u8>); 5] {
+    fn semantic_invalid_upstream_lines() -> [(&'static str, Vec<u8>); 6] {
         [
             (
                 "upstream error with response error class",
@@ -3548,6 +3575,16 @@ mod tests {
                     ("request_body", not_observed_body_value()),
                     ("status", Value::from(504_u64)),
                     ("upstream_path", Value::String("/v1/models".to_owned())),
+                ]),
+            ),
+            (
+                "upstream attempted with rejected request target",
+                serialized_event_line_with_fields([
+                    ("decision", Value::String("upstream_error".to_owned())),
+                    ("error_class", Value::String("upstream_timeout".to_owned())),
+                    ("path", Value::String("not-origin-form".to_owned())),
+                    ("status", Value::from(504_u64)),
+                    ("upstream_path", Value::String("not-origin-form".to_owned())),
                 ]),
             ),
             (
@@ -4026,7 +4063,7 @@ mod tests {
             response_body: ExistingAuditBodySummary::NotObserved,
             status: StatusCode::OK,
             timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
-            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_origin: upstream_origin(),
             upstream_path: None,
             upstream_query: None,
             version: AuditSchemaVersion::CURRENT,
@@ -4036,6 +4073,48 @@ mod tests {
             fields.validate_denied_target(fields.error_class),
             Err("audit error class does not match decision"),
         );
+    }
+
+    #[test]
+    pub(super) fn existing_upstream_targets_are_derived_from_accepted_targets() {
+        let accepted = existing_upstream_error_fields(
+            "/v1/models",
+            Some("q='"),
+            Some("/v1/models"),
+            Some("q=%27"),
+        );
+        let rejected =
+            existing_upstream_error_fields("not-origin-form", None, Some("not-origin-form"), None);
+
+        assert_eq!(accepted.validate_upstream_target(), Ok(()));
+        assert_eq!(
+            rejected.validate_upstream_target(),
+            Err("upstream-attempted audit target must be accepted"),
+        );
+    }
+
+    fn existing_upstream_error_fields(
+        path: &str,
+        query: Option<&str>,
+        upstream_path: Option<&str>,
+        upstream_query: Option<&str>,
+    ) -> ExistingAuditEventFields {
+        ExistingAuditEventFields {
+            decision: ExistingAuditDecision::UpstreamError,
+            error_class: Some(ExistingAuditErrorClass::UpstreamTimeout),
+            method: "GET".to_owned(),
+            path: path.to_owned(),
+            query: query.map(str::to_owned),
+            request_body: ExistingAuditBodySummary::Empty,
+            request_id: "req-000000000000000a-000000000000000b-0000000000000001".to_owned(),
+            response_body: ExistingAuditBodySummary::NotObserved,
+            status: StatusCode::GATEWAY_TIMEOUT,
+            timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
+            upstream_origin: upstream_origin(),
+            upstream_path: upstream_path.map(str::to_owned),
+            upstream_query: upstream_query.map(str::to_owned),
+            version: AuditSchemaVersion::CURRENT,
+        }
     }
 
     pub(super) fn existing_request_body_failures_require_unobserved_bodies() {
@@ -4076,7 +4155,7 @@ mod tests {
                 .fixed_status()
                 .expect("request-body denial should have a fixed status"),
             timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
-            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_origin: upstream_origin(),
             upstream_path: None,
             upstream_query: None,
             version: super::AuditSchemaVersion::CURRENT,
@@ -5429,7 +5508,7 @@ mod proptests {
             ("error_class".to_owned(), Value::Null),
             ("method".to_owned(), Value::String("GET".to_owned())),
             ("path".to_owned(), Value::String("/v1/models".to_owned())),
-            ("query".to_owned(), Value::String("limit=1".to_owned())),
+            ("query".to_owned(), Value::String("q='".to_owned())),
             ("request_body".to_owned(), non_empty_body_value()),
             (
                 "request_id".to_owned(),
@@ -5451,7 +5530,7 @@ mod proptests {
             ),
             (
                 "upstream_query".to_owned(),
-                Value::String("limit=1".to_owned()),
+                Value::String("q=%27".to_owned()),
             ),
             ("version".to_owned(), Value::from(3_u64)),
         ])));

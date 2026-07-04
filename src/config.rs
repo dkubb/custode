@@ -1326,12 +1326,18 @@ mod tests {
 
         let path = origin_form_path("/v1/models");
         let query = origin_form_query("limit=1");
+        let encoded_query = origin_form_query("q='");
         let with_query = origin.join_path_query(&path, Some(&query));
+        let with_encoded_query = origin.join_path_query(&path, Some(&encoded_query));
         let without_query = origin.join_path_query(&path, None);
 
         assert_eq!(
             with_query.as_str(),
             "https://api.example.com:8443/v1/models?limit=1"
+        );
+        assert_eq!(
+            with_encoded_query.as_str(),
+            "https://api.example.com:8443/v1/models?q=%27"
         );
         assert_eq!(
             without_query.as_str(),

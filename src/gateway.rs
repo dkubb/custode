@@ -562,7 +562,7 @@ mod tests {
             .add_chunk(b"world")
             .expect("response chunk should be accounted");
         let input = ResponseAuditInput::new(
-            allowed_target(&gateway, "/v1/models", Some("limit=1")),
+            allowed_target(&gateway, "/v1/models", Some("q='")),
             ResponseAuditOutcome::allowed(response_account, StatusCode::OK),
             request_body,
             RequestId::from_parts(
@@ -579,8 +579,9 @@ mod tests {
         let event = &single_audit_event(directory.path()).await;
         assert_eq!(event["decision"], "allowed");
         assert_eq!(event["status"], 200_u16);
+        assert_eq!(event["query"], "q='");
         assert_eq!(event["upstream_path"], "/v1/models");
-        assert_eq!(event["upstream_query"], "limit=1");
+        assert_eq!(event["upstream_query"], "q=%27");
         assert_eq!(event["request_body"], empty_body_value());
         assert_eq!(event["response_body"], non_empty_body_value(b"world"));
     }
