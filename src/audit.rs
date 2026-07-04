@@ -552,6 +552,14 @@ impl ExistingAuditErrorClass {
             Self::UpstreamConnectFailed | Self::UpstreamRequestFailed | Self::UpstreamTimeout
         )
     }
+
+    /// Returns true when the request body cannot have been observed.
+    const fn requires_unobserved_request_body(self) -> bool {
+        matches!(
+            self,
+            Self::RequestBodyReadFailed | Self::RequestBodyTimeout | Self::RequestBodyTooLarge
+        )
+    }
 }
 
 impl ExistingAuditEventFields {
@@ -559,7 +567,7 @@ impl ExistingAuditEventFields {
     fn validate(&self) -> Result<(), &'static str> {
         let error_class = self.validate_error_class()?;
         self.validate_method(error_class)?;
-        self.validate_request_body()?;
+        self.validate_request_body(error_class)?;
         self.validate_response_body(error_class)?;
         self.validate_status(error_class)?;
         self.validate_upstream_target()?;
@@ -609,7 +617,18 @@ impl ExistingAuditEventFields {
     }
 
     /// Validates the request body summary for the decision.
-    fn validate_request_body(&self) -> Result<(), &'static str> {
+    fn validate_request_body(
+        &self,
+        error_class: Option<ExistingAuditErrorClass>,
+    ) -> Result<(), &'static str> {
+        if error_class.is_some_and(ExistingAuditErrorClass::requires_unobserved_request_body) {
+            return if self.request_body.is_not_observed() {
+                Ok(())
+            } else {
+                Err("audit request body summary does not match error class")
+            };
+        }
+
         if self.decision == ExistingAuditDecision::Denied || self.request_body.is_observed() {
             Ok(())
         } else {
@@ -2396,7 +2415,8 @@ mod tests {
         AuditBodySummary, AuditDecision, AuditDenialReason, AuditError, AuditEvent,
         AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput, AuditResponseHeaderError,
         AuditTarget, AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
-        ExistingAuditErrorClass, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
+        ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
+        ExistingAuditEventFields, ObservedBodySummary, RUN_TOKEN_BYTES, RequestId,
         ResponseBodyPrefix, RunToken, RunTokenError, classify_audit_log_tail,
         inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
         validate_existing_audit_events, write_serialized_event,
@@ -2980,7 +3000,7 @@ mod tests {
     }
 
     /// Builds decision-level semantically invalid existing audit event lines.
-    fn semantic_invalid_decision_lines() -> [(&'static str, Vec<u8>); 9] {
+    fn semantic_invalid_decision_lines() -> [(&'static str, Vec<u8>); 10] {
         [
             (
                 "allowed with error class",
@@ -3031,6 +3051,17 @@ mod tests {
             (
                 "failed without error class",
                 serialized_event_line_with_field("error_class", Value::Null),
+            ),
+            (
+                "request body timeout with observed request body",
+                serialized_event_line_with_fields([
+                    (
+                        "error_class",
+                        Value::String("request_body_timeout".to_owned()),
+                    ),
+                    ("request_body", empty_body_value()),
+                    ("status", Value::from(408_u64)),
+                ]),
             ),
             (
                 "denied with response body",
@@ -3706,6 +3737,51 @@ mod tests {
         }
     }
 
+    pub(super) fn existing_request_body_failures_require_unobserved_bodies() {
+        for error_class in [
+            ExistingAuditErrorClass::RequestBodyReadFailed,
+            ExistingAuditErrorClass::RequestBodyTimeout,
+            ExistingAuditErrorClass::RequestBodyTooLarge,
+        ] {
+            let accepted = existing_request_body_failure_fields(
+                error_class,
+                ExistingAuditBodySummary::NotObserved,
+            );
+            let rejected =
+                existing_request_body_failure_fields(error_class, ExistingAuditBodySummary::Empty);
+
+            assert_eq!(accepted.validate_request_body(accepted.error_class), Ok(()));
+            assert_eq!(
+                rejected.validate_request_body(rejected.error_class),
+                Err("audit request body summary does not match error class")
+            );
+        }
+    }
+
+    fn existing_request_body_failure_fields(
+        error_class: ExistingAuditErrorClass,
+        request_body: ExistingAuditBodySummary,
+    ) -> ExistingAuditEventFields {
+        ExistingAuditEventFields {
+            decision: ExistingAuditDecision::Denied,
+            error_class: Some(error_class),
+            method: "GET".to_owned(),
+            path: "/v1/models".to_owned(),
+            query: None,
+            request_body,
+            request_id: "req-000000000000000a-000000000000000b-0000000000000001".to_owned(),
+            response_body: ExistingAuditBodySummary::NotObserved,
+            status: error_class
+                .fixed_status()
+                .expect("request-body denial should have a fixed status"),
+            timestamp: "1970-01-01T00:00:00.000000000Z".to_owned(),
+            upstream_origin: "https://api.openai.com".to_owned(),
+            upstream_path: None,
+            upstream_query: None,
+            version: super::AuditSchemaVersion::CURRENT,
+        }
+    }
+
     #[test]
     pub(super) fn existing_response_error_classes_bind_statuses() {
         let cases = [
@@ -4035,6 +4111,32 @@ mod tests {
         assert!(
             result.is_ok(),
             "too-many-requests denial should be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_accepts_existing_request_body_timeout_denials() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let audit_log = directory.path().join("audit.ndjson");
+        fs::write(
+            &audit_log,
+            serialized_event_line_with_fields([
+                (
+                    "error_class",
+                    Value::String("request_body_timeout".to_owned()),
+                ),
+                ("request_body", not_observed_body_value()),
+                ("status", Value::from(408_u64)),
+            ]),
+        )
+        .expect("existing log should be written");
+        let config = GatewayConfig::for_test(audit_log, roomy_event_limit());
+
+        let result = AuditWriter::open(&config).await;
+
+        assert!(
+            result.is_ok(),
+            "request-body-timeout denial should be accepted"
         );
     }
 
@@ -4656,6 +4758,7 @@ mod tests {
 mod proptests {
     use super::tests::{
         TailReader, TailReaderFailure, existing_denial_error_classes_bind_statuses,
+        existing_request_body_failures_require_unobserved_bodies,
         existing_response_error_classes_bind_statuses,
         existing_upstream_error_classes_bind_statuses, non_empty_body_value,
         response_error_existing_event_lines, schema_invalid_existing_event_lines,
@@ -5069,6 +5172,7 @@ mod proptests {
     #[test]
     fn existing_audit_helpers_cover_closed_domains_under_property_filter() {
         existing_denial_error_classes_bind_statuses();
+        existing_request_body_failures_require_unobserved_bodies();
         existing_response_error_classes_bind_statuses();
         existing_upstream_error_classes_bind_statuses();
         truncated_audit_methods_reject_non_writer_shapes();
