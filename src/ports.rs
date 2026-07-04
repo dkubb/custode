@@ -503,7 +503,7 @@ mod proptests {
     use crate::body::AccountedBody;
     use crate::config::{GatewayConfig, RequestBodyBytes, RequestHeaderBytes, UpstreamOrigin};
     use crate::headers::forward_request_headers;
-    use crate::target::testing::url_preserved_origin_form_query_valid;
+    use crate::target::testing::origin_form_query_valid;
     use ::http::{HeaderMap, Method};
     use axum::body::Body;
     use core::num::NonZeroUsize;
@@ -554,7 +554,7 @@ mod proptests {
     proptest! {
         #[test]
         fn from_target_preserves_accepted_target(
-            query in prop::option::of(url_preserved_origin_form_query_valid()),
+            query in prop::option::of(origin_form_query_valid()),
         ) {
             let runtime = Runtime::new()
                 .expect("runtime should build");
@@ -586,10 +586,13 @@ mod proptests {
                 &body,
                 UpstreamDeadline::from_timeout(config.request_timeout()),
             );
+            let expected_url =
+                origin.join_path_query(target.origin_form_path(), target.origin_form_query());
 
             prop_assert_eq!(request.method(), &Method::GET);
-            prop_assert_eq!(request.url().path(), target.path());
-            prop_assert_eq!(request.url().query(), target.query());
+            prop_assert_eq!(request.url(), &expected_url);
+            prop_assert_eq!(request.url().path(), expected_url.path());
+            prop_assert_eq!(request.url().query(), expected_url.query());
             prop_assert_eq!(request.body(), b"payload");
             prop_assert_eq!(
                 request.deadline().timeout(),

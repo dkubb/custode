@@ -878,11 +878,12 @@ mod tests {
         };
         use crate::allowlist::RejectionReason;
         use crate::audit::{AuditDenialReason, AuditTarget};
+        use crate::config::UpstreamOrigin;
         use crate::sim::{
             Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
             ScenarioDownstream, ScenarioRequest, ScenarioTarget, ScenarioUpstream, scenario_any,
         };
-        use crate::target::OriginFormQuery;
+        use crate::target::{OriginFormPath, OriginFormQuery};
         use axum::body::Bytes;
         use http::{Method, StatusCode};
         use proptest::prelude::*;
@@ -1237,6 +1238,22 @@ mod tests {
             })
         }
 
+        /// Returns the serialized upstream URL expected for a scenario.
+        fn expected_upstream_url(scenario: &Scenario) -> url::Url {
+            let origin =
+                UpstreamOrigin::parse("https://api.openai.com").expect("origin should parse");
+            let path = OriginFormPath::parse(scenario.request().target_path())
+                .expect("scenario path should parse");
+            let query = scenario
+                .request()
+                .target_query()
+                .map(OriginFormQuery::parse)
+                .transpose()
+                .expect("scenario query should parse");
+
+            origin.join_path_query(&path, query.as_ref())
+        }
+
         /// Returns true when a generated request header should be forwarded.
         fn request_header_is_forwarded(name: &str, connection_headers: &[String]) -> bool {
             !matches!(
@@ -1333,8 +1350,15 @@ mod tests {
                 &Value::String("https://api.openai.com".to_owned())
             );
             if has_upstream {
-                prop_assert_eq!(&object["upstream_path"], &Value::String(path.to_owned()));
-                prop_assert_eq!(&object["upstream_query"], &query);
+                let upstream_url = expected_upstream_url(scenario);
+                prop_assert_eq!(
+                    &object["upstream_path"],
+                    &Value::String(upstream_url.path().to_owned())
+                );
+                prop_assert_eq!(
+                    &object["upstream_query"],
+                    &query_value(upstream_url.query())
+                );
             } else {
                 prop_assert_eq!(&object["upstream_path"], &Value::Null);
                 prop_assert_eq!(&object["upstream_query"], &Value::Null);
@@ -1376,10 +1400,8 @@ mod tests {
             );
             let expected_method = ScenarioRequest::method();
             prop_assert_eq!(request.method(), &expected_method);
-            prop_assert_eq!(
-                request.url(),
-                format!("https://api.openai.com{}", scenario.request().target())
-            );
+            let expected_url = expected_upstream_url(scenario);
+            prop_assert_eq!(request.url(), expected_url.as_str());
             for header in request.headers() {
                 let name = &header.0;
                 prop_assert!(

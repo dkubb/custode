@@ -10,7 +10,10 @@ use crate::ports::{
     AuditSink, BoxFuture, Clock, UpstreamBodyError, UpstreamClient, UpstreamDeadline,
     UpstreamError, UpstreamErrorKind, UpstreamRequest, UpstreamResponse,
 };
-use crate::target::{OriginFormPath, OriginFormQuery, testing::origin_form_path_valid};
+use crate::target::{
+    OriginFormPath, OriginFormQuery,
+    testing::{origin_form_path_valid, origin_form_query_valid},
+};
 use axum::body::Bytes;
 use core::future;
 use core::num::NonZeroUsize;
@@ -925,37 +928,16 @@ fn scenario_connection_value_any() -> impl Strategy<Value = String> {
     ]
 }
 
-/// Generates one allowed query character.
-fn scenario_query_char_any() -> impl Strategy<Value = char> {
-    prop_oneof![
-        Just('&'),
-        Just('-'),
-        Just('.'),
-        Just('0'),
-        Just('1'),
-        Just('9'),
-        Just('='),
-        Just('_'),
-        Just('a'),
-        Just('z'),
-    ]
-}
-
 /// Generates allowed request targets.
 fn scenario_target_any() -> impl Strategy<Value = ScenarioTarget> {
     (
         origin_form_path_valid(),
-        prop_oneof![
-            Just(None),
-            collection::vec(scenario_query_char_any(), 1..17).prop_map(Some),
-        ],
+        prop_oneof![Just(None), origin_form_query_valid().prop_map(Some),],
     )
         .prop_map(|(path_text, query_chars)| {
             let path = OriginFormPath::parse(&path_text).expect("generated path should parse");
-            let query = query_chars.map(|chars| {
-                let query_text = chars.into_iter().collect::<String>();
-                OriginFormQuery::parse(&query_text).expect("generated query should parse")
-            });
+            let query = query_chars
+                .map(|chars| OriginFormQuery::parse(&chars).expect("generated query should parse"));
             ScenarioTarget::new(path, query)
         })
 }
@@ -972,7 +954,7 @@ mod tests {
         ScenarioStartedUpstream, ScenarioTarget, ScenarioUpstream, ScriptedUpstreamClient,
         scenario_any, scenario_body_any, scenario_class_any, scenario_connection_value_any,
         scenario_header_any, scenario_header_value_any, scenario_header_value_char_any,
-        scenario_headers_any, scenario_query_char_any, scripted_stream_error_response,
+        scenario_headers_any, scripted_stream_error_response,
     };
     use crate::config::RequestTimeout;
     use crate::ports::UpstreamDeadline;
@@ -1143,7 +1125,6 @@ mod tests {
             let _header_char = sample(&mut runner, scenario_header_value_char_any());
             let headers = sample(&mut runner, scenario_headers_any());
             let connection = sample(&mut runner, scenario_connection_value_any());
-            let _query_char = sample(&mut runner, scenario_query_char_any());
             let scenario = sample(&mut runner, scenario_any());
             let target_text = scenario.request().target();
 
