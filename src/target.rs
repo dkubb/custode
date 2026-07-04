@@ -365,6 +365,17 @@ pub mod testing {
             .prop_map(|(byte, uppercase)| format_percent_escape(byte, uppercase))
     }
 
+    /// Percent escapes that cannot change path segment structure.
+    fn path_percent_escape_valid() -> impl Strategy<Value = String> {
+        (any::<u8>(), any::<bool>()).prop_filter_map(
+            "path escapes cannot decode to dots or separators",
+            |(byte, uppercase)| {
+                (!matches!(byte, b'.' | b'/' | b'\\'))
+                    .then(|| format_percent_escape(byte, uppercase))
+            },
+        )
+    }
+
     /// Formats one percent escape with deterministic hex casing.
     fn format_percent_escape(byte: u8, uppercase: bool) -> String {
         if uppercase {
@@ -372,6 +383,41 @@ pub mod testing {
         } else {
             format!("%{byte:02x}")
         }
+    }
+
+    /// Path segment accepted by the parser.
+    fn path_segment_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            2 => "[A-Za-z0-9_~-]{1,8}",
+            1 => prop_oneof![
+                Just("!".to_owned()),
+                Just("$".to_owned()),
+                Just("&".to_owned()),
+                Just("'".to_owned()),
+                Just("(".to_owned()),
+                Just(")".to_owned()),
+                Just("*".to_owned()),
+                Just("+".to_owned()),
+                Just(",".to_owned()),
+                Just(";".to_owned()),
+                Just("=".to_owned()),
+                Just(":".to_owned()),
+                Just("@".to_owned()),
+                Just("...".to_owned()),
+                Just("a.".to_owned()),
+                Just(".a".to_owned()),
+                Just("a.b".to_owned()),
+                Just("%2ea".to_owned()),
+                Just("a%2e".to_owned()),
+            ],
+            1 => path_percent_escape_valid(),
+        ]
+    }
+
+    /// Origin-form paths built only from non-empty valid segments.
+    fn origin_form_path_plain_valid() -> impl Strategy<Value = String> {
+        collection::vec(path_segment_valid(), 1..4)
+            .prop_map(|segments| format!("/{}", segments.join("/")))
     }
 
     /// Query atom accepted by the parser.
@@ -423,6 +469,16 @@ pub mod testing {
         ]
     }
 
+    /// Valid path strings accepted as origin-form path witnesses.
+    pub(crate) fn origin_form_path_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            1 => Just("/".to_owned()),
+            3 => origin_form_path_plain_valid(),
+            1 => origin_form_path_plain_valid().prop_map(|path| format!("{path}/")),
+            1 => origin_form_path_plain_valid().prop_map(|path| format!("/{path}")),
+        ]
+    }
+
     /// Valid query strings accepted as origin-form query witnesses.
     pub(crate) fn origin_form_query_valid() -> impl Strategy<Value = String> {
         prop_oneof![
@@ -442,10 +498,10 @@ pub mod testing {
 
     #[cfg(test)]
     mod tests {
-        use super::super::OriginFormQuery;
+        use super::super::{OriginFormPath, OriginFormQuery};
         use super::{
-            format_percent_escape, origin_form_query_valid, percent_escape_valid,
-            url_preserved_origin_form_query_valid,
+            format_percent_escape, origin_form_path_valid, origin_form_query_valid,
+            percent_escape_valid, url_preserved_origin_form_query_valid,
         };
         use proptest::strategy::{Strategy as _, ValueTree as _};
         use proptest::test_runner::TestRunner;
@@ -482,6 +538,20 @@ pub mod testing {
                 OriginFormQuery::parse(&query).expect("generated query should parse");
                 OriginFormQuery::parse(&url_preserved_query)
                     .expect("generated URL-preserved query should parse");
+            }
+        }
+
+        #[test]
+        fn path_generators_create_parseable_samples() {
+            let mut runner = TestRunner::deterministic();
+
+            for _sample in 0_u8..32 {
+                let path = origin_form_path_valid()
+                    .new_tree(&mut runner)
+                    .expect("strategy should generate")
+                    .current();
+
+                OriginFormPath::parse(&path).expect("generated path should parse");
             }
         }
     }
@@ -785,59 +855,16 @@ mod tests {
     reason = "inline proptests keep file-local coverage ownership explicit"
 )]
 mod proptests {
-    use super::testing::origin_form_query_valid;
+    use super::testing::{origin_form_path_valid, origin_form_query_valid};
     use super::{
         MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath,
         OriginFormPathError, OriginFormQuery, OriginFormQueryError,
     };
-    use proptest::collection;
     use proptest::prelude::*;
-
-    /// Percent escapes that cannot change path segment structure.
-    fn path_escape_valid() -> impl Strategy<Value = String> {
-        (any::<u8>(), any::<bool>()).prop_filter_map(
-            "path escapes cannot decode to dots or separators",
-            |(byte, uppercase)| {
-                (!matches!(byte, b'.' | b'/' | b'\\')).then(|| {
-                    if uppercase {
-                        format!("%{byte:02X}")
-                    } else {
-                        format!("%{byte:02x}")
-                    }
-                })
-            },
-        )
-    }
-
-    /// Path segments that decode to something other than `.` or `..`.
-    fn segment_valid() -> impl Strategy<Value = String> {
-        prop_oneof![
-            2 => "[A-Za-z0-9_-]{1,8}",
-            1 => prop_oneof![
-                Just("...".to_owned()),
-                Just("a.".to_owned()),
-                Just(".a".to_owned()),
-                Just("a.b".to_owned()),
-                Just("%2ea".to_owned()),
-                Just("a%2e".to_owned()),
-            ],
-            1 => path_escape_valid(),
-        ]
-    }
-
-    /// Origin-form paths built only from non-empty valid segments.
-    fn path_plain() -> impl Strategy<Value = String> {
-        collection::vec(segment_valid(), 1..4)
-            .prop_map(|segments| format!("/{}", segments.join("/")))
-    }
 
     /// Origin-form paths built only from valid segments.
     fn path_valid() -> impl Strategy<Value = String> {
-        prop_oneof![
-            3 => path_plain(),
-            1 => path_plain().prop_map(|path| format!("{path}/")),
-            1 => path_plain().prop_map(|path| format!("/{path}")),
-        ]
+        origin_form_path_valid()
     }
 
     /// Segments with a representative malformed escape.

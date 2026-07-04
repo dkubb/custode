@@ -1790,7 +1790,7 @@ mod proptests {
     };
     use crate::target::{
         MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery,
-        testing::url_preserved_origin_form_query_valid,
+        testing::{origin_form_path_valid, url_preserved_origin_form_query_valid},
     };
     use ::http::Method;
     use core::iter;
@@ -1921,14 +1921,6 @@ mod proptests {
     fn operation_too_long() -> impl Strategy<Value = String> {
         (MAX_ALLOWED_OPERATION_BYTES..=MAX_ALLOWED_OPERATION_BYTES + 64)
             .prop_map(|tail_len| format!("GET:exact:/{}", "a".repeat(tail_len)))
-    }
-
-    /// Accepted request paths: no dot segments, mirroring what the request
-    /// validator admits. `Url::set_path` normalizes `.` and `..` segments, so
-    /// paths containing them never reach the URL builder at runtime.
-    fn accepted_path() -> impl Strategy<Value = String> {
-        collection::vec("[A-Za-z0-9_-]{1,8}", 1..4)
-            .prop_map(|segments| format!("/{}", segments.join("/")))
     }
 
     /// Registrable-looking hostnames without wildcards.
@@ -2374,7 +2366,7 @@ mod proptests {
         #[test]
         fn join_path_query_preserves_origin_path_and_query(
             origin in origin_valid(),
-            path in accepted_path(),
+            path in origin_form_path_valid(),
             query in option::of(url_preserved_origin_form_query_valid()),
         ) {
             let parsed = UpstreamOrigin::parse(&origin).expect("generated origin should parse");
