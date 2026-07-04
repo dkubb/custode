@@ -873,7 +873,8 @@ mod tests {
     )]
     mod proptests {
         use super::{
-            ScenarioBody, ScenarioRun, audit_denial_from_reason, audit_denial_from_rejection,
+            SCRIPTED_AUDIT_WRITE_ERROR, ScenarioBody, ScenarioFatalError, ScenarioRun,
+            audit_denial_from_reason, audit_denial_from_rejection,
             run_request_id_exhaustion_scenario, run_scenario,
         };
         use crate::allowlist::RejectionReason;
@@ -907,14 +908,6 @@ mod tests {
             "upstream_query",
             "version",
         ];
-
-        /// Expected fatal error for the deterministic audit sink failure.
-        const EXPECTED_FATAL_AUDIT_WRITE_ERROR: &str =
-            "failed to write audit event: scripted audit failure";
-        /// Expected empty fatal-error sequence.
-        const EXPECTED_NO_FATAL_ERRORS: &[&str] = &[];
-        /// Expected fatal-error sequence for one audit write failure.
-        const EXPECTED_FATAL_AUDIT_WRITE_ERRORS: &[&str] = &[EXPECTED_FATAL_AUDIT_WRITE_ERROR];
 
         /// Returns one denial reason by index.
         const fn denial_reason(index: u8) -> AuditDenialReason {
@@ -1197,14 +1190,16 @@ mod tests {
         }
 
         /// Returns the exact fatal post-start errors expected for a scenario.
-        fn expected_fatal_errors(scenario: &Scenario) -> &'static [&'static str] {
+        fn expected_fatal_errors(scenario: &Scenario) -> Vec<ScenarioFatalError> {
             if scenario.admission() == ScenarioAdmission::Open
                 && scenario.audit() == ScenarioAudit::FailFirst
                 && scenario.upstream() != ScenarioUpstream::Timeout
             {
-                EXPECTED_FATAL_AUDIT_WRITE_ERRORS
+                vec![ScenarioFatalError::AuditWrite {
+                    message: SCRIPTED_AUDIT_WRITE_ERROR.to_owned(),
+                }]
             } else {
-                EXPECTED_NO_FATAL_ERRORS
+                Vec::new()
             }
         }
 
@@ -1383,10 +1378,7 @@ mod tests {
             prop_assert_eq!(run.status, expected_status(scenario));
             prop_assert_eq!(&run.response_body, &expected_body(scenario));
             let expected_fatal_errors = expected_fatal_errors(scenario);
-            prop_assert_eq!(run.fatal_errors.len(), expected_fatal_errors.len());
-            for (actual, expected) in run.fatal_errors.iter().zip(expected_fatal_errors) {
-                prop_assert_eq!(actual.as_str(), *expected);
-            }
+            prop_assert_eq!(&run.fatal_errors, &expected_fatal_errors);
             Ok(())
         }
 
@@ -1543,7 +1535,7 @@ mod tests {
                 assert!(run.upstream_requests.is_empty());
                 assert_eq!(
                     run.fatal_errors,
-                    ["request id sequence exhausted".to_owned()]
+                    vec![ScenarioFatalError::RequestIdSequenceExhausted]
                 );
             }
         }
@@ -1615,6 +1607,27 @@ mod tests {
     /// Error string produced by the deterministic audit sink.
     const SCRIPTED_AUDIT_WRITE_ERROR: &str = "failed to write audit event: scripted audit failure";
 
+    /// Closed fatal error observation for deterministic scenarios.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    enum ScenarioFatalError {
+        /// Audit event serialization exceeded the configured bound.
+        AuditEventTooLarge {
+            /// Serialized event bytes.
+            bytes: usize,
+            /// Maximum allowed bytes.
+            max: usize,
+        },
+
+        /// Audit event write failed after the response started.
+        AuditWrite {
+            /// Rendered audit write failure.
+            message: String,
+        },
+
+        /// Request id sequence exhausted.
+        RequestIdSequenceExhausted,
+    }
+
     /// Test wrapper that parses serve arguments.
     #[derive(Debug, Parser)]
     struct ServeCommand {
@@ -1633,7 +1646,7 @@ mod tests {
         /// Upstream deadline used by the gateway.
         deadline: UpstreamDeadline,
         /// Fatal gateway errors reported after response start.
-        fatal_errors: Vec<String>,
+        fatal_errors: Vec<ScenarioFatalError>,
         /// Captured response body outcome.
         response_body: ScenarioBody,
         /// Captured response status.
@@ -2160,7 +2173,8 @@ mod tests {
             .clone();
         yield_now().await;
         let audit_attempts = audit_observer.event_count();
-        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver);
+        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver)
+            .expect("scenario fatal channel should contain only observed fatal variants");
 
         ScenarioRun {
             audit_attempts,
@@ -2211,7 +2225,8 @@ mod tests {
             .clone();
         yield_now().await;
         let audit_attempts = audit_observer.event_count();
-        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver);
+        let reported_fatal_errors = drain_fatal_errors(&mut fatal_receiver)
+            .expect("scenario fatal channel should contain only observed fatal variants");
 
         ScenarioRun {
             audit_attempts,
@@ -2227,12 +2242,33 @@ mod tests {
     /// Drains every currently reported fatal error from a test receiver.
     fn drain_fatal_errors(
         fatal_receiver: &mut mpsc::UnboundedReceiver<GatewayError>,
-    ) -> Vec<String> {
+    ) -> Result<Vec<ScenarioFatalError>, GatewayError> {
         let mut errors = Vec::new();
         while let Ok(error) = fatal_receiver.try_recv() {
-            errors.push(error.to_string());
+            errors.push(scenario_fatal_error(error)?);
         }
-        errors
+        Ok(errors)
+    }
+
+    /// Maps a gateway fatal error into the closed scenario observation type.
+    fn scenario_fatal_error(error: GatewayError) -> Result<ScenarioFatalError, GatewayError> {
+        match error {
+            GatewayError::Audit(AuditError::EventTooLarge { bytes, max }) => {
+                Ok(ScenarioFatalError::AuditEventTooLarge { bytes, max })
+            }
+            GatewayError::Audit(AuditError::Write(write_error)) => {
+                Ok(ScenarioFatalError::AuditWrite {
+                    message: format!("failed to write audit event: {write_error}"),
+                })
+            }
+            GatewayError::RequestId(RequestIdError::SequenceExhausted) => {
+                Ok(ScenarioFatalError::RequestIdSequenceExhausted)
+            }
+            unexpected @ (GatewayError::Audit(_)
+            | GatewayError::Body(_)
+            | GatewayError::Header(_)
+            | GatewayError::ResponseBuild(_)) => Err(unexpected),
+        }
     }
 
     /// Consumes a scenario response according to downstream behavior.
