@@ -2241,7 +2241,7 @@ impl AuditTarget {
 
     /// Creates an audit target from raw request URI parts.
     #[must_use]
-    pub(crate) fn from_uri_parts(path: &str, query: Option<&str>) -> Self {
+    fn from_uri_parts(path: &str, query: Option<&str>) -> Self {
         let normalized_path = if path.is_empty() { "/" } else { path };
         Self {
             path: bounded_audit_text(normalized_path, MAX_AUDIT_TARGET_PATH_BYTES),
