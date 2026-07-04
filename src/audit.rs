@@ -1009,6 +1009,15 @@ pub(crate) struct AuditRequestInput {
     upstream_origin: UpstreamOrigin,
 }
 
+/// Request context for a denied audit event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DeniedAuditRequestInput {
+    /// Denial reason paired with the request context.
+    reason: AuditDenialReason,
+    /// Request context common to every audit event.
+    request: AuditRequestInput,
+}
+
 /// Request context for an audit event after the request body was observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ObservedAuditRequestInput {
@@ -1399,7 +1408,8 @@ impl AuditEventInput {
 
     /// Creates a denied audit event input.
     #[must_use]
-    pub(crate) const fn denied(request: AuditRequestInput, reason: AuditDenialReason) -> Self {
+    pub(crate) fn denied(denied_request: DeniedAuditRequestInput) -> Self {
+        let (request, reason) = denied_request.into_parts();
         let outcome = AuditOutcome::denied(reason);
         Self { outcome, request }
     }
@@ -1490,9 +1500,10 @@ impl AuditRequestInput {
         target: AuditTarget,
         request_id: RequestId,
         body: Option<&AccountedBody>,
+        reason: AuditDenialReason,
         upstream_origin: UpstreamOrigin,
-    ) -> Self {
-        Self::new(
+    ) -> DeniedAuditRequestInput {
+        let request = Self::new(
             method,
             target,
             request_id,
@@ -1501,7 +1512,8 @@ impl AuditRequestInput {
                 AuditBodySummary::from_request_body,
             ),
             upstream_origin,
-        )
+        );
+        DeniedAuditRequestInput { reason, request }
     }
 
     /// Creates request context common to every audit event.
@@ -1520,6 +1532,14 @@ impl AuditRequestInput {
             target,
             upstream_origin,
         }
+    }
+}
+
+impl DeniedAuditRequestInput {
+    /// Consumes the denied wrapper into request context and reason.
+    #[must_use]
+    fn into_parts(self) -> (AuditRequestInput, AuditDenialReason) {
+        (self.request, self.reason)
     }
 }
 

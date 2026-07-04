@@ -230,9 +230,10 @@ impl Gateway {
             target,
             request_id,
             request_body,
+            reason,
             self.config.upstream_origin().clone(),
         );
-        let event = AuditEvent::new_at(AuditEventInput::denied(request, reason), self.clock.now());
+        let event = AuditEvent::new_at(AuditEventInput::denied(request), self.clock.now());
         self.audit.append_event(&event).await?;
         Ok(())
     }
