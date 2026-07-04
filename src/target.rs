@@ -359,6 +359,10 @@ pub mod testing {
     use super::MAX_ORIGIN_FORM_QUERY_BYTES;
     use proptest::collection;
     use proptest::prelude::*;
+    use proptest::sample::select;
+
+    /// First long query length not covered by compact scenario generation.
+    const LONG_QUERY_MIN_BYTES: usize = 65;
 
     /// Valid percent escapes spanning every byte and both hex cases.
     fn percent_escape_valid() -> impl Strategy<Value = String> {
@@ -470,9 +474,59 @@ pub mod testing {
         ]
     }
 
-    /// Plain query strings spanning every accepted byte length.
-    fn query_length_valid() -> impl Strategy<Value = String> {
-        (1..=MAX_ORIGIN_FORM_QUERY_BYTES).prop_map(|len| "a".repeat(len))
+    /// Raw query character accepted by the parser.
+    fn query_raw_character_valid() -> impl Strategy<Value = char> {
+        select(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&'()*+,/;=:@?"
+                .chars()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Raw query character accepted by the parser and preserved by `url::Url`.
+    fn url_preserved_query_raw_character_valid() -> impl Strategy<Value = char> {
+        select(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~!$&()*+,/;=:@?"
+                .chars()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Long raw query strings spanning the accepted raw character grammar.
+    fn query_raw_long_valid() -> impl Strategy<Value = String> {
+        collection::vec(
+            query_raw_character_valid(),
+            LONG_QUERY_MIN_BYTES..=MAX_ORIGIN_FORM_QUERY_BYTES,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Long percent-encoded query strings accepted by the parser.
+    fn query_percent_escape_long_valid() -> impl Strategy<Value = String> {
+        let min_escapes = LONG_QUERY_MIN_BYTES.div_ceil(3);
+        let max_escapes = MAX_ORIGIN_FORM_QUERY_BYTES
+            .checked_div(3)
+            .expect("percent escape width should be non-zero");
+
+        collection::vec(percent_escape_valid(), min_escapes..=max_escapes)
+            .prop_map(|escapes| escapes.concat())
+    }
+
+    /// Long query strings accepted as origin-form query witnesses.
+    fn query_long_valid() -> impl Strategy<Value = String> {
+        prop_oneof![
+            4 => query_raw_long_valid(),
+            1 => query_percent_escape_long_valid(),
+        ]
+    }
+
+    /// Long URL-preserved query strings spanning the raw preserved grammar.
+    fn url_preserved_query_raw_long_valid() -> impl Strategy<Value = String> {
+        collection::vec(
+            url_preserved_query_raw_character_valid(),
+            LONG_QUERY_MIN_BYTES..=MAX_ORIGIN_FORM_QUERY_BYTES,
+        )
+        .prop_map(|chars| chars.into_iter().collect())
     }
 
     /// Valid path strings accepted as origin-form path witnesses.
@@ -497,8 +551,8 @@ pub mod testing {
     pub(crate) fn origin_form_query_valid() -> impl Strategy<Value = String> {
         prop_oneof![
             4 => short_origin_form_query_valid(),
-            1 => query_length_valid(),
-            1 => Just("a".repeat(65)),
+            1 => query_long_valid(),
+            1 => Just("a".repeat(LONG_QUERY_MIN_BYTES)),
             1 => Just("a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES)),
         ]
     }
@@ -511,8 +565,8 @@ pub mod testing {
                 collection::vec(url_preserved_query_atom_valid(), 1..=8)
                     .prop_map(|atoms| atoms.concat()),
             ],
-            1 => query_length_valid(),
-            1 => Just("a".repeat(65)),
+            1 => url_preserved_query_raw_long_valid(),
+            1 => Just("a".repeat(LONG_QUERY_MIN_BYTES)),
             1 => Just("a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES)),
         ]
     }
