@@ -806,9 +806,10 @@ Simulation tests are test-only and live behind `#[cfg(test)]`. They run the
 real Axum handler on a paused current-thread Tokio runtime, with the
 production adapters replaced by deterministic ports from `src/sim.rs`:
 `FixedClock`, `MemoryAuditSink`, `ScriptedUpstreamClient`, and generated
-`Scenario` values. The current request grammar covers allowed `GET`
-`/v1/models` requests with bounded generated bodies, generated query strings,
-and generated header sets over both forwarded and stripped header names. The
+`Scenario` values. The current request grammar covers allowed `GET` requests
+with generated origin-form paths, generated query strings, bounded generated
+bodies, and generated header sets over both forwarded and stripped header names;
+each scenario installs an exact allowlist entry for its generated path. The
 current fault grammar covers saturated admission permits, audit write failure,
 provider success, virtual-time upstream stalls past the carried deadline,
 upstream response stream failure after a body chunk, upstream response body

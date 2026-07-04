@@ -782,6 +782,17 @@ impl GatewayConfig {
         &self.upstream_origin
     }
 
+    /// Returns this config with a replacement allowlist.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_allowed_operations(
+        mut self,
+        allowed_operations: Vec<AllowedOperation>,
+    ) -> Self {
+        self.allowed_operations = allowed_operations;
+        self
+    }
+
     /// Returns this config with a replacement audit event byte limit.
     #[cfg(test)]
     #[must_use]

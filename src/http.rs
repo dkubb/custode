@@ -1299,7 +1299,7 @@ mod tests {
 
             let (decision, error_class, status, response_bytes, response_body, has_upstream) =
                 expected_audit_outcome(scenario)?;
-            let path = ScenarioTarget::path();
+            let path = scenario.request().target_path();
             let query = query_value(scenario.request().target_query());
             prop_assert_eq!(&object["decision"], &Value::String(decision.to_owned()));
             prop_assert_eq!(&object["error_class"], &error_class);
@@ -1529,7 +1529,9 @@ mod tests {
         AuditUpstreamError, RequestId, RunToken,
     };
     use crate::body::{AccountedBody, RequestBodyError, ResponseAccount};
-    use crate::config::{GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs};
+    use crate::config::{
+        AllowedOperation, GatewayConfig, RequestBodyBytes, ResponseBodyBytes, ServeArgs,
+    };
     use crate::gateway::{Gateway, GatewayError};
     use crate::headers::HeaderError;
     use crate::ports::{
@@ -2025,10 +2027,17 @@ mod tests {
         let audit_observer = audit.clone();
         let (client, upstream_recorder) =
             ScriptedUpstreamClient::from_upstream(scenario.upstream());
+        let allowed_operation = AllowedOperation::parse(&format!(
+            "{}:exact:{}",
+            ScenarioRequest::method(),
+            request_shape.target_path()
+        ))
+        .expect("generated scenario operation should parse");
         let mut config = GatewayConfig::for_runtime_test(
             PathBuf::from("unused-audit.ndjson"),
             "https://api.openai.com",
-        );
+        )
+        .with_allowed_operations(vec![allowed_operation]);
         if scenario.bounds() == ScenarioBounds::TinyResponse {
             config = config
                 .with_max_response_bytes(NonZeroU64::new(4).expect("literal should be non-zero"));
