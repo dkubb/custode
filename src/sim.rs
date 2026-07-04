@@ -20,7 +20,7 @@ use core::num::NonZeroUsize;
 use core::time::Duration;
 use futures_util::{StreamExt as _, stream};
 use http::header::CONNECTION;
-use http::{HeaderName, Method, StatusCode};
+use http::{HeaderName, HeaderValue, Method, StatusCode};
 use proptest::prelude::{Just, Strategy, any};
 use proptest::sample::select;
 use proptest::{collection, prop_oneof};
@@ -251,6 +251,8 @@ pub(super) struct ScenarioBody {
 pub(super) struct ScenarioHeaders {
     /// Original header strings that passed HTTP parsing.
     fields: Vec<(String, String)>,
+    /// Parsed header names and values.
+    parsed_fields: Vec<(HeaderName, HeaderValue)>,
 }
 
 /// Closed construction errors for deterministic scenario requests.
@@ -784,6 +786,11 @@ impl ScenarioHeaders {
         &self.fields
     }
 
+    /// Returns the parsed scenario headers.
+    pub(super) fn parsed_slice(&self) -> &[(HeaderName, HeaderValue)] {
+        &self.parsed_fields
+    }
+
     /// Builds parsed scenario headers.
     pub(super) fn try_from_fields(
         fields: Vec<(String, String)>,
@@ -794,6 +801,7 @@ impl ScenarioHeaders {
                 max: MAX_SCENARIO_HEADERS,
             });
         }
+        let mut parsed_fields = Vec::with_capacity(fields.len());
         for field in &fields {
             let name = &field.0;
             let value = &field.1;
@@ -829,8 +837,13 @@ impl ScenarioHeaders {
                     value: value.clone(),
                 });
             }
+            let parsed_value = scenario_header_value_from_checked(value);
+            parsed_fields.push((parsed_name, parsed_value));
         }
-        Ok(Self { fields })
+        Ok(Self {
+            fields,
+            parsed_fields,
+        })
     }
 }
 
@@ -856,11 +869,21 @@ impl ScenarioRequest {
     /// Builds a harness request shape.
     #[must_use]
     pub(super) fn new(
-        body: Vec<u8>,
-        headers: Vec<(String, String)>,
+        body: ScenarioBody,
+        headers: ScenarioHeaders,
         target: ScenarioTarget,
     ) -> Self {
-        Self::try_from_parts(body, headers, target).expect("scenario request should parse")
+        Self {
+            body,
+            headers,
+            target,
+        }
+    }
+
+    /// Returns the parsed request headers.
+    #[must_use]
+    pub(super) fn parsed_headers(&self) -> &[(HeaderName, HeaderValue)] {
+        self.headers.parsed_slice()
     }
 
     /// Returns the request target.
@@ -889,11 +912,7 @@ impl ScenarioRequest {
     ) -> Result<Self, ScenarioRequestError> {
         let parsed_body = ScenarioBody::try_from_bytes(body)?;
         let parsed_headers = ScenarioHeaders::try_from_fields(headers)?;
-        Ok(Self {
-            body: parsed_body,
-            headers: parsed_headers,
-            target,
-        })
+        Ok(Self::new(parsed_body, parsed_headers, target))
     }
 }
 
@@ -1040,6 +1059,11 @@ const fn is_scenario_header_value_byte(byte: u8) -> bool {
     matches!(byte, b' '..=b'~')
 }
 
+/// Builds a parsed header value after the scenario value grammar check.
+fn scenario_header_value_from_checked(value: &str) -> HeaderValue {
+    HeaderValue::from_str(value).expect("printable ASCII header value should parse")
+}
+
 /// Returns true when `Connection` has non-empty valid dynamic header names.
 fn scenario_connection_header_value_is_valid(value: &str) -> bool {
     value.split(',').all(|raw_token| {
@@ -1122,8 +1146,9 @@ pub(super) fn scenario_any() -> impl Strategy<Value = Scenario> {
 }
 
 /// Generates bounded request bodies.
-fn scenario_body_any() -> impl Strategy<Value = Vec<u8>> {
+fn scenario_body_any() -> impl Strategy<Value = ScenarioBody> {
     collection::vec(any::<u8>(), 0..(MAX_SCENARIO_BODY_BYTES + 1))
+        .prop_map(|bytes| ScenarioBody::try_from_bytes(bytes).expect("generated body is bounded"))
 }
 
 /// Generates deterministic scenario fault classes.
@@ -1133,58 +1158,35 @@ fn scenario_class_any() -> impl Strategy<Value = ScenarioClass> {
 
 /// Generates one bounded request header.
 fn scenario_header_any() -> impl Strategy<Value = (String, String)> {
-    prop_oneof![
-        (
-            Just("authorization".to_owned()),
-            scenario_header_value_any(),
-        ),
-        (
-            Just("connection".to_owned()),
-            scenario_connection_value_any(),
-        ),
-        (Just("cookie".to_owned()), scenario_header_value_any(),),
-        (Just("host".to_owned()), scenario_header_value_any(),),
-        (Just("keep-alive".to_owned()), scenario_header_value_any(),),
-        (
-            Just("proxy-authorization".to_owned()),
-            scenario_header_value_any(),
-        ),
-        (Just("te".to_owned()), scenario_header_value_any(),),
-        (Just("upgrade".to_owned()), scenario_header_value_any(),),
-        (Just("x-drop".to_owned()), scenario_header_value_any(),),
-        (Just("x-request-id".to_owned()), scenario_header_value_any(),),
-        (Just("x-visible".to_owned()), scenario_header_value_any(),),
-    ]
+    select(SCENARIO_HEADER_NAMES.to_vec()).prop_flat_map(|name| {
+        let value = if name == "connection" {
+            scenario_connection_value_any().boxed()
+        } else {
+            scenario_header_value_any().boxed()
+        };
+        (Just(name.to_owned()), value)
+    })
 }
 
 /// Generates safe header values.
 fn scenario_header_value_any() -> impl Strategy<Value = String> {
-    collection::vec(scenario_header_value_char_any(), 0..17)
-        .prop_map(|chars| chars.into_iter().collect())
+    collection::vec(
+        scenario_header_value_char_any(),
+        0..(MAX_SCENARIO_HEADER_VALUE_BYTES + 1),
+    )
+    .prop_map(|chars| chars.into_iter().collect())
 }
 
 /// Generates one safe header value character.
 fn scenario_header_value_char_any() -> impl Strategy<Value = char> {
-    prop_oneof![
-        Just('-'),
-        Just('.'),
-        Just('/'),
-        Just('0'),
-        Just('1'),
-        Just('9'),
-        Just(':'),
-        Just('='),
-        Just('A'),
-        Just('Z'),
-        Just('_'),
-        Just('a'),
-        Just('z'),
-    ]
+    (b' '..=b'~').prop_map(char::from)
 }
 
 /// Generates bounded request header sets.
-fn scenario_headers_any() -> impl Strategy<Value = Vec<(String, String)>> {
-    collection::vec(scenario_header_any(), 0..(MAX_SCENARIO_HEADERS + 1))
+fn scenario_headers_any() -> impl Strategy<Value = ScenarioHeaders> {
+    collection::vec(scenario_header_any(), 0..(MAX_SCENARIO_HEADERS + 1)).prop_map(|headers| {
+        ScenarioHeaders::try_from_fields(headers).expect("generated headers should parse")
+    })
 }
 
 /// Generates valid `Connection` header values.
@@ -1218,13 +1220,14 @@ fn scenario_target_any() -> impl Strategy<Value = ScenarioTarget> {
 )]
 mod tests {
     use super::{
-        MAX_SCENARIO_BODY_BYTES, MAX_SCENARIO_HEADERS, MemoryAuditSink, RecordedUpstreamRequest,
-        Scenario, ScenarioAdmission, ScenarioAudit, ScenarioBounds, ScenarioClass,
-        ScenarioDisconnect, ScenarioDownstream, ScenarioRequest, ScenarioStartedUpstream,
-        ScenarioTarget, ScenarioUpstream, ScriptedUpstreamClient, scenario_any, scenario_body_any,
-        scenario_class_any, scenario_connection_value_any, scenario_header_any,
-        scenario_header_value_any, scenario_header_value_char_any, scenario_headers_any,
-        scripted_stream_error_response,
+        MAX_SCENARIO_BODY_BYTES, MAX_SCENARIO_HEADER_NAME_BYTES, MAX_SCENARIO_HEADER_VALUE_BYTES,
+        MAX_SCENARIO_HEADERS, MemoryAuditSink, RecordedUpstreamRequest, Scenario,
+        ScenarioAdmission, ScenarioAudit, ScenarioBody, ScenarioBounds, ScenarioClass,
+        ScenarioDisconnect, ScenarioDownstream, ScenarioHeaders, ScenarioRequest,
+        ScenarioRequestError, ScenarioStartedUpstream, ScenarioTarget, ScenarioUpstream,
+        ScriptedUpstreamClient, scenario_any, scenario_body_any, scenario_class_any,
+        scenario_connection_value_any, scenario_header_any, scenario_header_value_any,
+        scenario_header_value_char_any, scenario_headers_any, scripted_stream_error_response,
     };
     use crate::audit::{
         AuditDenial, AuditEvent, AuditEventInput, AuditRequestInput, AuditTimestamp,
@@ -1239,7 +1242,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use proptest::strategy::{Strategy, ValueTree as _};
     use proptest::test_runner::TestRunner;
-    use std::panic;
 
     fn sample<S>(runner: &mut TestRunner, strategy: S) -> S::Value
     where
@@ -1272,10 +1274,13 @@ mod tests {
         )
     }
 
-    fn assert_scenario_request_rejected(
-        build: impl FnOnce() -> ScenarioRequest + panic::UnwindSafe,
-    ) {
-        drop(panic::catch_unwind(build).expect_err("invalid scenario request should be rejected"));
+    fn scenario_request(
+        body: Vec<u8>,
+        headers: Vec<(String, String)>,
+        target: ScenarioTarget,
+    ) -> ScenarioRequest {
+        ScenarioRequest::try_from_parts(body, headers, target)
+            .expect("scenario request should parse")
     }
 
     #[test]
@@ -1302,7 +1307,7 @@ mod tests {
 
     #[test]
     fn scenario_classes_cover_every_reachable_combination() {
-        let request = ScenarioRequest::new(Vec::new(), Vec::new(), ScenarioTarget::models(None));
+        let request = scenario_request(Vec::new(), Vec::new(), ScenarioTarget::models(None));
         let classes = ScenarioClass::all();
 
         assert_eq!(request.target_query(), None);
@@ -1403,7 +1408,7 @@ mod tests {
 
     #[test]
     fn scenario_request_and_defaults_preserve_parts() {
-        let request = ScenarioRequest::new(
+        let request = scenario_request(
             b"body".to_vec(),
             vec![("authorization".to_owned(), "Bearer token".to_owned())],
             ScenarioTarget::models(Some(
@@ -1468,36 +1473,98 @@ mod tests {
     }
 
     #[test]
-    fn proptests_scenario_request_rejects_invalid_shapes() {
+    fn scenario_request_parts_reject_invalid_shapes() {
         let target = ScenarioTarget::models(None);
         let overlarge_body = vec![0; MAX_SCENARIO_BODY_BYTES + 1];
         let too_many_headers = (0..=MAX_SCENARIO_HEADERS)
             .map(|index| (format!("x-test-{index}"), "value".to_owned()))
             .collect::<Vec<_>>();
+        let overlong_name = "x".repeat(MAX_SCENARIO_HEADER_NAME_BYTES + 1);
+        let overlong_value = "A".repeat(MAX_SCENARIO_HEADER_VALUE_BYTES + 1);
 
-        let target_for_body = target.clone();
-        assert_scenario_request_rejected(move || {
-            ScenarioRequest::new(overlarge_body, Vec::new(), target_for_body)
-        });
-        let target_for_count = target.clone();
-        assert_scenario_request_rejected(move || {
-            ScenarioRequest::new(Vec::new(), too_many_headers, target_for_count)
-        });
-        let target_for_name = target.clone();
-        assert_scenario_request_rejected(move || {
-            ScenarioRequest::new(
+        assert_eq!(
+            ScenarioBody::try_from_bytes(overlarge_body),
+            Err(ScenarioRequestError::BodyTooLarge {
+                bytes: MAX_SCENARIO_BODY_BYTES + 1,
+                max: MAX_SCENARIO_BODY_BYTES,
+            })
+        );
+        assert_eq!(
+            ScenarioRequest::try_from_parts(
+                vec![0; MAX_SCENARIO_BODY_BYTES + 1],
                 Vec::new(),
-                vec![("not a header".to_owned(), "value".to_owned())],
-                target_for_name,
-            )
-        });
-        assert_scenario_request_rejected(move || {
-            ScenarioRequest::new(
+                target.clone(),
+            ),
+            Err(ScenarioRequestError::BodyTooLarge {
+                bytes: MAX_SCENARIO_BODY_BYTES + 1,
+                max: MAX_SCENARIO_BODY_BYTES,
+            })
+        );
+        assert_eq!(
+            ScenarioHeaders::try_from_fields(too_many_headers),
+            Err(ScenarioRequestError::TooManyHeaders {
+                count: MAX_SCENARIO_HEADERS + 1,
+                max: MAX_SCENARIO_HEADERS,
+            })
+        );
+        assert_eq!(
+            ScenarioHeaders::try_from_fields(vec![
+                ("not a header".to_owned(), "value".to_owned(),)
+            ]),
+            Err(ScenarioRequestError::InvalidHeaderName {
+                name: "not a header".to_owned(),
+            })
+        );
+        assert_eq!(
+            ScenarioHeaders::try_from_fields(vec![(overlong_name.clone(), "value".to_owned())]),
+            Err(ScenarioRequestError::HeaderNameTooLong {
+                name: overlong_name,
+                bytes: MAX_SCENARIO_HEADER_NAME_BYTES + 1,
+                max: MAX_SCENARIO_HEADER_NAME_BYTES,
+            })
+        );
+        assert_eq!(
+            ScenarioHeaders::try_from_fields(vec![("x-test".to_owned(), "value".to_owned())]),
+            Err(ScenarioRequestError::UnsupportedHeaderName {
+                name: "x-test".to_owned(),
+            })
+        );
+        assert_eq!(
+            ScenarioHeaders::try_from_fields(vec![(
+                "x-visible".to_owned(),
+                overlong_value.clone(),
+            )]),
+            Err(ScenarioRequestError::HeaderValueTooLong {
+                name: "x-visible".to_owned(),
+                value: overlong_value,
+                bytes: MAX_SCENARIO_HEADER_VALUE_BYTES + 1,
+                max: MAX_SCENARIO_HEADER_VALUE_BYTES,
+            })
+        );
+        assert_eq!(
+            ScenarioRequest::try_from_parts(
                 Vec::new(),
-                vec![("x-test".to_owned(), "\r\n".to_owned())],
+                vec![("x-visible".to_owned(), "\r\n".to_owned())],
                 target,
-            )
-        });
+            ),
+            Err(ScenarioRequestError::InvalidHeaderValue {
+                name: "x-visible".to_owned(),
+                value: "\r\n".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn scenario_headers_reject_invalid_connection_values() {
+        for value in ["", "accept", "bad header", "te,"] {
+            assert_eq!(
+                ScenarioHeaders::try_from_fields(vec![("connection".to_owned(), value.to_owned())]),
+                Err(ScenarioRequestError::InvalidHeaderValue {
+                    name: "connection".to_owned(),
+                    value: value.to_owned(),
+                })
+            );
+        }
     }
 
     #[tokio::test]
@@ -1624,10 +1691,10 @@ mod tests {
             let scenario = sample(&mut runner, scenario_any());
             let target_text = scenario.request().target();
 
-            assert!(body.len() <= MAX_SCENARIO_BODY_BYTES);
+            assert!(body.as_slice().len() <= MAX_SCENARIO_BODY_BYTES);
             assert!(!header.0.is_empty());
-            assert!(header_value.len() <= 16);
-            assert!(headers.len() <= MAX_SCENARIO_HEADERS);
+            assert!(header_value.len() <= MAX_SCENARIO_HEADER_VALUE_BYTES);
+            assert!(headers.as_slice().len() <= MAX_SCENARIO_HEADERS);
             assert!(!connection.is_empty());
             let (path, query_text) = target_text
                 .split_once('?')

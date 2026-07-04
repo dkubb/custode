@@ -1553,7 +1553,7 @@ mod tests {
             for class in classes {
                 let scenario = Scenario::with_class(
                     class,
-                    ScenarioRequest::new(
+                    ScenarioRequest::try_from_parts(
                         b"class".to_vec(),
                         vec![
                             ("authorization".to_owned(), "Bearer harness".to_owned()),
@@ -1568,7 +1568,8 @@ mod tests {
                         ScenarioTarget::models(Some(
                             OriginFormQuery::parse("limit=1").expect("test query should parse"),
                         )),
-                    ),
+                    )
+                    .expect("scenario request should parse"),
                 );
                 let run = run_generated_scenario(scenario.clone());
                 let result = prop_assert_scenario(&scenario, &run);
@@ -1580,11 +1581,12 @@ mod tests {
                 );
             }
 
-            let request = ScenarioRequest::new(
+            let request = ScenarioRequest::try_from_parts(
                 b"default".to_vec(),
                 Vec::new(),
                 ScenarioTarget::models(None),
-            );
+            )
+            .expect("scenario request should parse");
             for (upstream, expected_class) in [
                 (
                     ScenarioUpstream::BodyTimeout,
@@ -2405,8 +2407,8 @@ mod tests {
         let mut builder = Request::builder()
             .method(ScenarioRequest::method())
             .uri(request_shape.target());
-        for header in request_shape.headers() {
-            builder = builder.header(header.0.as_str(), header.1.as_str());
+        for header in request_shape.parsed_headers() {
+            builder = builder.header(header.0.clone(), header.1.clone());
         }
         let request = builder
             .body(Body::from(request_shape.body().to_vec()))
@@ -2685,7 +2687,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn scenario_runner_handles_allowed_requests() {
         let scenario = Scenario::new(
-            ScenarioRequest::new(
+            ScenarioRequest::try_from_parts(
                 b"hello".to_vec(),
                 vec![
                     ("authorization".to_owned(), "Bearer harness".to_owned()),
@@ -2698,7 +2700,8 @@ mod tests {
                 ScenarioTarget::models(Some(
                     OriginFormQuery::parse("limit=1").expect("test query should parse"),
                 )),
-            ),
+            )
+            .expect("scenario request should parse"),
             ScenarioUpstream::Respond,
         );
 
@@ -2729,13 +2732,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn scenario_runner_handles_upstream_stream_errors() {
         let scenario = Scenario::new(
-            ScenarioRequest::new(
+            ScenarioRequest::try_from_parts(
                 b"hello".to_vec(),
                 vec![("authorization".to_owned(), "Bearer harness".to_owned())],
                 ScenarioTarget::models(Some(
                     OriginFormQuery::parse("limit=1").expect("test query should parse"),
                 )),
-            ),
+            )
+            .expect("scenario request should parse"),
             ScenarioUpstream::StreamError,
         );
 
@@ -2768,13 +2772,14 @@ mod tests {
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn scenario_runner_handles_upstream_body_timeouts() {
         let scenario = Scenario::new(
-            ScenarioRequest::new(
+            ScenarioRequest::try_from_parts(
                 b"hello".to_vec(),
                 vec![("authorization".to_owned(), "Bearer harness".to_owned())],
                 ScenarioTarget::models(Some(
                     OriginFormQuery::parse("limit=1").expect("test query should parse"),
                 )),
-            ),
+            )
+            .expect("scenario request should parse"),
             ScenarioUpstream::BodyTimeout,
         );
 
