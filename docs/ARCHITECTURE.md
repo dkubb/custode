@@ -523,9 +523,11 @@ it fits, such as `http://evil.example/steal` or `evil.example:443`. Overlong
 raw target text keeps a prefix and records the original byte count in the
 audited string.
 `upstream_path` and `upstream_query` are null when no upstream request is
-attempted. When an upstream request is attempted, `upstream_query` equals the
-accepted incoming query. `status` is the response status returned to the
-harness. Every decision records one: each closed audit outcome variant
+attempted. When an upstream request is attempted, they record the path and query
+from the joined upstream URL. The `query` field preserves the accepted harness
+request spelling; `upstream_query` may differ when URL serialization
+percent-encodes a valid accepted query. `status` is the response status returned
+to the harness. Every decision records one: each closed audit outcome variant
 carries a mandatory status. The serialized `status` field is structurally
 nullable but always populated.
 `request_body` and `response_body` are closed body-summary objects. Their
