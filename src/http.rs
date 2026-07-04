@@ -7,7 +7,8 @@ use crate::adapters::{
 use crate::allowlist::{AcceptedTarget, AllowedTarget, AllowlistRejectionReason, allow_target};
 use crate::audit::{
     AcceptedAuditTarget, AuditDenial, AuditDenialReason, AuditResponseHeaderError,
-    AuditUpstreamError, AuditWriter, PreparsedAuditTarget, RejectedAuditTarget, RequestId,
+    AuditUpstreamError, AuditWriter, AuthorityAuditTarget, PreparsedAuditTarget,
+    RejectedAuditTarget, RequestId,
 };
 use crate::body::{AccountedBody, OversizedResponseBody, RequestBodyError, ResponseAccount};
 use crate::config::GatewayConfig;
@@ -236,14 +237,11 @@ async fn accept_allowed_target(
         .await;
     }
 
-    if uri.authority().is_some() {
+    if let Some(authority_target) = AuthorityAuditTarget::from_request_uri(uri) {
         return reject_allowed_target(
             gateway,
             request_id,
-            AuditDenial::absolute_form_unsupported(
-                method.clone(),
-                PreparsedAuditTarget::from_request_uri(uri),
-            ),
+            AuditDenial::absolute_form_unsupported(method.clone(), authority_target),
         )
         .await;
     }

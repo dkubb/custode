@@ -267,6 +267,13 @@ pub(crate) struct AcceptedAuditTarget {
     target: AuditTarget,
 }
 
+/// Audit target proven to carry an authority component.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AuthorityAuditTarget {
+    /// Raw audit target.
+    target: AuditTarget,
+}
+
 /// Audit target captured before target parsing or admission succeeds.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PreparsedAuditTarget {
@@ -1559,9 +1566,9 @@ impl AuditDenial {
     #[must_use]
     pub(crate) fn absolute_form_unsupported(
         method: Method,
-        preparsed_target: PreparsedAuditTarget,
+        authority_target: AuthorityAuditTarget,
     ) -> Self {
-        let target = preparsed_target.into_target();
+        let target = authority_target.into_target();
         Self::from_kind(AuditDenialKind::AbsoluteFormUnsupported { method, target })
     }
 
@@ -1779,6 +1786,22 @@ impl AuditDenial {
     ) -> Self {
         let target = preparsed_target.into_target();
         Self::from_kind(AuditDenialKind::TooManyRequests { method, target })
+    }
+}
+
+impl AuthorityAuditTarget {
+    /// Creates an authority-bearing audit target from the raw request URI.
+    #[must_use]
+    pub(crate) fn from_request_uri(uri: &Uri) -> Option<Self> {
+        uri.authority().map(|_authority| Self {
+            target: AuditTarget::from_request_uri(uri),
+        })
+    }
+
+    /// Consumes the witness into the recorded audit target.
+    #[must_use]
+    fn into_target(self) -> AuditTarget {
+        self.target
     }
 }
 
@@ -3212,7 +3235,7 @@ mod tests {
         AcceptedAuditTarget, AuditBodySummary, AuditDecision, AuditDenial, AuditDenialReason,
         AuditError, AuditEvent, AuditEventInput, AuditLogTail, AuditOutcome, AuditRequestInput,
         AuditResponseError, AuditResponseHeaderError, AuditSchemaVersion, AuditTarget,
-        AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter,
+        AuditTimestamp, AuditUpstreamError, AuditUpstreamTarget, AuditWriter, AuthorityAuditTarget,
         ExistingAuditBodySummary, ExistingAuditDecision, ExistingAuditErrorClass,
         ExistingAuditEventFields, MAX_AUDIT_TARGET_PATH_BYTES, MAX_AUDIT_TARGET_QUERY_BYTES,
         ObservedBodySummary, PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId,
@@ -4725,17 +4748,23 @@ mod tests {
         ]
     }
 
+    fn authority_denial_constructor_cases(
+        authority_target: &AuthorityAuditTarget,
+        target: &AuditTarget,
+    ) -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
+        vec![(
+            AuditDenial::absolute_form_unsupported(Method::GET, authority_target.clone()),
+            Method::GET,
+            target.clone(),
+            AuditDenialReason::AbsoluteFormUnsupported,
+        )]
+    }
+
     fn preparsed_denial_constructor_cases(
         preparsed_target: &PreparsedAuditTarget,
         target: &AuditTarget,
     ) -> Vec<(AuditDenial, Method, AuditTarget, AuditDenialReason)> {
         vec![
-            (
-                AuditDenial::absolute_form_unsupported(Method::GET, preparsed_target.clone()),
-                Method::GET,
-                target.clone(),
-                AuditDenialReason::AbsoluteFormUnsupported,
-            ),
             (
                 AuditDenial::connect_unsupported(preparsed_target.clone()),
                 Method::CONNECT,
@@ -4822,11 +4851,19 @@ mod tests {
     fn audit_denial_constructors_pair_method_target_and_reason() {
         let uri = Uri::from_static("/v1/models?limit=1");
         let target = AuditTarget::from_request_uri(&uri);
+        let authority_uri = Uri::from_static("http://evil.example/v1/models?limit=1");
+        let authority_target = AuditTarget::from_request_uri(&authority_uri);
         let accepted =
             AcceptedTarget::new("/v1/models", Some("limit=1")).expect("target should be accepted");
         let accepted_target = AcceptedAuditTarget::from_accepted(&accepted);
         let preparsed_target = PreparsedAuditTarget::from_request_uri(&uri);
+        let authority_target_witness = AuthorityAuditTarget::from_request_uri(&authority_uri)
+            .expect("absolute URI should carry authority");
         let mut cases = preparsed_denial_constructor_cases(&preparsed_target, &target);
+        cases.extend(authority_denial_constructor_cases(
+            &authority_target_witness,
+            &authority_target,
+        ));
         cases.extend(rejected_denial_constructor_cases());
         cases.extend(accepted_denial_constructor_cases(&accepted_target, &target));
 
@@ -5567,6 +5604,33 @@ mod tests {
         assert_eq!(target.path(), "/v1/models");
         assert_eq!(audited_query.len(), MAX_ORIGIN_FORM_QUERY_BYTES);
         assert!(audited_query.ends_with(&suffix));
+    }
+
+    #[test]
+    fn authority_audit_target_accepts_authority_bearing_targets() {
+        let absolute_uri = Uri::from_static("http://evil.example/v1/models?limit=1");
+        let authority_uri = Uri::from_static("evil.example:443");
+
+        let absolute_target = AuthorityAuditTarget::from_request_uri(&absolute_uri)
+            .expect("absolute URI should carry authority")
+            .into_target();
+        let authority_target = AuthorityAuditTarget::from_request_uri(&authority_uri)
+            .expect("authority-form URI should carry authority")
+            .into_target();
+
+        assert_eq!(absolute_target.path(), "http://evil.example/v1/models");
+        assert_eq!(absolute_target.query(), Some("limit=1"));
+        assert_eq!(authority_target.path(), "evil.example:443");
+        assert_eq!(authority_target.query(), None);
+    }
+
+    #[test]
+    fn authority_audit_target_rejects_origin_form_targets() {
+        let uri = Uri::from_static("/v1/models?limit=1");
+
+        let target = AuthorityAuditTarget::from_request_uri(&uri);
+
+        assert_eq!(target, None);
     }
 
     #[test]
@@ -6389,8 +6453,9 @@ mod proptests {
         AcceptedAuditTarget, AuditBodySummary, AuditDenial, AuditDenialReason, AuditEvent,
         AuditEventInput, AuditOutcome, AuditRequestInput, AuditResponseError,
         AuditResponseHeaderError, AuditTarget, AuditUpstreamError, AuditUpstreamTarget,
-        AuditWriter, ObservedBodySummary, PreparsedAuditTarget, RejectedAuditTarget, RequestId,
-        RunToken, RunTokenError, inspect_audit_log_tail, is_existing_request_id,
+        AuditWriter, AuthorityAuditTarget, ObservedBodySummary, PreparsedAuditTarget,
+        RejectedAuditTarget, RequestId, RunToken, RunTokenError, inspect_audit_log_tail,
+        is_existing_request_id,
     };
     use crate::allowlist::{AcceptedTarget, AllowlistRejectionReason, TargetRejectionReason};
     use crate::body::{BodyDigest, NonEmptyBodyObservation, ResponseAccount};
@@ -6459,7 +6524,7 @@ mod proptests {
         let method = Method::POST;
         match index {
             0 => (
-                AuditDenial::absolute_form_unsupported(method, preparsed_audit_target()),
+                AuditDenial::absolute_form_unsupported(method, authority_audit_target()),
                 AuditDenialReason::AbsoluteFormUnsupported,
             ),
             1 => (
@@ -6554,6 +6619,14 @@ mod proptests {
     /// Returns a preparsed audit target for generated denial constructors.
     fn preparsed_audit_target() -> PreparsedAuditTarget {
         PreparsedAuditTarget::from_request_uri(&Uri::from_static("/v1/models?limit=1"))
+    }
+
+    /// Returns an authority-bearing audit target for generated denials.
+    fn authority_audit_target() -> AuthorityAuditTarget {
+        AuthorityAuditTarget::from_request_uri(&Uri::from_static(
+            "http://evil.example/v1/models?limit=1",
+        ))
+        .expect("absolute URI should carry authority")
     }
 
     /// Returns a parser-rejected audit target for generated denial constructors.
