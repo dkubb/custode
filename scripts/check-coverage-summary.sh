@@ -209,6 +209,7 @@ detailed_report_excluding_test_modules() {
     printf 'detailed coverage JSON is required with --exclude-test-mods\n' >&2
     return 2
   fi
+  validate_detailed_events_present "${summary_path}"
 
   exclusions_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-exclusions.XXXXXX")
   events_path=$(mktemp "${TMPDIR:-/tmp}/custode-coverage-events.XXXXXX")
@@ -331,6 +332,93 @@ detailed_report_excluding_test_modules() {
     "${exclusions_path}" "${events_path}"
 
   rm -f "${exclusions_path}" "${events_path}"
+}
+
+validate_detailed_events_present() {
+  local summary_path="${1}"
+
+  jq --exit-status '
+    def as_bool:
+      if type == "boolean" then . else . != 0 end;
+
+    def require_number($metric; $field):
+      .data[0].totals[$metric][$field] as $value |
+      if ($value | type) == "number" then
+        $value
+      else
+        error("coverage summary missing numeric field: " + $metric + "." + $field)
+      end;
+
+    def missed($metric):
+      (require_number($metric; "count")) as $count |
+      (require_number($metric; "covered")) as $covered |
+      $count - $covered;
+
+    def require_events($metric; $missed; $events):
+      if $missed > 0 and $events == 0 then
+        error("coverage detail missing uncovered " + $metric + " events despite summary misses")
+      else
+        true
+      end;
+
+    .data[0] as $data |
+    (
+      [
+        $data.files[]? |
+        (.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        (($segment[4] // false) | as_bool) as $is_region_entry |
+        select($line > 0 and $has_count and $count == 0 and $is_region_entry)
+      ] |
+      length
+    ) as $region_events |
+    (
+      [
+        ($data.functions // [])[] |
+        select((.count // 0) == 0) |
+        (.filenames[0] // "") as $filename |
+        ((.regions[0][0]) // 0) as $line |
+        select($filename != "" and $line > 0)
+      ] |
+      length
+    ) as $function_events |
+    (
+      [
+        $data.files[]? |
+        (.segments // [])[] |
+        . as $segment |
+        ($segment[0] // 0) as $line |
+        ($segment[2] // 0) as $count |
+        (($segment[3] // false) | as_bool) as $has_count |
+        select($line > 0 and $has_count and $count == 0)
+      ] |
+      length
+    ) as $line_events |
+    (
+      [
+        $data.files[]? |
+        (.branches // [])[] |
+        . as $branch |
+        ($branch[0] // 0) as $line |
+        [
+          ($branch[4] // 0),
+          ($branch[5] // 0)
+        ][] as $count |
+        select($line > 0 and $count == 0)
+      ] |
+      length
+    ) as $branch_events |
+    [
+      require_events("regions"; missed("regions"); $region_events),
+      require_events("functions"; missed("functions"); $function_events),
+      require_events("lines"; missed("lines"); $line_events),
+      require_events("branches"; missed("branches"); $branch_events)
+    ] |
+    all
+  ' "${summary_path}" >/dev/null
 }
 
 build_exclusion_table() {

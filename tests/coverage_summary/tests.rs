@@ -166,6 +166,22 @@ fn exclude_test_modules_rejects_covered_totals_above_counts() {
 }
 
 #[test]
+fn exclude_test_modules_requires_detailed_events_for_summary_misses() {
+    let output = run_excluded_summary_fixture(
+        r#"{"data":[{"totals":{"regions":{"count":0,"covered":0},"functions":{"count":1,"covered":0},"lines":{"count":0,"covered":0},"branches":{"count":0,"covered":0}},"functions":[],"files":[]}]}"#,
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be UTF-8");
+
+    assert_ne!(output.status.code(), Some(0_i32));
+    assert!(
+        stderr.contains(
+            "coverage detail missing uncovered functions events despite summary misses"
+        ),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn exclude_test_modules_counts_each_uncovered_branch_arm() {
     let output = run_coverage_summary("[[1,0,1,10,1,0]]", 0);
 
