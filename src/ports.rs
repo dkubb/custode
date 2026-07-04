@@ -16,6 +16,9 @@ use non_empty_string::NonEmptyString;
 use thiserror::Error;
 use url::Url;
 
+/// Maximum retained diagnostic bytes for upstream errors.
+const MAX_UPSTREAM_ERROR_MESSAGE_BYTES: usize = 4_096;
+
 /// Boxed future returned by runtime ports.
 pub(crate) type BoxFuture<'future, T> = Pin<Box<dyn Future<Output = T> + Send + 'future>>;
 
@@ -112,7 +115,7 @@ pub(crate) struct UpstreamError {
     /// Stable failure kind.
     kind: UpstreamErrorKind,
     /// Source error message.
-    message: NonEmptyString,
+    message: UpstreamErrorMessage,
 }
 
 /// Upstream response body streaming failure.
@@ -120,7 +123,14 @@ pub(crate) struct UpstreamError {
 #[error("{message}")]
 pub(crate) struct UpstreamBodyError {
     /// Source error message.
-    message: NonEmptyString,
+    message: UpstreamErrorMessage,
+}
+
+/// Bounded non-empty upstream diagnostic message.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpstreamErrorMessage {
+    /// Bounded non-empty text.
+    value: NonEmptyString,
 }
 
 impl UpstreamDeadline {
@@ -144,7 +154,7 @@ impl UpstreamBodyError {
     #[must_use]
     pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
-            message: non_empty_message(message.into(), "upstream response body failed"),
+            message: UpstreamErrorMessage::new(message, "upstream response body failed"),
         }
     }
 }
@@ -161,7 +171,18 @@ impl UpstreamError {
     pub(crate) fn new(kind: UpstreamErrorKind, message: impl Into<String>) -> Self {
         Self {
             kind,
-            message: non_empty_message(message.into(), default_upstream_error_message(kind)),
+            message: UpstreamErrorMessage::new(message, default_upstream_error_message(kind)),
+        }
+    }
+}
+
+impl UpstreamErrorMessage {
+    /// Creates a bounded non-empty diagnostic message.
+    fn new(raw_message: impl Into<String>, fallback: &'static str) -> Self {
+        let message = bounded_message(raw_message.into(), fallback);
+        Self {
+            value: NonEmptyString::new(message)
+                .expect("bounded upstream message should be non-empty"),
         }
     }
 }
@@ -275,6 +296,23 @@ impl fmt::Debug for UpstreamResponse {
     }
 }
 
+impl fmt::Display for UpstreamErrorMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.value.fmt(f)
+    }
+}
+
+/// Returns a bounded non-empty upstream error message.
+fn bounded_message(mut message: String, fallback: &'static str) -> String {
+    if message.is_empty() {
+        message.push_str(fallback);
+    }
+    if message.len() > MAX_UPSTREAM_ERROR_MESSAGE_BYTES {
+        truncate_utf8(&mut message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+    }
+    message
+}
+
 /// Returns the fallback message for an upstream request failure kind.
 const fn default_upstream_error_message(kind: UpstreamErrorKind) -> &'static str {
     match kind {
@@ -284,11 +322,15 @@ const fn default_upstream_error_message(kind: UpstreamErrorKind) -> &'static str
     }
 }
 
-/// Returns a non-empty upstream error message.
-fn non_empty_message(message: String, fallback: &'static str) -> NonEmptyString {
-    NonEmptyString::new(message)
-        .or_else(|_empty| NonEmptyString::try_from(fallback).map_err(str::to_owned))
-        .expect("fallback error message should be non-empty")
+/// Truncates a string to a byte limit without splitting a UTF-8 code point.
+fn truncate_utf8(message: &mut String, max_bytes: usize) {
+    let mut end = max_bytes.min(message.len());
+    while !message.is_char_boundary(end) {
+        end = end
+            .checked_sub(1)
+            .expect("string start should always be a char boundary");
+    }
+    message.truncate(end);
 }
 
 #[cfg(test)]
@@ -298,7 +340,10 @@ fn non_empty_message(message: String, fallback: &'static str) -> NonEmptyString 
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{UpstreamBodyError, UpstreamError, UpstreamErrorKind, UpstreamResponse};
+    use super::{
+        MAX_UPSTREAM_ERROR_MESSAGE_BYTES, UpstreamBodyError, UpstreamError, UpstreamErrorKind,
+        UpstreamResponse,
+    };
     use futures_util::{StreamExt as _, stream};
     use http::{HeaderMap, StatusCode};
     use pretty_assertions::assert_eq;
@@ -332,11 +377,41 @@ mod tests {
     }
 
     #[test]
+    fn upstream_body_error_truncates_long_unicode_messages() {
+        let error = UpstreamBodyError::new("\u{20ac}".repeat(2_000));
+
+        assert_eq!(
+            error.to_string().len(),
+            MAX_UPSTREAM_ERROR_MESSAGE_BYTES - 1
+        );
+        assert!(
+            error
+                .to_string()
+                .chars()
+                .all(|character| character == '\u{20ac}')
+        );
+    }
+
+    #[test]
     fn upstream_error_preserves_non_empty_messages() {
         let error = UpstreamError::new(UpstreamErrorKind::Request, "protocol failed");
 
         assert_eq!(error.kind(), UpstreamErrorKind::Request);
         assert_eq!(error.to_string(), "protocol failed");
+    }
+
+    #[test]
+    fn upstream_error_truncates_long_messages() {
+        let error = UpstreamError::new(
+            UpstreamErrorKind::Request,
+            "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES + 1),
+        );
+
+        assert_eq!(error.kind(), UpstreamErrorKind::Request);
+        assert_eq!(
+            error.to_string(),
+            "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
+        );
     }
 
     #[test]
