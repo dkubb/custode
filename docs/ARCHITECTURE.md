@@ -853,6 +853,10 @@ Mutation runs that gate a change are scoped to the touched files with unit
 tests only (`cargo mutants -f <file> -- --lib`); the `just mutants` recipe
 runs the full unscoped suite. Surviving mutants are either killed with new
 unit tests or documented as equivalent at the mutation site.
+Because `src/sim.rs` is compiled only for tests, cargo-mutants does not provide
+load-bearing evidence for the simulation adapters themselves. Simulation
+changes are gated by the deterministic scenario sweep, the randomized scenario
+property test, and the unit/proptest coverage ratchets.
 
 ## 17. Initial Build Plan
 
