@@ -363,6 +363,8 @@ pub mod testing {
 
     /// First long query length not covered by compact scenario generation.
     const LONG_QUERY_MIN_BYTES: usize = 65;
+    /// Byte width of one percent escape.
+    const PERCENT_ESCAPE_BYTES: usize = 3;
 
     /// Valid percent escapes spanning every byte and both hex cases.
     fn percent_escape_valid() -> impl Strategy<Value = String> {
@@ -512,11 +514,41 @@ pub mod testing {
             .prop_map(|escapes| escapes.concat())
     }
 
+    /// Long mixed raw and escaped query strings accepted by the parser.
+    fn query_raw_escape_long_valid() -> impl Strategy<Value = String> {
+        let min_raw_bytes = LONG_QUERY_MIN_BYTES
+            .checked_sub(PERCENT_ESCAPE_BYTES)
+            .expect("long query minimum should fit one percent escape");
+        let max_raw_bytes = MAX_ORIGIN_FORM_QUERY_BYTES
+            .checked_sub(PERCENT_ESCAPE_BYTES)
+            .expect("query maximum should fit one percent escape");
+
+        prop_oneof![
+            (
+                collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
+                percent_escape_valid(),
+            )
+                .prop_map(|(raw_chars, escape)| {
+                    let raw = raw_chars.into_iter().collect::<String>();
+                    format!("{escape}{raw}")
+                }),
+            (
+                collection::vec(query_raw_character_valid(), min_raw_bytes..=max_raw_bytes),
+                percent_escape_valid(),
+            )
+                .prop_map(|(raw_chars, escape)| {
+                    let raw = raw_chars.into_iter().collect::<String>();
+                    format!("{raw}{escape}")
+                }),
+        ]
+    }
+
     /// Long query strings accepted as origin-form query witnesses.
     fn query_long_valid() -> impl Strategy<Value = String> {
         prop_oneof![
             4 => query_raw_long_valid(),
             1 => query_percent_escape_long_valid(),
+            1 => query_raw_escape_long_valid(),
         ]
     }
 
@@ -527,6 +559,41 @@ pub mod testing {
             LONG_QUERY_MIN_BYTES..=MAX_ORIGIN_FORM_QUERY_BYTES,
         )
         .prop_map(|chars| chars.into_iter().collect())
+    }
+
+    /// Long mixed raw and escaped query strings preserved by `url::Url`.
+    fn url_preserved_query_raw_escape_long_valid() -> impl Strategy<Value = String> {
+        let min_raw_bytes = LONG_QUERY_MIN_BYTES
+            .checked_sub(PERCENT_ESCAPE_BYTES)
+            .expect("long query minimum should fit one percent escape");
+        let max_raw_bytes = MAX_ORIGIN_FORM_QUERY_BYTES
+            .checked_sub(PERCENT_ESCAPE_BYTES)
+            .expect("query maximum should fit one percent escape");
+
+        prop_oneof![
+            (
+                collection::vec(
+                    url_preserved_query_raw_character_valid(),
+                    min_raw_bytes..=max_raw_bytes,
+                ),
+                percent_escape_valid(),
+            )
+                .prop_map(|(raw_chars, escape)| {
+                    let raw = raw_chars.into_iter().collect::<String>();
+                    format!("{escape}{raw}")
+                }),
+            (
+                collection::vec(
+                    url_preserved_query_raw_character_valid(),
+                    min_raw_bytes..=max_raw_bytes,
+                ),
+                percent_escape_valid(),
+            )
+                .prop_map(|(raw_chars, escape)| {
+                    let raw = raw_chars.into_iter().collect::<String>();
+                    format!("{raw}{escape}")
+                }),
+        ]
     }
 
     /// Valid path strings accepted as origin-form path witnesses.
@@ -565,7 +632,8 @@ pub mod testing {
                 collection::vec(url_preserved_query_atom_valid(), 1..=8)
                     .prop_map(|atoms| atoms.concat()),
             ],
-            1 => url_preserved_query_raw_long_valid(),
+            4 => url_preserved_query_raw_long_valid(),
+            1 => url_preserved_query_raw_escape_long_valid(),
             1 => Just("a".repeat(LONG_QUERY_MIN_BYTES)),
             1 => Just("a".repeat(MAX_ORIGIN_FORM_QUERY_BYTES)),
         ]
