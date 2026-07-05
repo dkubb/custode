@@ -2256,8 +2256,8 @@ mod tests {
     use core::iter;
     use core::num::{NonZeroU64, NonZeroUsize};
     use core::time::Duration;
-    use futures_util::StreamExt as _;
     use futures_util::stream;
+    use futures_util::{Stream, StreamExt as _};
     use http_body_util::BodyExt as _;
     use pretty_assertions::assert_eq;
     use reqwest::{Client, Proxy};
@@ -2270,7 +2270,7 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
     use tokio::task::yield_now;
-    use tokio::time::{Instant, advance, sleep};
+    use tokio::time::{Instant, advance, sleep, timeout};
     use tower::ServiceExt as _;
     use tracing::{
         Level,
@@ -2280,6 +2280,8 @@ mod tests {
 
     /// Error string produced by the deterministic audit sink.
     const SCRIPTED_AUDIT_WRITE_ERROR: &str = "failed to write audit event: scripted audit failure";
+    /// Maximum time a unit test should wait for a locally-triggered async item.
+    const TEST_ASYNC_EVENT_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// Closed fatal error observation for deterministic scenarios.
     #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2525,7 +2527,7 @@ mod tests {
 
         /// Waits until the first upstream send starts.
         async fn wait_for_first_send(&self) {
-            self.first_send_started.notified().await;
+            notified_bounded(&self.first_send_started).await;
         }
     }
 
@@ -2599,6 +2601,66 @@ mod tests {
             matches!(fatal, GatewayError::Audit(AuditError::Write(_error))),
             "unexpected fatal error: {fatal:?}"
         );
+    }
+
+    /// Receives one bounded mpsc item or fails the test quickly.
+    async fn recv_bounded<T>(receiver: &mut mpsc::Receiver<T>) -> T {
+        timeout(TEST_ASYNC_EVENT_TIMEOUT, receiver.recv())
+            .await
+            .expect("bounded receive should complete before timeout")
+            .expect("bounded channel should produce an item")
+    }
+
+    /// Receives one bounded unbounded-channel item or fails the test quickly.
+    async fn recv_unbounded_bounded<T>(receiver: &mut mpsc::UnboundedReceiver<T>) -> T {
+        timeout(TEST_ASYNC_EVENT_TIMEOUT, receiver.recv())
+            .await
+            .expect("bounded receive should complete before timeout")
+            .expect("bounded channel should produce an item")
+    }
+
+    /// Receives one bounded stream item or fails the test quickly.
+    async fn next_bounded<S>(stream: &mut S) -> S::Item
+    where
+        S: Stream + Unpin,
+    {
+        timeout(TEST_ASYNC_EVENT_TIMEOUT, stream.next())
+            .await
+            .expect("bounded stream receive should complete before timeout")
+            .expect("bounded stream should produce an item")
+    }
+
+    /// Observes bounded stream completion or fails the test quickly.
+    async fn expect_stream_closed_bounded<S>(stream: &mut S)
+    where
+        S: Stream + Unpin,
+    {
+        let item = timeout(TEST_ASYNC_EVENT_TIMEOUT, stream.next())
+            .await
+            .expect("bounded stream close should complete before timeout");
+
+        assert!(
+            item.is_none(),
+            "bounded stream should close without an item"
+        );
+    }
+
+    /// Waits for one notify signal or fails the test quickly.
+    async fn notified_bounded(notify: &Notify) {
+        timeout(TEST_ASYNC_EVENT_TIMEOUT, notify.notified())
+            .await
+            .expect("bounded notification should arrive before timeout");
+    }
+
+    /// Waits for one memory-audit attempt or fails the test quickly.
+    async fn wait_for_memory_audit_attempt(audit: &MemoryAuditSink) {
+        timeout(TEST_ASYNC_EVENT_TIMEOUT, async {
+            while audit.event_count() == 0 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("memory audit attempt should happen before timeout");
     }
 
     /// Expected serialized empty body summary.
@@ -4071,10 +4133,7 @@ mod tests {
             .await
             .expect_err("completion audit failure should fail the response body");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("fatal error should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_fatal_event_too_large(&fatal, 481, 1);
     }
 
@@ -4093,10 +4152,7 @@ mod tests {
             .expect("proxy should respond");
         drop(response);
 
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("fatal error should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_fatal_event_too_large(&fatal, 503, 1);
     }
 
@@ -4364,9 +4420,7 @@ mod tests {
                     .await
             }
         });
-        while audit_observer.event_count() == 0 {
-            yield_now().await;
-        }
+        wait_for_memory_audit_attempt(&audit_observer).await;
         yield_now().await;
 
         let second_forward = {
@@ -4816,10 +4870,7 @@ mod tests {
 
         send_stream_error(&sender, Err(ResponseAuditFailure)).await;
 
-        let outcome = receiver
-            .recv()
-            .await
-            .expect("terminal error should be sent");
+        let outcome = recv_bounded(&mut receiver).await;
         let error = outcome.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
     }
@@ -4830,10 +4881,7 @@ mod tests {
 
         send_stream_error(&sender, Ok(())).await;
 
-        let outcome = receiver
-            .recv()
-            .await
-            .expect("terminal error should be sent");
+        let outcome = recv_bounded(&mut receiver).await;
         let error = outcome.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
     }
@@ -4861,16 +4909,11 @@ mod tests {
         });
 
         yield_now().await;
-        let queued = receiver
-            .recv()
+        let queued = recv_bounded(&mut receiver)
             .await
-            .expect("queued chunk should still be present")
             .expect("queued chunk should be ok");
         yield_now().await;
-        let terminal = receiver
-            .recv()
-            .await
-            .expect("terminal error should be sent after space opens");
+        let terminal = recv_bounded(&mut receiver).await;
 
         send_task
             .await
@@ -5040,10 +5083,8 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let first = response_body
-            .next()
+        let first = next_bounded(&mut response_body)
             .await
-            .expect("first response chunk should be sent")
             .expect("first response chunk should be ok");
         assert_eq!(first, Bytes::from_static(b"first"));
         drop(response_body);
@@ -5081,17 +5122,11 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let result = response_body
-            .next()
-            .await
-            .expect("terminal stream error should be sent");
+        let result = next_bounded(&mut response_body).await;
 
         let error = result.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        assert!(
-            response_body.next().await.is_none(),
-            "stream should close after terminal error"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
         let events = audit_events
             .lock()
             .expect("memory audit sink should not be poisoned")
@@ -5122,17 +5157,11 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let result = response_body
-            .next()
-            .await
-            .expect("terminal stream error should be sent");
+        let result = next_bounded(&mut response_body).await;
 
         let error = result.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        assert!(
-            response_body.next().await.is_none(),
-            "stream should close after terminal error"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
         let events = audit_events
             .lock()
             .expect("memory audit sink should not be poisoned")
@@ -5250,27 +5279,20 @@ mod tests {
             yield_now().await;
         }
         assert_eq!(audit_observer.event_count(), 1);
-        let first = response_body
-            .next()
+        let first = next_bounded(&mut response_body)
             .await
-            .expect("first buffered chunk should be sent")
             .expect("first buffered chunk should be ok");
         assert_eq!(first, Bytes::from(vec![0]));
         yield_now().await;
         for index in 1..chunk_count {
             let expected = u8::try_from(index).expect("test chunk index should fit in a byte");
             let expected_chunk = Bytes::from(vec![expected]);
-            let chunk = response_body
-                .next()
+            let chunk = next_bounded(&mut response_body)
                 .await
-                .expect("buffered chunk should be sent")
                 .expect("buffered chunk should be ok");
             assert_eq!(chunk, expected_chunk);
         }
-        let terminal = response_body
-            .next()
-            .await
-            .expect("terminal stream error should be sent after downstream resumes");
+        let terminal = next_bounded(&mut response_body).await;
         let error = terminal.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
         yield_now().await;
@@ -5318,7 +5340,7 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        observers.first_append_started.notified().await;
+        notified_bounded(&observers.first_append_started).await;
         assert_eq!(audit_observer.event_count(), 1);
         advance(Duration::from_secs(5)).await;
         yield_now().await;
@@ -5331,16 +5353,10 @@ mod tests {
             "audit event should still be in flight"
         );
         observers.release_first_append.notify_one();
-        let terminal = response_body
-            .next()
-            .await
-            .expect("terminal stream error should be sent after audit completes");
+        let terminal = next_bounded(&mut response_body).await;
         let error = terminal.expect_err("terminal item should be an error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        assert!(
-            response_body.next().await.is_none(),
-            "stream should close after terminal error"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
         advance(Duration::from_secs(5)).await;
         yield_now().await;
 
@@ -5376,10 +5392,7 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        assert!(
-            response_body.next().await.is_none(),
-            "empty stream should complete without chunks"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
 
         let events = audit_events
             .lock()
@@ -5411,17 +5424,11 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let outcome = response_body
-            .next()
-            .await
-            .expect("terminal error should be sent");
+        let outcome = next_bounded(&mut response_body).await;
         let error = outcome.expect_err("empty completion should report audit failure");
 
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        assert!(
-            response_body.next().await.is_none(),
-            "stream should close after terminal error"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
         assert_eq!(audit_observer.event_count(), 1);
         assert!(
             audit_events
@@ -5429,10 +5436,7 @@ mod tests {
                 .expect("memory audit sink should not be poisoned")
                 .is_empty()
         );
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("audit failure should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
     }
 
@@ -5449,26 +5453,17 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let mut response_body = response_stream(context, upstream_response, test_permit());
 
-        let terminal = response_body
-            .next()
-            .await
-            .expect("audit failure should be sent instead of final chunk");
+        let terminal = next_bounded(&mut response_body).await;
         let error = terminal.expect_err("terminal item should be an audit error");
         assert_eq!(error.to_string(), TERMINAL_STREAM_ABORT_ERROR);
-        assert!(
-            response_body.next().await.is_none(),
-            "stream should close after terminal error"
-        );
+        expect_stream_closed_bounded(&mut response_body).await;
         assert_eq!(audit_observer.event_count(), 1);
         let events = audit_events
             .lock()
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert!(events.is_empty());
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("audit failure should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
     }
 
@@ -5484,7 +5479,7 @@ mod tests {
             UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
         let response_body = response_stream(context, upstream_response, test_permit());
 
-        observers.first_append_started.notified().await;
+        notified_bounded(&observers.first_append_started).await;
         drop(response_body);
         observers.release_first_append.notify_one();
         let mut events = Vec::new();
@@ -5554,10 +5549,7 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert!(events.is_empty());
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("audit failure should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
     }
 
@@ -5602,10 +5594,7 @@ mod tests {
                 .expect("memory audit sink should not be poisoned")
                 .is_empty()
         );
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("audit failure should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
     }
 
@@ -5692,10 +5681,7 @@ mod tests {
             .expect("memory audit sink should not be poisoned")
             .clone();
         assert!(events.is_empty());
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("audit failure should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
     }
 
@@ -5803,10 +5789,7 @@ mod tests {
         let result = context
             .audit_after_response_started(ResponseStreamOutcome::Allowed)
             .await;
-        let fatal = fatal_receiver
-            .recv()
-            .await
-            .expect("fatal error should be reported");
+        let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
 
         assert!(result.is_err());
         assert_fatal_event_too_large(&fatal, 481, 1);
