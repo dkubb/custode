@@ -282,12 +282,6 @@ impl Gateway {
         }
     }
 
-    /// Returns true when required audit writes are still available.
-    #[must_use]
-    pub(crate) fn audit_available(&self) -> bool {
-        !self.audit_failed.load(Ordering::SeqCst)
-    }
-
     /// Writes an audit event for a denied request.
     ///
     /// # Errors
@@ -376,11 +370,8 @@ impl Gateway {
     /// Starts upstream forwarding unless audit has already failed.
     pub(crate) async fn begin_forwarding(&self) -> Result<ForwardingPermit, GatewayError> {
         let guard = Arc::clone(&self.forwarding_gate).read_owned().await;
-        if self.audit_available() {
-            Ok(ForwardingPermit { _guard: guard })
-        } else {
-            Err(GatewayError::AuditUnavailable)
-        }
+        self.require_audit_available()?;
+        Ok(ForwardingPermit { _guard: guard })
     }
 
     /// Closes future upstream forwarding after a required audit failure.
@@ -422,12 +413,11 @@ impl Gateway {
     }
 
     /// Returns an error when a previous required audit event failed.
-    #[cfg(test)]
     pub(crate) fn require_audit_available(&self) -> Result<(), GatewayError> {
-        if self.audit_available() {
-            Ok(())
-        } else {
+        if self.audit_failed.load(Ordering::SeqCst) {
             Err(GatewayError::AuditUnavailable)
+        } else {
+            Ok(())
         }
     }
 }
@@ -563,7 +553,6 @@ mod tests {
             result,
             Err(GatewayError::Audit(AuditError::Write(_)))
         ));
-        assert!(!gateway.audit_available());
         assert!(matches!(
             gateway.require_audit_available(),
             Err(GatewayError::AuditUnavailable)

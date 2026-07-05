@@ -407,8 +407,8 @@ async fn proxy(
     State(state): State<AppState>,
     request: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    if !state.gateway.audit_available() {
-        report_fatal_error(&state.fatal_errors, GatewayError::AuditUnavailable);
+    if let Err(error) = state.gateway.require_audit_available() {
+        report_fatal_error(&state.fatal_errors, error);
         return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
 
