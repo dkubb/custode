@@ -67,6 +67,4 @@ config = ".cargo/deny.toml"
 
 [env]
 CLIPPY_CONF_DIR = { value = ".cargo", relative = true }
-LLVM_COV = "/opt/homebrew/opt/llvm/bin/llvm-cov"
-LLVM_PROFDATA = "/opt/homebrew/opt/llvm/bin/llvm-profdata"
 MACOSX_DEPLOYMENT_TARGET = "26.0"

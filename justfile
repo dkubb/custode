@@ -29,6 +29,9 @@ shell-check:
     shfmt -d -i 2 -ci scripts/*.sh
     shellcheck -S style -x scripts/*.sh
 
+toolchain-check:
+    scripts/check-portable-tooling.sh
+
 dockerfile-check:
     docker buildx build --check .
 
@@ -60,7 +63,7 @@ coverage-proptests:
 mutants:
     {{cargo}} mutants-all
 
-check: fmt-check lint shell-check test dockerfile-check
+check: fmt-check lint shell-check toolchain-check test dockerfile-check
 
 ci: check deny
 

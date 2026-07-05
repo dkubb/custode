@@ -146,6 +146,8 @@ The local gate vocabulary is:
   tests.
 - `just docs` runs Markdown linting with `mado`.
 - `just deny` runs `cargo deny check`.
+- `just toolchain-check` rejects repository-pinned coverage tool paths so
+  `cargo llvm-cov` uses the platform's Rust toolchain LLVM tools.
 - `just dockerfile-check` runs the BuildKit Dockerfile check.
 - `just docker-build` builds both images; `just docker-test` runs the
   container tests in `scripts/container-test.sh`.
