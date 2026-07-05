@@ -323,9 +323,7 @@ fn segment_is_dot_segment(segment: &str) -> bool {
 fn decode_hex_pair(first: u8, second: u8) -> Option<u8> {
     let high = hex_value(first)?;
     let low = hex_value(second)?;
-    // The nibbles occupy disjoint bit ranges, so `|` is exact here and a
-    // `^` mutation is equivalent.
-    Some((high << 4) | low)
+    Some(high.wrapping_shl(4).wrapping_add(low))
 }
 
 /// Decodes one ASCII hex digit.
