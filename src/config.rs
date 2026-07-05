@@ -1110,12 +1110,6 @@ fn usize_to_u128(value: usize) -> u128 {
 
 /// Parses an allowed path string.
 fn parse_allowed_path(path: &str) -> Result<OriginFormPath, ConfigError> {
-    if has_forbidden_allowed_path_character(path) {
-        return Err(ConfigError::InvalidAllowedPath {
-            path: path.to_owned(),
-        });
-    }
-
     OriginFormPath::parse(path).map_err(|_error| ConfigError::InvalidAllowedPath {
         path: path.to_owned(),
     })
@@ -1130,14 +1124,6 @@ fn parse_allowed_prefix(prefix: &str) -> Result<OriginFormPath, ConfigError> {
         });
     }
     Ok(path)
-}
-
-/// Returns true when configured path text includes non-path syntax.
-fn has_forbidden_allowed_path_character(path: &str) -> bool {
-    path.as_bytes()
-        .iter()
-        .copied()
-        .any(|byte| matches!(byte, b'#' | b'?' | b'\\'))
 }
 
 #[cfg(test)]
