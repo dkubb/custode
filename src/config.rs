@@ -1142,9 +1142,9 @@ fn has_forbidden_allowed_path_character(path: &str) -> bool {
 )]
 mod tests {
     use super::{
-        AllowedOperation, AllowedOperations, AllowedPath, ConfigError, GatewayConfig,
-        MAX_ALLOWED_METHOD_BYTES, MAX_ALLOWED_OPERATION_BYTES, MAX_ALLOWED_OPERATIONS,
-        MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
+        AllowedMethod, AllowedOperation, AllowedOperations, AllowedPath, ConfigError,
+        GatewayConfig, MAX_ALLOWED_METHOD_BYTES, MAX_ALLOWED_OPERATION_BYTES,
+        MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
         MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
         UpstreamOrigin, non_zero_usize, usize_to_u128,
@@ -1318,6 +1318,28 @@ mod tests {
 
         assert_eq!(raw.len(), MAX_ALLOWED_OPERATION_BYTES);
         assert!(operation.matches(&parsed_method, &parsed_path));
+    }
+
+    #[test]
+    fn method_enforces_the_supported_length_boundary() {
+        for len in [MAX_ALLOWED_METHOD_BYTES - 1, MAX_ALLOWED_METHOD_BYTES] {
+            let method = "A".repeat(len);
+
+            let parsed = AllowedMethod::parse(&method).expect("boundary method should parse");
+            let expected =
+                http::Method::from_bytes(method.as_bytes()).expect("test method should parse");
+
+            assert_eq!(parsed.as_method(), &expected);
+        }
+
+        let method = "A".repeat(MAX_ALLOWED_METHOD_BYTES + 1);
+
+        assert!(matches!(
+            AllowedMethod::parse(&method),
+            Err(ConfigError::MethodTooLong { max, value })
+                if max == expected_usize_u128(MAX_ALLOWED_METHOD_BYTES)
+                    && value == expected_usize_u128(method.len()),
+        ));
     }
 
     #[test]
