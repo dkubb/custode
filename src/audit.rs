@@ -1232,8 +1232,8 @@ impl ExistingAuditEventFields {
 }
 
 impl ExistingAuditEvent {
-    /// Consumes all validated event fields.
-    fn consume(self) {
+    /// Consumes all validated event fields and returns the request identity.
+    fn into_request_id(self) -> String {
         let Self { fields } = self;
         let ExistingAuditEventFields {
             decision,
@@ -1265,7 +1265,6 @@ impl ExistingAuditEvent {
             method,
             path,
             query,
-            request_id,
             status,
             timestamp,
             upstream_origin,
@@ -1273,11 +1272,7 @@ impl ExistingAuditEvent {
             upstream_query,
             version,
         ));
-    }
-
-    /// Returns the existing request identity.
-    fn request_id(&self) -> &str {
-        &self.fields.request_id
+        request_id
     }
 }
 
@@ -3194,14 +3189,13 @@ async fn validate_existing_audit_events(
                 source,
             }
         })?;
-        if !request_ids.insert(event.request_id().to_owned()) {
+        if !request_ids.insert(event.into_request_id()) {
             return Err(AuditError::CorruptLog {
                 path: path.to_owned(),
                 line: numbered_line,
                 source: <serde_json::Error as SerdeError>::custom("duplicate audit request id"),
             });
         }
-        event.consume();
         line_number = line_number
             .checked_add(1)
             .expect("audit log line count should not overflow");
