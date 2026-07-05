@@ -4928,6 +4928,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn response_stream_abort_reports_terminal_error_only_when_requested() {
+        let audit_only = super::ResponseStreamAbort::audit_only(
+            ResponseStreamOutcome::UpstreamResponseStreamFailed,
+        );
+        let with_terminal_error = super::ResponseStreamAbort::with_terminal_error(
+            ResponseStreamOutcome::UpstreamResponseStreamFailed,
+        );
+
+        assert!(!audit_only.sends_terminal_error());
+        assert!(with_terminal_error.sends_terminal_error());
+    }
+
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn response_stream_audits_final_chunk_disconnects_before_allowed_completion() {
         let (audit, audit_events) = MemoryAuditSink::new();
