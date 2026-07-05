@@ -131,6 +131,8 @@ struct ResponseAuditContext {
     status: StatusCode,
     /// Allowlist witness for the accepted method and target.
     target: AllowedTarget,
+    /// Whether the terminal response audit attempt has already started.
+    terminal_audit_started: bool,
 }
 
 /// Accepted request state ready for upstream forwarding.
@@ -217,9 +219,18 @@ impl ResponseAuditContext {
 
     /// Writes the terminal response audit event or reports a fatal error.
     async fn audit_after_response_started(
-        &self,
+        &mut self,
         outcome: ResponseStreamOutcome,
     ) -> Result<(), ResponseAuditFailure> {
+        if self.terminal_audit_started {
+            tracing::debug!(
+                ?outcome,
+                request_id = %self.request_id,
+                "terminal response audit already started"
+            );
+            return Ok(());
+        }
+        self.terminal_audit_started = true;
         let fatal_errors = self.fatal_errors.clone();
         match self.audit(outcome).await {
             Ok(()) => Ok(()),
@@ -501,6 +512,7 @@ async fn forward_request(
         response_account,
         status,
         target,
+        terminal_audit_started: false,
     };
     let response_header_map = response_headers.into_header_map();
 
@@ -582,8 +594,7 @@ async fn stream_upstream_response(
                         .inspect_err(log_upstream_body_audit_error);
                     return;
                 }
-                send_stream_error(sender, context.audit_after_response_started(outcome).await)
-                    .await;
+                send_stream_error(sender, context.audit_after_response_started(outcome).await);
                 return;
             }
         };
@@ -606,8 +617,7 @@ async fn stream_upstream_response(
                         response_body,
                     })
                     .await,
-            )
-            .await;
+            );
             return;
         }
 
@@ -664,12 +674,12 @@ fn log_upstream_body_audit_error(audit_error: &ResponseAuditFailure) {
     tracing::error!(%audit_error, "failed to audit upstream body error");
 }
 
-/// Sends a stream error after the terminal audit attempt completes.
-async fn send_stream_error(
+/// Best-effort sends a stream error after the terminal audit attempt completes.
+fn send_stream_error(
     sender: &mpsc::Sender<Result<Bytes, io::Error>>,
     _audit_result: Result<(), ResponseAuditFailure>,
 ) {
-    send_terminal_stream_error(sender).await;
+    try_send_terminal_stream_error(sender);
 }
 
 /// Sends one generic terminal stream error to the harness.
@@ -2586,6 +2596,7 @@ mod tests {
             response_account,
             status: StatusCode::OK,
             target,
+            terminal_audit_started: false,
         };
         (context, fatal_receiver)
     }
@@ -4648,7 +4659,7 @@ mod tests {
     async fn send_stream_error_masks_audit_failures() {
         let (sender, mut receiver) = mpsc::channel(1);
 
-        send_stream_error(&sender, Err(ResponseAuditFailure)).await;
+        send_stream_error(&sender, Err(ResponseAuditFailure));
 
         let outcome = receiver
             .recv()
@@ -4662,7 +4673,7 @@ mod tests {
     async fn send_stream_error_masks_stream_failures() {
         let (sender, mut receiver) = mpsc::channel(1);
 
-        send_stream_error(&sender, Ok(())).await;
+        send_stream_error(&sender, Ok(()));
 
         let outcome = receiver
             .recv()
@@ -4677,7 +4688,7 @@ mod tests {
         let (sender, receiver) = mpsc::channel(1);
         drop(receiver);
 
-        send_stream_error(&sender, Ok(())).await;
+        send_stream_error(&sender, Ok(()));
 
         assert!(sender.is_closed(), "receiver should be gone");
     }
@@ -4730,6 +4741,7 @@ mod tests {
             response_account,
             status: StatusCode::OK,
             target,
+            terminal_audit_started: false,
         };
         let upstream_body = stream::unfold(TwoChunkStep::First, |step| async move {
             match step {
@@ -4909,6 +4921,73 @@ mod tests {
             .expect("stalled stream timeout should be audited");
         assert_eq!(event["decision"], "response_error");
         assert_eq!(event["error_class"], "response_stream_timeout");
+        assert_eq!(event["response_body"], non_empty_body_value(&observed_body));
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn response_stream_does_not_reclassify_after_terminal_audit() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let audit_observer = audit.clone();
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, mut fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let chunk_count = RESPONSE_STREAM_CHANNEL_CAPACITY.get();
+        let upstream_body = stream::iter(
+            (0..chunk_count)
+                .map(|index| {
+                    let byte = u8::try_from(index).expect("test chunk index should fit in a byte");
+                    Ok::<Bytes, UpstreamBodyError>(Bytes::from(vec![byte]))
+                })
+                .chain(iter::once(Err(UpstreamBodyError::stream(
+                    "scripted upstream stream failed",
+                )))),
+        );
+        let upstream_response =
+            UpstreamResponse::new(StatusCode::OK, HeaderMap::new(), upstream_body.boxed());
+        let semaphore = Arc::new(Semaphore::new(1));
+        let response_body = response_stream(
+            context,
+            upstream_response,
+            Arc::clone(&semaphore)
+                .try_acquire_owned()
+                .expect("test permit should be available"),
+        );
+
+        for _attempt in 0_u8..10 {
+            if audit_observer.event_count() == 1 {
+                break;
+            }
+            yield_now().await;
+        }
+        assert_eq!(audit_observer.event_count(), 1);
+        let released_permit = Arc::clone(&semaphore)
+            .try_acquire_owned()
+            .expect("post-audit terminal send should not wait for stream timeout");
+        drop(released_permit);
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+        drop(response_body);
+
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        let observed_body: Vec<u8> = (0..RESPONSE_STREAM_CHANNEL_CAPACITY.get())
+            .map(|index| u8::try_from(index).expect("test chunk index should fit in a byte"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let event = events
+            .first()
+            .expect("terminal upstream stream error should be audited once");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_stream_failed");
         assert_eq!(event["response_body"], non_empty_body_value(&observed_body));
         let fatal_result = fatal_receiver.try_recv();
         assert!(
@@ -5340,7 +5419,7 @@ mod tests {
             .add_chunk(b"hello")
             .expect("response chunk should be accounted");
         let (fatal_errors, mut fatal_receiver) = mpsc::unbounded_channel();
-        let context = ResponseAuditContext {
+        let mut context = ResponseAuditContext {
             fatal_errors,
             gateway,
             request_body,
@@ -5351,6 +5430,7 @@ mod tests {
             response_account,
             status: StatusCode::OK,
             target,
+            terminal_audit_started: false,
         };
 
         let result = context
@@ -5363,6 +5443,42 @@ mod tests {
 
         assert!(result.is_err());
         assert_fatal_event_too_large(&fatal, 481, 1);
+    }
+
+    #[tokio::test]
+    async fn audit_after_response_started_writes_only_the_first_terminal_event() {
+        let (audit, audit_events) = MemoryAuditSink::new();
+        let max_response_bytes = response_body_limit(1_024);
+        let (mut context, mut fatal_receiver) =
+            response_audit_context(audit, max_response_bytes).await;
+
+        let first_result = context
+            .audit_after_response_started(ResponseStreamOutcome::UpstreamResponseStreamFailed)
+            .await;
+        let second_result = context
+            .audit_after_response_started(ResponseStreamOutcome::ResponseStreamTimeout)
+            .await;
+
+        first_result.expect("first terminal audit should succeed");
+        second_result.expect("second terminal audit should be ignored");
+        let events = audit_events
+            .lock()
+            .expect("memory audit sink should not be poisoned")
+            .clone();
+        assert_eq!(events.len(), 1);
+        let event = events
+            .first()
+            .expect("first terminal event should be audited");
+        assert_eq!(event["decision"], "response_error");
+        assert_eq!(event["error_class"], "upstream_response_stream_failed");
+        let fatal_result = fatal_receiver.try_recv();
+        assert!(
+            matches!(
+                fatal_result,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected)
+            ),
+            "unexpected fatal error: {fatal_result:?}"
+        );
     }
 
     #[tokio::test]
