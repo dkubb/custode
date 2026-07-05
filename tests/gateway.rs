@@ -57,6 +57,12 @@ const MAX_ORIGIN_FORM_PATH_BYTES: usize = 4_096;
 /// Maximum accepted origin-form query bytes.
 const MAX_ORIGIN_FORM_QUERY_BYTES: usize = 8_192;
 
+/// Number of times to poll the audit log for expected events.
+const AUDIT_EVENT_POLL_ATTEMPTS: u32 = 10;
+
+/// Delay between audit-log event polls.
+const AUDIT_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
 /// One request observed by the recording upstream.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct RecordedRequest {
@@ -115,7 +121,7 @@ impl GatewayProcess {
 
     /// Polls the audit log until it holds `expected` events.
     async fn read_audit_events(&self, expected: usize) -> Vec<Value> {
-        for _attempt in 0_u32..100 {
+        for _attempt in 0_u32..AUDIT_EVENT_POLL_ATTEMPTS {
             let text = read_to_string(&self.audit_log).await.unwrap_or_default();
             let events: Vec<Value> = text
                 .lines()
@@ -124,7 +130,7 @@ impl GatewayProcess {
             if events.len() >= expected {
                 return events;
             }
-            sleep(Duration::from_millis(50)).await;
+            sleep(AUDIT_EVENT_POLL_INTERVAL).await;
         }
         Vec::new()
     }
