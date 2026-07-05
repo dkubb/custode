@@ -6122,6 +6122,19 @@ mod tests {
         assert!(matches!(result, Err(AuditError::Open { path, .. }) if path == blocking_file));
     }
 
+    #[tokio::test]
+    async fn create_dir_all_durable_preserves_not_a_directory_metadata_errors() {
+        let directory = tempdir().expect("temporary directory should be created");
+        let blocking_file = directory.path().join("occupied");
+        fs::write(&blocking_file, b"not a directory").expect("blocking file should be written");
+
+        let error = create_dir_all_durable(&blocking_file.join("child"))
+            .await
+            .expect_err("file-as-parent metadata should fail before directory creation");
+
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+    }
+
     pub(super) async fn durable_directory_helpers_cover_reachable_paths() {
         let directory = tempdir().expect("temporary directory should be created");
         let nested = directory.path().join("nested/logs");
