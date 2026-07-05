@@ -6869,6 +6869,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_existing_audit_events_preserves_distinct_request_ids() {
+        let path = Path::new("audit.ndjson");
+        let first = serialized_event_line_with_field(
+            "request_id",
+            Value::String("req-000000000000000a-000000000000000b-0000000000000001".to_owned()),
+        );
+        let second = serialized_event_line_with_field(
+            "request_id",
+            Value::String("req-000000000000000a-000000000000000b-0000000000000002".to_owned()),
+        );
+        let mut reader = TailReader::new([first.as_slice(), second.as_slice()].concat());
+
+        let result = validate_existing_audit_events(path, &mut reader).await;
+
+        result.expect("distinct request ids should validate");
+    }
+
+    #[tokio::test]
     async fn write_event_appends_one_ndjson_line() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
