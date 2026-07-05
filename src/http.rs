@@ -2059,7 +2059,8 @@ mod tests {
         audit_denial_from_target_rejection, audit_response_header_error, audit_upstream_error,
         forward_request, is_fatal_request_failure, log_response_stream_timeout_audit_error,
         production_gateway, proxy, report_fatal_error, response_stream, run_until_server_stops,
-        send_stream_error, serve, serve_with_adapter_result, try_send_terminal_stream_error,
+        send_stream_error, send_terminal_stream_error, serve, serve_with_adapter_result,
+        try_send_terminal_stream_error,
     };
     use crate::adapters::{
         RequestIdSourceBuildError, ReqwestUpstreamClient, SequentialRequestIds,
@@ -4699,6 +4700,16 @@ mod tests {
         drop(receiver);
 
         try_send_terminal_stream_error(&sender);
+
+        assert!(sender.is_closed(), "receiver should be gone");
+    }
+
+    #[tokio::test]
+    async fn send_terminal_stream_error_tolerates_a_closed_receiver() {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+
+        send_terminal_stream_error(&sender).await;
 
         assert!(sender.is_closed(), "receiver should be gone");
     }
