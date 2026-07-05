@@ -3475,6 +3475,9 @@ mod tests {
         /// Fail flushes.
         Flush,
 
+        /// Fail shutdowns.
+        Shutdown,
+
         /// Fail writes.
         Write,
     }
@@ -3635,13 +3638,20 @@ mod tests {
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             match self.failure {
-                WriterFailure::Commit | WriterFailure::Write => Poll::Ready(Ok(())),
+                WriterFailure::Commit | WriterFailure::Shutdown | WriterFailure::Write => {
+                    Poll::Ready(Ok(()))
+                }
                 WriterFailure::Flush => Poll::Ready(Err(io::Error::other("flush failed"))),
             }
         }
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
+            match self.failure {
+                WriterFailure::Commit | WriterFailure::Flush | WriterFailure::Write => {
+                    Poll::Ready(Ok(()))
+                }
+                WriterFailure::Shutdown => Poll::Ready(Err(io::Error::other("shutdown failed"))),
+            }
         }
 
         fn poll_write(
@@ -3650,7 +3660,9 @@ mod tests {
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
             match self.failure {
-                WriterFailure::Commit | WriterFailure::Flush => Poll::Ready(Ok(buf.len())),
+                WriterFailure::Commit | WriterFailure::Flush | WriterFailure::Shutdown => {
+                    Poll::Ready(Ok(buf.len()))
+                }
                 WriterFailure::Write => Poll::Ready(Err(io::Error::other("write failed"))),
             }
         }
@@ -3661,7 +3673,7 @@ mod tests {
             bufs: &[io::IoSlice<'_>],
         ) -> Poll<io::Result<usize>> {
             match self.failure {
-                WriterFailure::Commit | WriterFailure::Flush => {
+                WriterFailure::Commit | WriterFailure::Flush | WriterFailure::Shutdown => {
                     let bytes = bufs.iter().map(|buf| buf.len()).sum();
                     Poll::Ready(Ok(bytes))
                 }
@@ -3675,7 +3687,7 @@ mod tests {
             Box::pin(async move {
                 match self.failure {
                     WriterFailure::Commit => Err(io::Error::other("commit failed")),
-                    WriterFailure::Flush | WriterFailure::Write => Ok(()),
+                    WriterFailure::Flush | WriterFailure::Shutdown | WriterFailure::Write => Ok(()),
                 }
             })
         }
@@ -7003,6 +7015,18 @@ mod tests {
             .expect_err("durable audit file flush should return inner writer errors");
 
         assert_eq!(error.to_string(), "flush failed");
+    }
+
+    #[tokio::test]
+    async fn durable_audit_file_delegates_shutdown_failures_to_inner_writer() {
+        let mut writer = DurableAuditFile::new(FailingWriter::failing(WriterFailure::Shutdown));
+
+        let error = writer
+            .shutdown()
+            .await
+            .expect_err("durable audit file shutdown should return inner writer errors");
+
+        assert_eq!(error.to_string(), "shutdown failed");
     }
 
     #[tokio::test]
