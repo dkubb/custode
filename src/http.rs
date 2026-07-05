@@ -814,11 +814,6 @@ async fn send_stream_error(
     sender: &mpsc::Sender<Result<Bytes, io::Error>>,
     _audit_result: Result<(), ResponseAuditFailure>,
 ) {
-    send_terminal_stream_error_with_grace(sender).await;
-}
-
-/// Sends one generic terminal stream error without unbounded downstream waiting.
-async fn send_terminal_stream_error_with_grace(sender: &mpsc::Sender<Result<Bytes, io::Error>>) {
     let send_result = timeout(
         TERMINAL_STREAM_ERROR_GRACE,
         sender.send(Err(io::Error::other(TERMINAL_STREAM_ABORT_ERROR))),
