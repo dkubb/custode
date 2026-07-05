@@ -1,5 +1,31 @@
 //! Gateway configuration parsing.
 
+#[cfg(any(test, fuzzing))]
+#[expect(
+    clippy::inline_modules,
+    reason = "fuzz oracles stay beside the private parsers they exercise"
+)]
+/// Fuzz-only configuration parser oracles.
+pub mod fuzzing {
+    /// Reports whether arbitrary bytes parse as a lossy allowed-operation string.
+    #[must_use]
+    #[inline]
+    pub fn allowed_operation_parse(input: &[u8]) -> bool {
+        let raw = String::from_utf8_lossy(input);
+
+        super::AllowedOperation::parse(raw.as_ref()).is_ok()
+    }
+
+    /// Parses arbitrary bytes as a lossy upstream-origin string.
+    #[cfg(fuzzing)]
+    #[inline]
+    pub fn upstream_origin_parse(input: &[u8]) {
+        let raw = String::from_utf8_lossy(input);
+
+        let _result = super::UpstreamOrigin::parse(raw.as_ref());
+    }
+}
+
 use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
 use ::http::Method;
 use clap::Args;
@@ -1033,26 +1059,6 @@ impl UpstreamOrigin {
     }
 }
 
-#[cfg(fuzzing)]
-/// Fuzz-only configuration parser oracles.
-pub mod fuzzing {
-    use super::{AllowedOperation, UpstreamOrigin};
-
-    /// Parses arbitrary bytes as a lossy allowed-operation string.
-    pub fn allowed_operation_parse(input: &[u8]) {
-        let raw = String::from_utf8_lossy(input);
-
-        let _result = AllowedOperation::parse(raw.as_ref());
-    }
-
-    /// Parses arbitrary bytes as a lossy upstream-origin string.
-    pub fn upstream_origin_parse(input: &[u8]) {
-        let raw = String::from_utf8_lossy(input);
-
-        let _result = UpstreamOrigin::parse(raw.as_ref());
-    }
-}
-
 /// Returns a non-zero `u64` or the matching configuration error.
 fn non_zero_u64(name: &'static str, value: u64) -> Result<NonZeroU64, ConfigError> {
     NonZeroU64::new(value).ok_or(ConfigError::ZeroBound { name })
@@ -1147,7 +1153,7 @@ mod tests {
         MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
         MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
-        UpstreamOrigin, non_zero_usize, usize_to_u128,
+        UpstreamOrigin, fuzzing, non_zero_usize, usize_to_u128,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -1630,6 +1636,20 @@ mod tests {
             AllowedOperation::parse("CONNECT:exact:/v1/models"),
             Err(ConfigError::UnsupportedMethod { method }) if method == "CONNECT",
         ));
+    }
+
+    #[test]
+    fn allowed_operation_fuzz_oracle_accepts_valid_bytes() {
+        let accepted = fuzzing::allowed_operation_parse(b"GET:exact:/v1/models");
+
+        assert!(accepted);
+    }
+
+    #[test]
+    fn allowed_operation_fuzz_oracle_rejects_invalid_bytes() {
+        let accepted = fuzzing::allowed_operation_parse(b"B@D:exact:/v1/models");
+
+        assert!(!accepted);
     }
 
     #[test]
