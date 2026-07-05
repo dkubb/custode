@@ -6994,6 +6994,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_audit_file_delegates_flush_failures_to_inner_writer() {
+        let mut writer = DurableAuditFile::new(FailingWriter::failing(WriterFailure::Flush));
+
+        let error = writer
+            .flush()
+            .await
+            .expect_err("durable audit file flush should return inner writer errors");
+
+        assert_eq!(error.to_string(), "flush failed");
+    }
+
+    #[tokio::test]
     async fn durable_audit_file_delegates_write_methods_to_inner_file() {
         let directory = tempdir().expect("temporary directory should be created");
         let audit_log = directory.path().join("audit.ndjson");
