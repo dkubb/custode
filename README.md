@@ -69,8 +69,11 @@ export CUSTODE_HARNESS_NPM_PACKAGES='@anthropic-ai/claude-code'
 docker compose build harness
 
 export CUSTODE_HARNESS_COMMAND='claude --version'
-docker compose run --rm harness
+docker compose run --rm --no-deps harness
 ```
+
+Use `--no-deps` for version smoke tests because they do not need the proxy.
+The model-call examples below omit it so Compose starts the proxy.
 
 Then run Claude through the proxy:
 
@@ -114,7 +117,7 @@ export CUSTODE_HARNESS_NPM_PACKAGES='@openai/codex'
 docker compose build harness
 
 export CUSTODE_HARNESS_COMMAND='codex --version'
-docker compose run --rm harness
+docker compose run --rm --no-deps harness
 ```
 
 For model calls, route Codex to the proxy. The compose file exports
