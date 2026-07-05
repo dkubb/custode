@@ -201,6 +201,21 @@ struct ResponseStreamAbort {
     terminal_error: TerminalStreamError,
 }
 
+/// Response-stream audit failure log branch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseStreamAuditLog {
+    /// Failed to audit an allowed response completion.
+    AllowedCompletion,
+    /// Failed to audit a downstream close.
+    DownstreamClose,
+    /// Failed to audit an oversized response body.
+    ResponseBodyLimit,
+    /// Failed to audit a response stream timeout.
+    ResponseStreamTimeout,
+    /// Failed to audit an upstream body error.
+    UpstreamBodyError,
+}
+
 /// Completion state returned from the timed upstream response body streamer.
 #[derive(Debug)]
 enum ResponseStreamCompletion {
@@ -753,38 +768,45 @@ async fn handle_response_stream_abort(
 fn log_response_stream_abort_audit_error(
     outcome: ResponseStreamOutcome,
     audit_error: &ResponseAuditFailure,
-) {
+) -> ResponseStreamAuditLog {
     match outcome {
         ResponseStreamOutcome::Allowed => {
             tracing::error!(%audit_error, "failed to audit response completion");
+            ResponseStreamAuditLog::AllowedCompletion
         }
         ResponseStreamOutcome::DownstreamClosed => log_downstream_close_audit_error(audit_error),
         ResponseStreamOutcome::ResponseBodyTooLarge { .. } => {
             tracing::error!(%audit_error, "failed to audit response body limit");
+            ResponseStreamAuditLog::ResponseBodyLimit
         }
         ResponseStreamOutcome::ResponseStreamTimeout => {
-            log_response_stream_timeout_audit_error(audit_error);
+            log_response_stream_timeout_audit_error(audit_error)
         }
         ResponseStreamOutcome::UpstreamResponseStreamFailed
         | ResponseStreamOutcome::UpstreamResponseTimeout => {
-            log_upstream_body_audit_error(audit_error);
+            log_upstream_body_audit_error(audit_error)
         }
     }
 }
 
 /// Logs a downstream-close audit failure.
-fn log_downstream_close_audit_error(audit_error: &ResponseAuditFailure) {
+fn log_downstream_close_audit_error(audit_error: &ResponseAuditFailure) -> ResponseStreamAuditLog {
     tracing::error!(%audit_error, "failed to audit downstream close");
+    ResponseStreamAuditLog::DownstreamClose
 }
 
 /// Logs a response-stream-timeout audit failure.
-fn log_response_stream_timeout_audit_error(audit_error: &ResponseAuditFailure) {
+fn log_response_stream_timeout_audit_error(
+    audit_error: &ResponseAuditFailure,
+) -> ResponseStreamAuditLog {
     tracing::error!(%audit_error, "failed to audit response stream timeout");
+    ResponseStreamAuditLog::ResponseStreamTimeout
 }
 
 /// Logs an upstream-body audit failure.
-fn log_upstream_body_audit_error(audit_error: &ResponseAuditFailure) {
+fn log_upstream_body_audit_error(audit_error: &ResponseAuditFailure) -> ResponseStreamAuditLog {
     tracing::error!(%audit_error, "failed to audit upstream body error");
+    ResponseStreamAuditLog::UpstreamBodyError
 }
 
 /// Sends a stream error after the terminal audit attempt completes.
@@ -2184,8 +2206,8 @@ mod tests {
 
     use super::{
         AppState, ForwardRequestInput, ProductionAdapters, RESPONSE_STREAM_CHANNEL_CAPACITY,
-        ResponseAuditContext, ResponseAuditFailure, ResponseStreamOutcome, ServeError,
-        TERMINAL_STREAM_ABORT_ERROR, TERMINAL_STREAM_ERROR_GRACE,
+        ResponseAuditContext, ResponseAuditFailure, ResponseStreamAuditLog, ResponseStreamOutcome,
+        ServeError, TERMINAL_STREAM_ABORT_ERROR, TERMINAL_STREAM_ERROR_GRACE,
         audit_denial_from_allowlist_rejection, audit_denial_from_request_body,
         audit_denial_from_request_header, audit_denial_from_target_rejection,
         audit_response_header_error, audit_upstream_error, forward_request,
@@ -4903,7 +4925,10 @@ mod tests {
         let _subscriber_guard: DefaultGuard =
             set_default(fmt().with_max_level(Level::ERROR).finish());
 
-        log_response_stream_timeout_audit_error(&ResponseAuditFailure);
+        assert_eq!(
+            log_response_stream_timeout_audit_error(&ResponseAuditFailure),
+            ResponseStreamAuditLog::ResponseStreamTimeout,
+        );
     }
 
     #[test]
@@ -4915,16 +4940,38 @@ mod tests {
             .add_chunk(b"overflow")
             .expect_err("chunk should exceed the response limit");
         let outcomes = [
-            ResponseStreamOutcome::Allowed,
-            ResponseStreamOutcome::DownstreamClosed,
-            ResponseStreamOutcome::ResponseBodyTooLarge { response_body },
-            ResponseStreamOutcome::ResponseStreamTimeout,
-            ResponseStreamOutcome::UpstreamResponseStreamFailed,
-            ResponseStreamOutcome::UpstreamResponseTimeout,
+            (
+                ResponseStreamOutcome::Allowed,
+                ResponseStreamAuditLog::AllowedCompletion,
+            ),
+            (
+                ResponseStreamOutcome::DownstreamClosed,
+                ResponseStreamAuditLog::DownstreamClose,
+            ),
+            (
+                ResponseStreamOutcome::ResponseBodyTooLarge { response_body },
+                ResponseStreamAuditLog::ResponseBodyLimit,
+            ),
+            (
+                ResponseStreamOutcome::ResponseStreamTimeout,
+                ResponseStreamAuditLog::ResponseStreamTimeout,
+            ),
+            (
+                ResponseStreamOutcome::UpstreamResponseStreamFailed,
+                ResponseStreamAuditLog::UpstreamBodyError,
+            ),
+            (
+                ResponseStreamOutcome::UpstreamResponseTimeout,
+                ResponseStreamAuditLog::UpstreamBodyError,
+            ),
         ];
 
-        for outcome in outcomes {
-            log_response_stream_abort_audit_error(outcome, &ResponseAuditFailure);
+        for (outcome, expected_log) in outcomes {
+            assert_eq!(
+                log_response_stream_abort_audit_error(outcome, &ResponseAuditFailure),
+                expected_log,
+                "outcome {outcome:?}",
+            );
         }
     }
 
