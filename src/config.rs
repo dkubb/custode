@@ -38,6 +38,16 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use url::Url;
 
+/// Converts `usize` to `u128` without exposing a function mutation target.
+macro_rules! usize_to_u128 {
+    ($value:expr) => {{
+        match u128::try_from($value) {
+            Ok(value) => value,
+            Err(_error) => unreachable!("usize should fit into u128"),
+        }
+    }};
+}
+
 /// Maximum serialized audit event bytes, including the NDJSON newline.
 const MAX_AUDIT_EVENT_BYTES: usize = 0x0010_0000;
 /// Minimum serialized audit event bytes required for every admitted target.
@@ -435,8 +445,8 @@ impl AllowedOperation {
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
         if raw.len() > MAX_ALLOWED_OPERATION_BYTES {
             return Err(ConfigError::AllowedOperationTooLong {
-                max: usize_to_u128(MAX_ALLOWED_OPERATION_BYTES),
-                value: usize_to_u128(raw.len()),
+                max: usize_to_u128!(MAX_ALLOWED_OPERATION_BYTES),
+                value: usize_to_u128!(raw.len()),
             });
         }
 
@@ -494,8 +504,8 @@ impl AllowedOperations {
         }
         if operations.len() > MAX_ALLOWED_OPERATIONS {
             return Err(ConfigError::TooManyAllowedOperations {
-                max: usize_to_u128(MAX_ALLOWED_OPERATIONS),
-                value: usize_to_u128(operations.len()),
+                max: usize_to_u128!(MAX_ALLOWED_OPERATIONS),
+                value: usize_to_u128!(operations.len()),
             });
         }
 
@@ -554,8 +564,8 @@ impl AllowedMethod {
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
         if raw.len() > MAX_ALLOWED_METHOD_BYTES {
             return Err(ConfigError::MethodTooLong {
-                max: usize_to_u128(MAX_ALLOWED_METHOD_BYTES),
-                value: usize_to_u128(raw.len()),
+                max: usize_to_u128!(MAX_ALLOWED_METHOD_BYTES),
+                value: usize_to_u128!(raw.len()),
             });
         }
 
@@ -651,8 +661,8 @@ impl AuditEventBytes {
         if value.get() < MIN_AUDIT_EVENT_BYTES {
             return Err(ConfigError::BoundTooSmall {
                 name,
-                min: usize_to_u128(MIN_AUDIT_EVENT_BYTES),
-                value: usize_to_u128(raw_value),
+                min: usize_to_u128!(MIN_AUDIT_EVENT_BYTES),
+                value: usize_to_u128!(raw_value),
             });
         }
         Ok(Self(value))
@@ -1027,8 +1037,8 @@ impl UpstreamOrigin {
     pub(crate) fn parse(raw: &str) -> Result<Self, ConfigError> {
         if raw.len() > MAX_UPSTREAM_ORIGIN_BYTES {
             return Err(ConfigError::UpstreamOriginTooLong {
-                max: usize_to_u128(MAX_UPSTREAM_ORIGIN_BYTES),
-                value: usize_to_u128(raw.len()),
+                max: usize_to_u128!(MAX_UPSTREAM_ORIGIN_BYTES),
+                value: usize_to_u128!(raw.len()),
             });
         }
 
@@ -1096,16 +1106,11 @@ fn bounded_non_zero_usize(
     if raw_value > max {
         return Err(ConfigError::BoundTooLarge {
             name,
-            max: usize_to_u128(max),
-            value: usize_to_u128(raw_value),
+            max: usize_to_u128!(max),
+            value: usize_to_u128!(raw_value),
         });
     }
     Ok(value)
-}
-
-/// Converts `usize` to `u128` without loss.
-fn usize_to_u128(value: usize) -> u128 {
-    u128::try_from(value).expect("usize should fit into u128")
 }
 
 /// Parses an allowed path string.
@@ -1139,7 +1144,7 @@ mod tests {
         MAX_ALLOWED_OPERATIONS, MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
         MAX_RESPONSE_HEADER_BYTES, MAX_UPSTREAM_ORIGIN_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs,
-        UpstreamOrigin, fuzzing, non_zero_usize, usize_to_u128,
+        UpstreamOrigin, fuzzing, non_zero_usize,
     };
     use crate::target::{MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery};
     use core::net::SocketAddr;
@@ -1179,7 +1184,7 @@ mod tests {
     }
 
     /// Converts a test `usize` into the expected `u128` value.
-    fn expected_usize_u128(value: usize) -> u128 {
+    pub(super) fn expected_usize_u128(value: usize) -> u128 {
         u128::try_from(value).expect("usize should fit into u128")
     }
 
@@ -1676,13 +1681,6 @@ mod tests {
     }
 
     #[test]
-    fn usize_to_u128_preserves_representative_values() {
-        assert_eq!(usize_to_u128(0), 0);
-        assert_eq!(usize_to_u128(1), 1);
-        assert_eq!(usize_to_u128(usize::MAX), expected_usize_u128(usize::MAX));
-    }
-
-    #[test]
     fn too_large_serve_args_fail_closed_with_the_env_name() {
         let cases: [(&str, u128, u128, MutateBound); 7] = [
             (
@@ -1989,7 +1987,7 @@ mod proptests {
         MAX_AUDIT_EVENT_BYTES, MAX_CONCURRENT_REQUESTS, MAX_REQUEST_BYTES,
         MAX_REQUEST_HEADER_BYTES, MAX_REQUEST_TIMEOUT_SECS, MAX_RESPONSE_BYTES,
         MAX_RESPONSE_HEADER_BYTES, MIN_AUDIT_EVENT_BYTES, ServeArgs, UpstreamOrigin,
-        tests::serve_args, usize_to_u128,
+        tests::{expected_usize_u128, serve_args},
     };
     use crate::target::{
         MAX_ORIGIN_FORM_PATH_BYTES, OriginFormPath, OriginFormQuery,
@@ -2562,8 +2560,8 @@ mod proptests {
                 error,
                 ConfigError::BoundTooSmall { name, min, value }
                     if name == "CUSTODE_MAX_AUDIT_EVENT_BYTES"
-                        && min == usize_to_u128(MIN_AUDIT_EVENT_BYTES)
-                        && value == usize_to_u128(max_audit_event_bytes)
+                        && min == expected_usize_u128(MIN_AUDIT_EVENT_BYTES)
+                        && value == expected_usize_u128(max_audit_event_bytes)
             );
             prop_assert!(is_too_small);
         }
