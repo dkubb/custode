@@ -265,6 +265,12 @@ The audit log MUST NOT include provider credential header values. If request
 header logging is added later, authorization and cookie-like headers MUST be
 redacted by default.
 
+Audit events do include request paths and queries, and denied authority-bearing
+targets preserve the requested authority for forensics. Provider credentials,
+API keys, bearer tokens, and other secrets MUST NOT be placed in query strings
+or request-target userinfo because header redaction does not protect those
+channels.
+
 ### 5.5. Audit Logging
 
 The gateway MUST write one structured audit event for every runtime request
@@ -300,7 +306,7 @@ Each audit event MUST include:
 - upstream path and query when an upstream request is attempted, where the
   upstream query records the query from the joined upstream URL and MAY differ
   from the accepted incoming query only by URL serialization;
-- response status when one exists;
+- non-null response status returned to the harness;
 - request body summary with one of three states: not observed, observed empty,
   or observed non-empty with byte count and body digest;
 - response body summary with one of three states: not observed, observed empty,
@@ -388,7 +394,9 @@ The gateway MUST bound:
 - request body bytes;
 - response header bytes;
 - response body bytes read before aborting;
-- request duration;
+- per-phase request duration: request body reading, upstream
+  request/response-header I/O, and response body streaming each get the
+  configured timeout budget;
 - concurrent requests;
 - audit event size.
 

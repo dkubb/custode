@@ -102,6 +102,8 @@ The implementation uses these concrete foundations:
 - HTTP client: Reqwest with Rustls TLS and no native TLS dependency.
 - URL representation: `url::Url`.
 - Serialization: Serde and `serde_json`.
+- Randomness: `getrandom` for production request-id run tokens.
+- Non-empty string invariants: `non-empty-string`.
 - Request digest: BLAKE3.
 - CLI parsing: Clap, with environment variable bindings declared on the
   argument types.
@@ -146,6 +148,7 @@ The local gate vocabulary is:
   tests.
 - `just docs` runs Markdown linting with `mado`.
 - `just deny` runs `cargo deny check`.
+- `just shell-check` runs `shfmt` and `shellcheck` for `scripts/*.sh`.
 - `just toolchain-check` rejects repository-pinned coverage tool paths so
   `cargo llvm-cov` uses the platform's Rust toolchain LLVM tools.
 - `just dockerfile-check` runs the BuildKit Dockerfile check.
@@ -157,9 +160,13 @@ The local gate vocabulary is:
   and fails when missed regions, functions, lines, or branches exceed the
   documented aggregate or per-source-file ratchet outside inline test modules.
 - `just mutants` runs `cargo-mutants` mutation testing.
-- `just check` runs Rust formatting, Rust linting, shell checks, tests, and
-  the Dockerfile check.
+- `just check` runs Rust formatting, Rust linting, shell checks, portable
+  toolchain checks, tests, and the Dockerfile check.
 - `just ci` runs `check` plus `deny`.
+- `just stress-check` runs repo-local hardening checks: `ci`, audit-verifier
+  fixture tests, container topology tests, proxy audit-log verification, and
+  bounded parser fuzz smoke tests. It intentionally excludes privileged,
+  host-specific, or slow manual tools; see [STRESS.md](STRESS.md).
 
 Gates never skip silently: a recipe fails when its tool is missing rather
 than reporting success without running.
@@ -194,13 +201,29 @@ custode/
 ├── compose.yaml
 ├── docs/
 │   ├── ARCHITECTURE.md
-│   └── IDEA.md
+│   ├── IDEA.md
+│   └── STRESS.md
+├── fuzz/
+│   ├── Cargo.lock
+│   ├── Cargo.toml
+│   └── fuzz_targets/
+│       ├── accepted_path_set_path.rs
+│       ├── allowed_operation_parse.rs
+│       └── upstream_origin_parse.rs
 ├── justfile
+├── proptest-regressions/
+│   ├── audit.txt
+│   ├── config.txt
+│   ├── http.txt
+│   └── ports.txt
 ├── rust-toolchain.toml
 ├── scripts/
 │   ├── check-coverage-summary.sh
+│   ├── check-portable-tooling.sh
 │   ├── container-test.sh
-│   └── pinned-cargo.sh
+│   ├── pinned-cargo.sh
+│   ├── test-verify-audit-log.sh
+│   └── verify-audit-log.sh
 ├── secrets/
 │   └── env.example
 ├── src/
@@ -221,6 +244,7 @@ custode/
 │   └── target.rs
 ├── tests/
 │   ├── coverage_summary/
+│   │   ├── proptests-ratchet.tsv
 │   │   └── tests.rs
 │   ├── coverage_summary.rs
 │   └── gateway.rs
@@ -331,9 +355,11 @@ The gateway MUST reject:
   `https://api.openai.com/v1/responses` and authority-form request lines
   like `evil.example:443`;
 - paths that do not start with `/`;
+- authority-looking origin-form paths that start with `//`;
 - paths longer than 4,096 bytes;
 - queries longer than 8,192 bytes;
-- paths containing invalid percent-encoding;
+- paths containing invalid percent-encoding or bytes outside HTTP
+  request-target syntax;
 - paths containing literal query delimiters, fragment delimiters, or
   backslashes;
 - paths containing percent-encoded path separators;
@@ -345,6 +371,9 @@ The gateway MUST reject:
 - method-path pairs absent from the configured operation allowlist, where each
   allowed operation binds exactly one method to exactly one exact path or
   segment-bounded path prefix.
+
+Allowlist matching is byte-exact on the accepted path spelling. The gateway
+does not apply percent-encoding equivalence when matching configured paths.
 
 The gateway constructs the upstream URL by joining the configured provider
 origin with the accepted path and query. The incoming `Host` header does not
@@ -388,11 +417,16 @@ Configuration parsing is fail-closed:
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at least one operation.
 - `CUSTODE_ALLOWED_OPERATIONS` MUST contain at most 256 operations, and each
   operation string MUST be at most 4,160 bytes.
+- `CUSTODE_ALLOWED_OPERATIONS` MUST NOT contain duplicate operations after
+  canonical parsing.
 - Each operation MUST have the form `METHOD:exact:/path` or
   `METHOD:prefix:/path`, where `METHOD` is a valid HTTP token and MUST NOT be
   `CONNECT`.
 - Every configured path or prefix MUST begin with `/` and MUST NOT contain a
-  query delimiter, fragment delimiter, or literal backslash.
+  query delimiter, fragment delimiter, literal backslash, invalid
+  percent-encoding, percent-encoded path separator, literal or
+  percent-encoded dot segment, authority-looking `//` prefix, or bytes outside
+  HTTP request-target syntax.
 - Every configured prefix MUST be non-root and MUST NOT end with `/`; use an
   exact path for `/` or a trailing-slash resource.
 - Prefix matching MUST be segment-bounded: `/v1/responses` matches
@@ -410,6 +444,9 @@ Configuration parsing is fail-closed:
   `exact` or `prefix` kind. The separate method and path maxima bound parsed
   components, but one configured operation cannot contain both a maximum-length
   method and a maximum-length path.
+- Because comma is the configured environment delimiter, configured paths that
+  contain a literal comma are not expressible in
+  `CUSTODE_ALLOWED_OPERATIONS`.
 - `CUSTODE_MAX_AUDIT_EVENT_BYTES` MUST also be at least 65,536 bytes, so every
   admitted target under the current audit schema remains serializable. Rejected
   raw target fields are bounded before serialization; overlong path or query
@@ -432,7 +469,8 @@ For each request, the gateway performs these steps in order:
    literal or percent-encoded dot segments.
 1. Check the method-path operation allowlist.
 1. Copy end-to-end headers, excluding hop-by-hop headers, the `Host` header,
-   and HTTP proxy credential headers such as `Proxy-Authorization`.
+   `Content-Length` because request and response bodies are re-framed, and
+   HTTP proxy credential headers such as `Proxy-Authorization`.
 1. Read the request body up to the configured maximum.
 1. Compute the request body byte count and digest.
 1. Build the upstream URL from the configured origin plus accepted path and
@@ -443,6 +481,12 @@ For each request, the gateway performs these steps in order:
    updating the response digest.
 1. Write a required audit event before the request task is considered
    complete.
+
+`CUSTODE_REQUEST_TIMEOUT_SECS` is a per-phase timeout, not a single
+end-to-end request lifetime. The gateway applies that duration independently
+to request body reading, upstream request/response-header I/O, and response
+body streaming. A request that consumes the full budget in more than one phase
+can therefore run longer than the configured value.
 
 If a request is denied before upstream I/O, the gateway writes a denied audit
 event and returns an HTTP error without contacting the provider.
@@ -482,6 +526,11 @@ terminal allowed audit event has started for the final response state, that
 allowed decision is committed; a later close while sending the already-audited
 final chunk is not reclassified.
 
+To preserve that audit-before-final-byte ordering, the gateway withholds one
+response chunk until the next chunk arrives. Server-sent-event and chunked
+clients can therefore observe one-chunk delivery lag when the upstream sends a
+chunk and then pauses for a long time.
+
 ## 11. Audit Log
 
 The audit log is newline-delimited JSON.
@@ -490,6 +539,13 @@ At startup, a non-empty existing audit log MUST end with a newline. If the
 final byte is not a newline, the gateway MUST reject the log before appending
 so a partial final event cannot be joined with a later event.
 If the gateway cannot inspect the existing log tail, it MUST fail startup.
+After the newline-tail check, the gateway parses every existing event in the
+log and validates the current schema, fixed field set, closed decision and
+error-class sets, cross-field constraints, request-id shape, and duplicate
+request IDs. Any invalid line, stale schema version, or duplicate request ID
+fails startup until the operator rotates or repairs the log. This is
+intentional fail-closed behavior, but it means startup work and memory are
+linear in the current log size.
 The audit log path and its containing directory MUST be writable by the
 gateway UID. The containing directory and any created ancestors MUST also be
 openable for metadata sync by that UID. If Docker volume permissions prevent
@@ -553,10 +609,14 @@ audited string.
 attempted. When an upstream request is attempted, they record the path and query
 from the joined upstream URL. The `query` field preserves the accepted harness
 request spelling; `upstream_query` may differ when URL serialization
-percent-encodes a valid accepted query. `status` is the response status returned
-to the harness. Every decision records one: each closed audit outcome variant
-carries a mandatory status. The serialized `status` field is structurally
-nullable but always populated.
+percent-encodes a valid accepted query. Query strings are logged verbatim.
+Denied absolute-form or authority-form request targets also preserve the
+requested authority for forensics, so userinfo credentials in those rejected
+targets are logged when present. Operators MUST NOT place provider credentials,
+API keys, bearer tokens, or other secrets in query strings or request-target
+userinfo. Header redaction does not protect those channels.
+`status` is the response status returned to the harness. Every decision records
+one: each closed audit outcome variant carries a mandatory non-null status.
 `request_body` and `response_body` are closed body-summary objects. Their
 `state` is one of `not_observed`, `empty`, or `non_empty`. `not_observed`
 means the gateway could not summarize body bytes on that path. `empty` means
@@ -856,16 +916,23 @@ binary against a local recording upstream and cover:
   incoming `Host` header unable to redirect it;
 - denied method does not reach a local test upstream;
 - denied path does not reach a local test upstream;
+- denied requests carrying authorization headers do not reach a local test
+  upstream;
 - raw absolute-form, authority-form, and `CONNECT` request lines are denied
   without reaching a local test upstream and audited with the bounded
   authority-bearing target;
+- authority-looking origin paths, mixed-case encoded dot segments, mixed-case
+  encoded separators, maximum path/query boundaries, and max-plus-one
+  path/query overflows have explicit binary-level coverage;
 - harness-supplied authorization reaches the local test upstream for allowed
   requests;
 - every allowed and denied request produces an audit event with a request
   identity distinct within the gateway run;
 - an unopenable audit log fails closed at startup;
 - a missing allowlist fails closed at startup;
-- a wildcard upstream origin fails closed at startup.
+- a wildcard upstream origin fails closed at startup;
+- `serve` command-line flags override conflicting `CUSTODE_*` environment
+  variables through the clap configuration boundary.
 
 Container tests are implemented by `scripts/container-test.sh`, run with
 `just docker-test`, and cover:
@@ -879,12 +946,23 @@ Container tests are implemented by `scripts/container-test.sh`, run with
   that network as internal;
 - harness cannot reach an external URL directly from inside the harness
   container;
+- harness cannot reach a raw public IP over HTTP directly from inside the
+  harness container;
+- harness cannot open TCP to public DNS directly from inside the harness
+  container;
 - harness reaches the gateway service on the internal network.
+- the proxy audit log emitted during the test is valid under
+  `scripts/verify-audit-log.sh`.
 
 The direct-egress denial test MUST run from inside the harness container. A
 passing proxy request is not proof that direct egress is denied. The topology
 check is the primary containment proof; the external request is a live
 end-to-end regression check.
+
+`scripts/verify-audit-log.sh` is the maintained offline verifier for emitted
+logs in repo-local gates. It is deliberately a separate black-box check, not
+the authoritative production validator. The gateway startup validator remains
+the enforcement point for whether an existing log can be appended.
 
 Mutation runs that gate a change are scoped to the touched files with unit
 tests only (`cargo mutants -f <file> -- --lib`); the `just mutants` recipe

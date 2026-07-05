@@ -180,12 +180,13 @@ docker compose down --volumes
 The main development gates are:
 
 ```sh
-just check        # fmt-check, lint, test, Dockerfile check
+just check        # fmt-check, lint, shell, toolchain, test, Dockerfile check
 just ci           # check plus cargo-deny
 just docs         # Markdown lint
 just docker-build # image build
-just docker-test  # container tests: static linkage, health, egress denial
+just docker-test  # container tests: static linkage, health, egress, audit log
 just coverage     # cargo llvm-cov summary
+just stress-check # ci, verifier fixtures, docker-test, fuzz smoke tests
 just mutants      # cargo-mutants mutation testing
 ```
 
