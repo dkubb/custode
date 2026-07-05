@@ -5996,6 +5996,30 @@ mod tests {
     }
 
     #[test]
+    fn existing_timestamps_require_canonical_nanosecond_fraction() {
+        let before = serialized_event_line_with_field(
+            "timestamp",
+            Value::String("1970-01-01T00:00:00.00000000Z".to_owned()),
+        );
+        let at = serialized_event_line_with_field(
+            "timestamp",
+            Value::String("1970-01-01T00:00:00.000000000Z".to_owned()),
+        );
+        let after = serialized_event_line_with_field(
+            "timestamp",
+            Value::String("1970-01-01T00:00:00.0000000000Z".to_owned()),
+        );
+
+        serde_json::from_slice::<ExistingAuditEventFields>(&at)
+            .expect("nine fractional digits should be accepted");
+
+        for rejected in [before, after] {
+            serde_json::from_slice::<ExistingAuditEventFields>(&rejected)
+                .expect_err("non-canonical fractional width should be rejected");
+        }
+    }
+
+    #[test]
     fn rfc3339_timestamp_produces_a_parsable_instant() {
         let timestamp = AuditTimestamp::now();
 
