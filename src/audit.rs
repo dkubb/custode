@@ -6015,6 +6015,27 @@ mod tests {
     }
 
     #[test]
+    fn from_uri_parts_preserves_path_length_boundary() {
+        let before = format!("/{}", "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES - 2));
+        let at = format!("/{}", "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES - 1));
+        let after = format!("/{}", "a".repeat(MAX_AUDIT_TARGET_PATH_BYTES));
+        let truncated_suffix = format!(
+            "...[truncated original_bytes={}]",
+            MAX_AUDIT_TARGET_PATH_BYTES + 1
+        );
+
+        let before_target = AuditTarget::from_uri_parts(&before, None);
+        let at_target = AuditTarget::from_uri_parts(&at, None);
+        let after_target = AuditTarget::from_uri_parts(&after, None);
+
+        assert_eq!(before_target.path(), before);
+        assert_eq!(at_target.path(), at);
+        assert_eq!(after_target.path().len(), MAX_AUDIT_TARGET_PATH_BYTES);
+        assert!(after_target.path().starts_with('/'));
+        assert!(after_target.path().ends_with(&truncated_suffix));
+    }
+
+    #[test]
     fn from_uri_parts_truncates_overlong_paths_with_original_length() {
         let path = format!("/{}", "a".repeat(MAX_ORIGIN_FORM_PATH_BYTES));
         let target = AuditTarget::from_uri_parts(&path, None);
