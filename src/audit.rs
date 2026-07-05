@@ -457,19 +457,22 @@ trait AuditLogWriter: AsyncWrite + Send + Unpin {
 }
 
 /// Audit file adapter that commits event bytes to stable storage.
-struct DurableAuditFile {
+struct DurableAuditFile<Writer = File> {
     /// Open audit file.
-    file: File,
+    file: Writer,
 }
 
-impl DurableAuditFile {
+impl<Writer> DurableAuditFile<Writer> {
     /// Creates a durable audit file adapter.
-    const fn new(file: File) -> Self {
+    const fn new(file: Writer) -> Self {
         Self { file }
     }
 }
 
-impl AsyncWrite for DurableAuditFile {
+impl<Writer> AsyncWrite for DurableAuditFile<Writer>
+where
+    Writer: AsyncWrite + Unpin,
+{
     fn is_write_vectored(&self) -> bool {
         self.file.is_write_vectored()
     }
@@ -3442,6 +3445,13 @@ mod tests {
         failure: WriterFailure,
     }
 
+    /// Test writer with configurable vectored-write capability.
+    #[derive(Debug)]
+    pub(super) struct VectoredWriter {
+        /// Capability reported by `AsyncWrite::is_write_vectored`.
+        is_write_vectored: bool,
+    }
+
     /// Test writer that writes a prefix, then fails the next write.
     #[derive(Debug)]
     pub(super) struct PartialWriteThenFailWriter {
@@ -3473,6 +3483,13 @@ mod tests {
         /// Creates a writer that fails one operation class.
         pub(super) const fn failing(failure: WriterFailure) -> Self {
             Self { failure }
+        }
+    }
+
+    impl VectoredWriter {
+        /// Creates a writer with the supplied vectored-write capability.
+        pub(super) const fn new(is_write_vectored: bool) -> Self {
+            Self { is_write_vectored }
         }
     }
 
@@ -3661,6 +3678,37 @@ mod tests {
                     WriterFailure::Flush | WriterFailure::Write => Ok(()),
                 }
             })
+        }
+    }
+
+    impl AsyncWrite for VectoredWriter {
+        fn is_write_vectored(&self) -> bool {
+            self.is_write_vectored
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            let bytes = bufs.iter().map(|buf| buf.len()).sum();
+            Poll::Ready(Ok(bytes))
         }
     }
 
@@ -6930,6 +6978,18 @@ mod tests {
                 .expect("written bytes should lock")
                 .as_slice(),
             after_first.as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_audit_file_reports_inner_vectored_write_capability() {
+        let writer = DurableAuditFile::new(VectoredWriter::new(false));
+
+        let is_write_vectored = writer.is_write_vectored();
+
+        assert!(
+            !is_write_vectored,
+            "durable audit file should delegate false vectored-write capability"
         );
     }
 
