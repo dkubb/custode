@@ -1,5 +1,37 @@
 //! Request target parsing.
 
+#[cfg(any(test, fuzzing))]
+#[expect(
+    clippy::inline_modules,
+    reason = "fuzz oracles stay beside the private parsers they exercise"
+)]
+/// Fuzz-only target parser oracles.
+pub mod fuzzing {
+    use core::str;
+    use url::Url;
+
+    /// Reports whether accepted origin-form paths survive `Url::set_path`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the hard-coded upstream origin is no longer a valid URL.
+    #[must_use]
+    #[inline]
+    pub fn accepted_path_set_path(input: &[u8]) -> bool {
+        let Ok(path) = str::from_utf8(input) else {
+            return false;
+        };
+        let Ok(parsed) = super::OriginFormPath::parse(path) else {
+            return false;
+        };
+        let mut url = Url::parse("https://api.openai.com").expect("static origin URL should parse");
+
+        url.set_path(parsed.as_str());
+
+        url.path() == parsed.as_str()
+    }
+}
+
 /// Maximum accepted origin-form request path bytes.
 pub(crate) const MAX_ORIGIN_FORM_PATH_BYTES: usize = 4_096;
 /// Maximum accepted origin-form request query bytes.
@@ -748,28 +780,6 @@ pub mod testing {
     }
 }
 
-#[cfg(fuzzing)]
-/// Fuzz-only parser oracles.
-pub mod fuzzing {
-    use super::OriginFormPath;
-    use url::Url;
-
-    /// Checks that accepted origin-form paths are preserved by `Url::set_path`.
-    pub fn accepted_path_set_path(input: &[u8]) {
-        let Ok(path) = core::str::from_utf8(input) else {
-            return;
-        };
-        let Ok(parsed) = OriginFormPath::parse(path) else {
-            return;
-        };
-        let mut url = Url::parse("https://api.openai.com").expect("origin should parse");
-
-        url.set_path(parsed.as_str());
-
-        assert_eq!(url.path(), parsed.as_str());
-    }
-}
-
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[expect(
@@ -779,7 +789,7 @@ pub mod fuzzing {
 mod tests {
     use super::{
         DotSegmentState, MAX_ORIGIN_FORM_PATH_BYTES, MAX_ORIGIN_FORM_QUERY_BYTES, OriginFormPath,
-        OriginFormPathError, OriginFormQuery, OriginFormQueryError,
+        OriginFormPathError, OriginFormQuery, OriginFormQueryError, fuzzing,
     };
     use pretty_assertions::assert_eq;
 
@@ -803,6 +813,14 @@ mod tests {
         assert_eq!(super::decode_hex_pair(b'3', b'0'), Some(0x30));
         assert_eq!(super::decode_hex_pair(b'z', b'0'), None);
         assert_eq!(super::decode_hex_pair(b'0', b'z'), None);
+    }
+
+    #[test]
+    fn accepted_path_set_path_fuzz_oracle_reports_parse_outcome() {
+        assert!(fuzzing::accepted_path_set_path(b"/v1/models"));
+        assert!(!fuzzing::accepted_path_set_path(b"v1/models"));
+        assert!(!fuzzing::accepted_path_set_path(b"/v1/.."));
+        assert!(!fuzzing::accepted_path_set_path(b"/bad/\xff"));
     }
 
     #[test]
