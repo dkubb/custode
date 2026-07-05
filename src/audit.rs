@@ -753,14 +753,6 @@ enum ExistingAuditErrorClass {
 }
 
 impl ExistingAuditBodySummary {
-    /// Consumes all validated body-summary fields.
-    fn consume(self) {
-        match self {
-            Self::Empty | Self::NotObserved => {}
-            Self::NonEmpty { blake3, bytes } => drop((blake3, bytes)),
-        }
-    }
-
     /// Returns true when the body bytes were not observed.
     const fn is_not_observed(&self) -> bool {
         matches!(self, Self::NotObserved)
@@ -1259,8 +1251,14 @@ impl ExistingAuditEvent {
             upstream_query,
             version,
         } = fields;
-        request_body.consume();
-        response_body.consume();
+        match request_body {
+            ExistingAuditBodySummary::Empty | ExistingAuditBodySummary::NotObserved => {}
+            ExistingAuditBodySummary::NonEmpty { blake3, bytes } => drop((blake3, bytes)),
+        }
+        match response_body {
+            ExistingAuditBodySummary::Empty | ExistingAuditBodySummary::NotObserved => {}
+            ExistingAuditBodySummary::NonEmpty { blake3, bytes } => drop((blake3, bytes)),
+        }
         drop((
             decision,
             error_class,
