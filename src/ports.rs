@@ -340,9 +340,7 @@ fn bounded_message(mut message: String, fallback: &'static str) -> String {
     if message.is_empty() {
         message.push_str(fallback);
     }
-    if message.len() > MAX_UPSTREAM_ERROR_MESSAGE_BYTES {
-        truncate_utf8(&mut message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
-    }
+    truncate_utf8(&mut message, MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
     message
 }
 
