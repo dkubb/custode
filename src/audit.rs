@@ -2750,10 +2750,7 @@ async fn create_dir_all_durable(path: &Path) -> io::Result<()> {
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 missing.push(current.to_owned());
-                let Some(parent) = current
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                else {
+                let Some(parent) = non_empty_parent(current) else {
                     break;
                 };
                 current = parent;
@@ -2770,6 +2767,15 @@ async fn create_dir_all_durable(path: &Path) -> io::Result<()> {
         sync_containing_directory(directory).await?;
     }
     Ok(())
+}
+
+/// Returns the parent path unless it is the empty relative path sentinel.
+fn non_empty_parent(path: &Path) -> Option<&Path> {
+    match path.parent() {
+        Some(parent) if parent.as_os_str().is_empty() => None,
+        Some(parent) => Some(parent),
+        None => None,
+    }
 }
 
 /// Durably commits an audit log path's containing directory.
@@ -3396,8 +3402,8 @@ mod tests {
         PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId, RequiredOption,
         RunToken, RunTokenError, classify_audit_log_tail, create_dir_all_durable,
         inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
-        sync_audit_log_directory, sync_containing_directory, validate_existing_audit_events,
-        write_serialized_event,
+        non_empty_parent, sync_audit_log_directory, sync_containing_directory,
+        validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::{
         AcceptedTarget, RejectedAllowedTarget, TargetRejectionReason, allow_target,
@@ -6133,6 +6139,17 @@ mod tests {
             .expect_err("file-as-parent metadata should fail before directory creation");
 
         assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
+    }
+
+    #[test]
+    fn non_empty_parent_stops_at_relative_path_boundaries() {
+        let empty = non_empty_parent(Path::new(""));
+        let parentless = non_empty_parent(Path::new("audit.ndjson"));
+        let nested = non_empty_parent(Path::new("logs/audit.ndjson"));
+
+        assert_eq!(empty, None);
+        assert_eq!(parentless, None);
+        assert_eq!(nested, Some(Path::new("logs")));
     }
 
     pub(super) async fn durable_directory_helpers_cover_reachable_paths() {
