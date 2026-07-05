@@ -559,9 +559,10 @@ fn wait_for_failure(mut child: Child) -> bool {
 mod tests {
     use super::{
         Command, Duration, GatewayProcess, GatewayTestLock, MAX_ORIGIN_FORM_PATH_BYTES,
-        MAX_ORIGIN_FORM_QUERY_BYTES, RecordedRequest, StatusCode, Stdio, Value, empty_body_value,
-        free_local_addr, non_empty_body_value, not_observed_body_value, raw_response_status_line,
-        sleep, spawn_gateway_command, start_fake_proxy, start_redirecting_upstream, start_upstream,
+        MAX_ORIGIN_FORM_QUERY_BYTES, RecordedRequest, StatusCode, Stdio, TcpStream, Value,
+        clear_proxy_environment, empty_body_value, free_local_addr, non_empty_body_value,
+        not_observed_body_value, raw_response_status_line, sleep, spawn_configured_gateway,
+        spawn_gateway_command, start_fake_proxy, start_redirecting_upstream, start_upstream,
         tempdir, wait_for_failure,
     };
     use pretty_assertions::{assert_eq, assert_ne};
@@ -614,6 +615,63 @@ mod tests {
             .lock()
             .expect("recorder mutex should not be poisoned")
             .clone()
+    }
+
+    /// Spawns a gateway whose CLI flags intentionally conflict with env vars.
+    async fn try_spawn_flag_precedence_gateway(
+        flag_upstream: &str,
+        env_upstream: &str,
+    ) -> Option<GatewayProcess> {
+        for _spawn_attempt in 0_u32..5 {
+            let directory = tempdir().expect("temporary directory should be created");
+            let flag_bind = free_local_addr();
+            let env_bind = free_local_addr();
+            let flag_audit_log = directory.path().join("flag-audit.ndjson");
+            let env_audit_log = directory.path().join("env-audit.ndjson");
+            let mut command = Command::new(env!("CARGO_BIN_EXE_custode-proxy"));
+            clear_proxy_environment(&mut command);
+            command
+                .arg("serve")
+                .arg("--bind")
+                .arg(flag_bind.to_string())
+                .arg("--upstream-origin")
+                .arg(flag_upstream)
+                .arg("--allowed-operations")
+                .arg("GET:exact:/v1/models")
+                .arg("--audit-log")
+                .arg(&flag_audit_log)
+                .arg("--request-timeout-secs")
+                .arg("5")
+                .env("CUSTODE_BIND", env_bind.to_string())
+                .env("CUSTODE_UPSTREAM_ORIGIN", env_upstream)
+                .env("CUSTODE_ALLOWED_OPERATIONS", "POST:exact:/env-only")
+                .env("CUSTODE_AUDIT_LOG", &env_audit_log)
+                .env("CUSTODE_REQUEST_TIMEOUT_SECS", "30")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let mut child = spawn_configured_gateway(command);
+            for _poll in 0_u32..100 {
+                if child
+                    .try_wait()
+                    .expect("child status should be observable")
+                    .is_some()
+                {
+                    break;
+                }
+                if TcpStream::connect(flag_bind).await.is_ok() {
+                    return Some(GatewayProcess {
+                        _directory: directory,
+                        addr: flag_bind,
+                        audit_log: flag_audit_log,
+                        child,
+                    });
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            let _kill_result = child.kill();
+            let _wait_result = child.wait();
+        }
+        None
     }
 
     #[test]
@@ -953,6 +1011,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn denied_request_with_authorization_does_not_reach_upstream() {
+        let _guard = lock_gateway_test().await;
+        let (upstream, recorder) = start_upstream().await;
+        let gateway =
+            GatewayProcess::spawn(&format!("http://{upstream}"), "GET:exact:/v1/models").await;
+
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{}/admin", gateway.base_url()))
+            .header("authorization", "Bearer should-not-leak")
+            .header("proxy-authorization", "Basic should-not-leak")
+            .send()
+            .await
+            .expect("gateway request should complete");
+
+        assert_eq!(response.status(), 403);
+        assert_eq!(
+            recorded_hits(&recorder).len(),
+            0,
+            "denied authorization-bearing requests must not reach the upstream"
+        );
+
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "denied");
+        assert_eq!(event["error_class"], "path_denied");
+    }
+
+    #[tokio::test]
     async fn invalid_query_percent_encoding_does_not_reach_upstream() {
         let _guard = lock_gateway_test().await;
         let (upstream, recorder) = start_upstream().await;
@@ -1239,6 +1327,40 @@ mod tests {
         assert_header_absent(hit, "proxy-authorization");
         assert_header_absent(hit, "proxy-connection");
         assert_header_absent(hit, "x-secret");
+    }
+
+    #[tokio::test]
+    async fn serve_flags_override_environment_configuration() {
+        let _guard = lock_gateway_test().await;
+        let (flag_upstream, flag_recorder) = start_upstream().await;
+        let (env_upstream, env_recorder) = start_upstream().await;
+        let gateway = try_spawn_flag_precedence_gateway(
+            &format!("http://{flag_upstream}"),
+            &format!("http://{env_upstream}"),
+        )
+        .await
+        .expect("gateway should start with CLI flag configuration within five attempts");
+
+        let response = reqwest::get(format!("{}/v1/models", gateway.base_url()))
+            .await
+            .expect("gateway request should complete");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            recorded_hits(&flag_recorder).len(),
+            1,
+            "flag upstream should be reached"
+        );
+        assert_eq!(
+            recorded_hits(&env_recorder).len(),
+            0,
+            "environment upstream should not be reached"
+        );
+        let events = gateway.read_audit_events(1).await;
+        assert_eq!(events.len(), 1);
+        let event = events.first().expect("one audit event should exist");
+        assert_eq!(event["decision"], "allowed");
+        assert_eq!(event["upstream_path"], "/v1/models");
     }
 
     #[tokio::test]
