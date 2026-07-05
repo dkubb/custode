@@ -16,13 +16,13 @@ pub mod fuzzing {
         super::AllowedOperation::parse(raw.as_ref()).is_ok()
     }
 
-    /// Parses arbitrary bytes as a lossy upstream-origin string.
-    #[cfg(fuzzing)]
+    /// Reports whether arbitrary bytes parse as a lossy upstream-origin string.
+    #[must_use]
     #[inline]
-    pub fn upstream_origin_parse(input: &[u8]) {
+    pub fn upstream_origin_parse(input: &[u8]) -> bool {
         let raw = String::from_utf8_lossy(input);
 
-        let _result = super::UpstreamOrigin::parse(raw.as_ref());
+        super::UpstreamOrigin::parse(raw.as_ref()).is_ok()
     }
 }
 
@@ -1648,6 +1648,20 @@ mod tests {
     #[test]
     fn allowed_operation_fuzz_oracle_rejects_invalid_bytes() {
         let accepted = fuzzing::allowed_operation_parse(b"B@D:exact:/v1/models");
+
+        assert!(!accepted);
+    }
+
+    #[test]
+    fn upstream_origin_fuzz_oracle_accepts_valid_bytes() {
+        let accepted = fuzzing::upstream_origin_parse(b"https://api.openai.com");
+
+        assert!(accepted);
+    }
+
+    #[test]
+    fn upstream_origin_fuzz_oracle_rejects_invalid_bytes() {
+        let accepted = fuzzing::upstream_origin_parse(b"https://api.openai.com/v1");
 
         assert!(!accepted);
     }
