@@ -339,6 +339,15 @@ mod tests {
         assert_eq!(BodyDigest::for_test(b"hello").to_hex_string(), HELLO_DIGEST);
     }
 
+    #[test]
+    fn accounted_body_bytes_preserve_empty_single_and_multi_byte_inputs() {
+        for bytes in [Vec::new(), vec![1], b"hello".to_vec()] {
+            let accounted = AccountedBody::from_bytes(bytes.clone());
+
+            assert_eq!(accounted.bytes(), bytes.as_slice());
+        }
+    }
+
     #[tokio::test]
     async fn read_request_accounts_bytes_count_and_digest() {
         let accounted = AccountedBody::read_request(Body::from("hello"), roomy_limit())
