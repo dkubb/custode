@@ -203,7 +203,7 @@ fn response_header_is_forwarded(
     reason = "inline tests keep file-local coverage ownership explicit"
 )]
 mod tests {
-    use super::{HeaderError, forward_request_headers, forward_response_headers};
+    use super::{HeaderError, add_header_bytes, forward_request_headers, forward_response_headers};
     use crate::config::{RequestHeaderBytes, ResponseHeaderBytes};
     use ::http::header::{
         AUTHORIZATION, CONNECTION, CONTENT_LENGTH, COOKIE, HOST, PROXY_AUTHORIZATION,
@@ -220,6 +220,13 @@ mod tests {
     /// Builds a response header byte limit for tests.
     fn response_limit(value: usize) -> ResponseHeaderBytes {
         ResponseHeaderBytes::for_test(NonZeroUsize::new(value).expect("limit should be non-zero"))
+    }
+
+    #[test]
+    fn add_header_bytes_preserves_running_total_boundaries() {
+        assert_eq!(add_header_bytes(2, 2, 5), Ok(4));
+        assert_eq!(add_header_bytes(2, 3, 5), Ok(5));
+        assert_eq!(add_header_bytes(2, 4, 5), Err(HeaderError::TooLarge));
     }
 
     #[test]
