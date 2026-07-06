@@ -3402,7 +3402,7 @@ mod tests {
         PreparsedAuditTarget, RUN_TOKEN_BYTES, RejectedAuditTarget, RequestId, RequiredOption,
         RunToken, RunTokenError, classify_audit_log_tail, create_dir_all_durable,
         inspect_audit_log_tail, is_existing_request_id, is_truncated_audit_method,
-        non_empty_parent, sync_audit_log_directory, sync_containing_directory,
+        non_empty_parent, serialize_event, sync_audit_log_directory, sync_containing_directory,
         validate_existing_audit_events, write_serialized_event,
     };
     use crate::allowlist::{
@@ -7050,6 +7050,38 @@ mod tests {
         ));
         let contents = fs::read_to_string(&audit_log).expect("audit log should be readable");
         assert_eq!(contents, "");
+    }
+
+    #[test]
+    fn serialize_event_enforces_newline_inclusive_size_boundary() {
+        let event = denied_event();
+        let expected = serialized_audit_event_line(&event);
+        let exact_size = expected.len();
+        let too_small = exact_size
+            .checked_sub(1)
+            .and_then(NonZeroUsize::new)
+            .expect("test event should be longer than one byte");
+        let exact_limit = NonZeroUsize::new(exact_size).expect("event length should be non-zero");
+        let above_limit =
+            NonZeroUsize::new(exact_size + 1).expect("event length plus one should be non-zero");
+
+        let before_boundary = serialize_event(&event, AuditEventBytes::for_test(too_small));
+        let at_boundary = serialize_event(&event, AuditEventBytes::for_test(exact_limit));
+        let after_boundary = serialize_event(&event, AuditEventBytes::for_test(above_limit));
+
+        assert!(matches!(
+            before_boundary,
+            Err(AuditError::EventTooLarge { bytes, max })
+                if bytes == exact_size && max == too_small.get(),
+        ));
+        assert_eq!(
+            at_boundary.expect("event exactly at the limit should serialize"),
+            expected
+        );
+        assert_eq!(
+            after_boundary.expect("event below the limit should serialize"),
+            expected
+        );
     }
 
     #[tokio::test]
