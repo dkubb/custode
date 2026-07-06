@@ -363,12 +363,16 @@ const fn default_upstream_body_error_message(kind: UpstreamBodyErrorKind) -> &'s
 
 /// Truncates a string to a byte limit without splitting a UTF-8 code point.
 fn truncate_utf8(message: &mut String, max_bytes: usize) {
-    let mut end = max_bytes.min(message.len());
-    while !message.is_char_boundary(end) {
-        end = end
-            .checked_sub(1)
-            .expect("string start should always be a char boundary");
+    if message.len() <= max_bytes {
+        return;
     }
+
+    let end = message
+        .char_indices()
+        .map(|(index, _character)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .expect("non-empty string should have a zero char boundary");
     message.truncate(end);
 }
 
@@ -381,7 +385,7 @@ fn truncate_utf8(message: &mut String, max_bytes: usize) {
 mod tests {
     use super::{
         MAX_UPSTREAM_ERROR_MESSAGE_BYTES, UpstreamBodyError, UpstreamBodyErrorKind, UpstreamError,
-        UpstreamErrorKind, UpstreamResponse,
+        UpstreamErrorKind, UpstreamResponse, truncate_utf8,
     };
     use futures_util::{StreamExt as _, stream};
     use http::{HeaderMap, StatusCode};
@@ -466,6 +470,26 @@ mod tests {
             error.to_string(),
             "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES)
         );
+    }
+
+    #[test]
+    fn truncate_utf8_preserves_boundary_before_at_after_limit() {
+        let before_limit = "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES - 1);
+        let at_limit = "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+        let split_prefix = "x".repeat(MAX_UPSTREAM_ERROR_MESSAGE_BYTES - 1);
+        let split_limit = format!("{split_prefix}\u{20ac}");
+        let cases = [
+            (before_limit.clone(), before_limit),
+            (at_limit.clone(), at_limit),
+            (split_limit, split_prefix),
+        ];
+
+        for (mut input, expected) in cases {
+            truncate_utf8(&mut input, MAX_UPSTREAM_ERROR_MESSAGE_BYTES);
+
+            assert_eq!(input, expected);
+            assert!(input.is_char_boundary(input.len()));
+        }
     }
 
     #[test]
