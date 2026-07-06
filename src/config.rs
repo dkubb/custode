@@ -1375,6 +1375,15 @@ mod tests {
     }
 
     #[test]
+    fn operation_config_text_preserves_method_kind_and_path() {
+        for raw in ["GET:exact:/v1/models", "POST:prefix:/v1/responses"] {
+            let operation = AllowedOperation::parse(raw).expect("operation should parse");
+
+            assert_eq!(operation.to_config_text(), raw);
+        }
+    }
+
+    #[test]
     fn operation_reports_exact_and_prefix_path_errors() {
         assert!(matches!(
             AllowedOperation::parse("GET:exact:v1/models"),
