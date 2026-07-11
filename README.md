@@ -159,6 +159,9 @@ externally sandboxed harness container.
 
 The proxy writes one NDJSON audit event per handled request:
 
+Run only one gateway process per audit log path. Multiple gateway processes
+must use distinct paths.
+
 ```sh
 docker run --rm \
   -v custode_proxy-logs:/logs \

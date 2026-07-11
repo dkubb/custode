@@ -315,6 +315,9 @@ Each audit event MUST include:
 
 Audit events MUST be newline-delimited JSON.
 
+Exactly one gateway process MUST own an audit log path at a time. Sharing one
+audit log path between gateway processes is unsupported.
+
 The gateway MUST fail closed if it cannot write a required audit event.
 Failing closed means the affected request MUST NOT complete as an unaudited
 success: before a response starts, the gateway MUST return an error without
