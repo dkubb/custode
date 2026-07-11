@@ -2576,6 +2576,47 @@ mod proptests {
         }
 
         #[test]
+        fn serve_args_with_too_large_bounds_fail_closed(
+            extra in 1_u8..=16,
+            selected in 0_u8..2,
+        ) {
+            let mut args = serve_args();
+            let (expected_name, expected_max, expected_value) = if selected == 0 {
+                let value = MAX_REQUEST_BYTES
+                    .checked_add(usize::from(extra))
+                    .expect("generated request bound should fit usize");
+                args.max_request_bytes = value;
+                (
+                    "CUSTODE_MAX_REQUEST_BYTES",
+                    expected_usize_u128(MAX_REQUEST_BYTES),
+                    expected_usize_u128(value),
+                )
+            } else {
+                let value = MAX_RESPONSE_BYTES
+                    .checked_add(u64::from(extra))
+                    .expect("generated response bound should fit u64");
+                args.max_response_bytes = value;
+                (
+                    "CUSTODE_MAX_RESPONSE_BYTES",
+                    u128::from(MAX_RESPONSE_BYTES),
+                    u128::from(value),
+                )
+            };
+
+            let error = GatewayConfig::try_from(args)
+                .expect_err("too-large bounds should fail closed");
+
+            let is_too_large = matches!(
+                error,
+                ConfigError::BoundTooLarge { name, max, value }
+                    if name == expected_name
+                        && max == expected_max
+                        && value == expected_value
+            );
+            prop_assert!(is_too_large);
+        }
+
+        #[test]
         fn bound_overrides_preserve_non_zero_values(
             max_audit_event_bytes in bound_usize(MAX_AUDIT_EVENT_BYTES),
             max_response_header_bytes in bound_usize(MAX_RESPONSE_HEADER_BYTES),
@@ -2629,6 +2670,19 @@ mod proptests {
         #[test]
         fn origin_parse_rejects_every_invalid_origin(origin in origin_invalid()) {
             prop_assert!(UpstreamOrigin::parse(&origin).is_err());
+        }
+
+        #[test]
+        fn origin_parse_rejects_every_too_long_origin(
+            suffix in "[a-z]{256,512}",
+        ) {
+            let origin = format!("https://{suffix}");
+
+            let is_too_long = matches!(
+                UpstreamOrigin::parse(&origin),
+                Err(ConfigError::UpstreamOriginTooLong { .. }),
+            );
+            prop_assert!(is_too_long);
         }
 
         #[test]

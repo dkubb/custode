@@ -281,8 +281,10 @@ mod tests {
                     .expect("run token should contain the separator");
                 let chunks = first
                     .as_bytes()
-                    .chunks_exact(2)
-                    .chain(second.as_bytes().chunks_exact(2));
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .chain(second.as_bytes().as_chunks::<2>().0.iter());
 
                 prop_assert_eq!(first.len(), 16);
                 prop_assert_eq!(second.len(), 16);
