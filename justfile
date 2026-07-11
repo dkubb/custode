@@ -32,6 +32,10 @@ shell-check:
 toolchain-check:
     scripts/check-portable-tooling.sh
 
+commit-check:
+    scripts/test-check-commit-messages.sh
+    scripts/check-commit-messages.sh
+
 dockerfile-check:
     docker buildx build --check .
 
@@ -63,7 +67,7 @@ coverage-proptests:
 mutants:
     {{cargo}} mutants-all
 
-check: fmt-check lint shell-check toolchain-check test dockerfile-check
+check: fmt-check lint shell-check toolchain-check commit-check test dockerfile-check
 
 ci: check coverage coverage-proptests deny
 
