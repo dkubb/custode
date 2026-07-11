@@ -65,7 +65,7 @@ mutants:
 
 check: fmt-check lint shell-check toolchain-check test dockerfile-check
 
-ci: check deny
+ci: check coverage deny
 
 stress-check:
     just ci
