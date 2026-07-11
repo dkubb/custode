@@ -1,4 +1,5 @@
-#!/usr/bin/env -S bash --noprofile --norc -o errexit -o errtrace -o nounset -o pipefail
+#!/usr/bin/env -S -u BASHOPTS -u BASH_ENV -u CDPATH -u GLOBIGNORE -u SHELLOPTS bash --noprofile --norc -o errexit -o errtrace -o nounset -o pipefail
+# shellcheck shell=bash
 # Container tests for the Custode Compose topology.
 #
 # Proves the ARCHITECTURE.md Section 16 container properties:

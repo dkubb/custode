@@ -3,7 +3,7 @@ src/adapters.rs	145	23	90	6
 src/allowlist.rs	1	0	1	0
 src/audit.rs	51	21	41	7
 src/body.rs	8	3	7	2
-src/config.rs	27	2	19	4
+src/config.rs	16	2	10	1
 src/gateway.rs	23	4	14	0
 src/headers.rs	3	0	3	0
 src/health.rs	6	2	5	0

@@ -222,6 +222,9 @@ enum ResponseStreamCompletion {
     /// Response stream aborted after response headers were sent.
     Abort(ResponseStreamAbort),
 
+    /// Another request made the audit sink permanently unavailable.
+    AuditUnavailable,
+
     /// Empty upstream response completed successfully.
     EmptyAllowed,
 
@@ -631,6 +634,10 @@ const fn upstream_body_error_outcome(error_kind: UpstreamBodyErrorKind) -> Respo
 }
 
 /// Streams the upstream response and writes exactly one terminal audit event.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "tokio select expansion uses remainder internally"
+)]
 fn response_stream(
     mut context: ResponseAuditContext,
     upstream_response: UpstreamResponse,
@@ -641,12 +648,25 @@ fn response_stream(
 
     tokio::spawn(async move {
         let _permit = permit;
-        let stream_result = timeout(
-            response_timeout,
-            stream_upstream_response(&mut context.response_account, upstream_response, &sender),
-        )
+        let gateway = context.gateway.clone();
+        let stream_result = timeout(response_timeout, async {
+            tokio::select! {
+                biased;
+                () = gateway.wait_for_audit_failure() => {
+                    ResponseStreamCompletion::AuditUnavailable
+                }
+                completion = stream_upstream_response(
+                    &mut context.response_account,
+                    upstream_response,
+                    &sender,
+                ) => completion,
+            }
+        })
         .await;
         match stream_result {
+            Ok(ResponseStreamCompletion::AuditUnavailable) => {
+                send_terminal_stream_error(&sender).await;
+            }
             Ok(ResponseStreamCompletion::Abort(abort)) => {
                 handle_response_stream_abort(&mut context, &sender, abort).await;
             }
@@ -2266,6 +2286,7 @@ mod tests {
     use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
     use tokio::task::yield_now;
     use tokio::time::{Instant, advance, sleep, timeout};
+    use tokio_stream::wrappers::ReceiverStream;
     use tower::ServiceExt as _;
     use tracing::{
         Level,
@@ -5460,6 +5481,59 @@ mod tests {
         assert!(events.is_empty());
         let fatal = recv_unbounded_bounded(&mut fatal_receiver).await;
         assert_scripted_fatal_audit_write(&fatal);
+    }
+
+    async fn assert_response_stream_stops_after_another_request_audit_fails() {
+        let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
+        let (audit, _audit_events) = MemoryAuditSink::failing_on(fail_on_first);
+        let max_response_bytes = response_body_limit(1_024);
+        let (context, _fatal_receiver) = response_audit_context(audit, max_response_bytes).await;
+        let gateway = context.gateway.clone();
+        let (upstream_sender, upstream_receiver) = mpsc::channel(2);
+        let upstream_response = UpstreamResponse::new(
+            StatusCode::OK,
+            HeaderMap::new(),
+            ReceiverStream::new(upstream_receiver).boxed(),
+        );
+        let mut response_body = response_stream(context, upstream_response, test_permit());
+        let audit_result = gateway
+            .audit_denial(
+                RequestId::from_parts(
+                    &RunToken::for_test("0000000000007e57-000000000000c0de"),
+                    NonZeroU64::new(2).expect("sequence should be non-zero"),
+                ),
+                AuditDenial::connect_unsupported(PreparsedAuditTarget::from_request_uri(
+                    &Uri::from_static("/"),
+                )),
+                None,
+            )
+            .await;
+
+        upstream_sender
+            .send(Ok(Bytes::from_static(b"first")))
+            .await
+            .expect("first upstream chunk should send");
+        upstream_sender
+            .send(Ok(Bytes::from_static(b"second")))
+            .await
+            .expect("second upstream chunk should send");
+        let first_downstream_item = next_bounded(&mut response_body).await;
+
+        assert!(audit_result.is_err(), "audit write should fail");
+        assert!(
+            first_downstream_item.is_err(),
+            "audit failure should abort before another response chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_stream_stops_after_another_request_audit_fails() {
+        assert_response_stream_stops_after_another_request_audit_fails().await;
+    }
+
+    #[tokio::test]
+    async fn proptests_response_stream_stops_after_another_request_audit_fails() {
+        assert_response_stream_stops_after_another_request_audit_fails().await;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

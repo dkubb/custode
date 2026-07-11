@@ -32,6 +32,10 @@ shell-check:
 toolchain-check:
     scripts/check-portable-tooling.sh
 
+commit-check:
+    scripts/test-check-commit-messages.sh
+    scripts/check-commit-messages.sh
+
 dockerfile-check:
     docker buildx build --check .
 
@@ -63,15 +67,15 @@ coverage-proptests:
 mutants:
     {{cargo}} mutants-all
 
-check: fmt-check lint shell-check toolchain-check test dockerfile-check
+check: fmt-check lint shell-check toolchain-check commit-check test dockerfile-check
 
-ci: check deny
+ci: check coverage coverage-proptests deny
 
 stress-check:
     just ci
     scripts/test-verify-audit-log.sh
     just docker-test
     mkdir -p target/fuzz-corpus/{accepted_path_set_path,allowed_operation_parse,upstream_origin_parse}
-    cargo fuzz run accepted_path_set_path target/fuzz-corpus/accepted_path_set_path -- -runs=256
-    cargo fuzz run allowed_operation_parse target/fuzz-corpus/allowed_operation_parse -- -runs=256
-    cargo fuzz run upstream_origin_parse target/fuzz-corpus/upstream_origin_parse -- -runs=256
+    {{cargo}} fuzz run accepted_path_set_path target/fuzz-corpus/accepted_path_set_path -- -runs=256
+    {{cargo}} fuzz run allowed_operation_parse target/fuzz-corpus/allowed_operation_parse -- -runs=256
+    {{cargo}} fuzz run upstream_origin_parse target/fuzz-corpus/upstream_origin_parse -- -runs=256

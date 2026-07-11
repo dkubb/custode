@@ -537,6 +537,9 @@ chunk and then pauses for a long time.
 
 The audit log is newline-delimited JSON.
 
+One gateway process owns each audit log path. Multiple gateway processes must
+use distinct paths; the writer does not coordinate access between processes.
+
 At startup, a non-empty existing audit log MUST end with a newline. If the
 final byte is not a newline, the gateway MUST reject the log before appending
 so a partial final event cannot be joined with a later event.

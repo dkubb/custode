@@ -70,10 +70,9 @@ memory so the same answer applies automatically in future sessions.
 
 ### Commit Messages
 
-Write commit subjects in the semantic action-verb form from the
-[`atomic-changes` skill](https://github.com/dkubb/skills/blob/main/skills/atomic-changes/SKILL.md):
-`<Verb> <imperative summary>`. Conventional commit prefixes belong in pull
-request titles, not in git commit subjects.
+Write commit subjects using conventional commit syntax:
+`type(scope): imperative summary`. Use a standard type such as `fix`, `test`,
+`docs`, `refactor`, `build`, or `ci`, and choose the narrowest useful scope.
 
 Keep the subject short and imperative, with no trailing period. When a commit
 needs a body, leave a blank line after the subject and wrap the body at 72
