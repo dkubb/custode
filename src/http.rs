@@ -222,6 +222,9 @@ enum ResponseStreamCompletion {
     /// Response stream aborted after response headers were sent.
     Abort(ResponseStreamAbort),
 
+    /// Another request made the audit sink permanently unavailable.
+    AuditUnavailable,
+
     /// Empty upstream response completed successfully.
     EmptyAllowed,
 
@@ -631,6 +634,10 @@ const fn upstream_body_error_outcome(error_kind: UpstreamBodyErrorKind) -> Respo
 }
 
 /// Streams the upstream response and writes exactly one terminal audit event.
+#[expect(
+    clippy::integer_division_remainder_used,
+    reason = "tokio select expansion uses remainder internally"
+)]
 fn response_stream(
     mut context: ResponseAuditContext,
     upstream_response: UpstreamResponse,
@@ -641,12 +648,25 @@ fn response_stream(
 
     tokio::spawn(async move {
         let _permit = permit;
-        let stream_result = timeout(
-            response_timeout,
-            stream_upstream_response(&mut context.response_account, upstream_response, &sender),
-        )
+        let gateway = context.gateway.clone();
+        let stream_result = timeout(response_timeout, async {
+            tokio::select! {
+                biased;
+                () = gateway.wait_for_audit_failure() => {
+                    ResponseStreamCompletion::AuditUnavailable
+                }
+                completion = stream_upstream_response(
+                    &mut context.response_account,
+                    upstream_response,
+                    &sender,
+                ) => completion,
+            }
+        })
         .await;
         match stream_result {
+            Ok(ResponseStreamCompletion::AuditUnavailable) => {
+                send_terminal_stream_error(&sender).await;
+            }
             Ok(ResponseStreamCompletion::Abort(abort)) => {
                 handle_response_stream_abort(&mut context, &sender, abort).await;
             }
@@ -5463,10 +5483,7 @@ mod tests {
         assert_scripted_fatal_audit_write(&fatal);
     }
 
-    #[tokio::test]
-    #[cfg_attr(coverage_nightly, coverage(off))]
-    #[should_panic(expected = "audit failure should abort before another response chunk")]
-    async fn response_stream_stops_after_another_request_audit_fails() {
+    async fn assert_response_stream_stops_after_another_request_audit_fails() {
         let fail_on_first = NonZeroUsize::new(1).expect("literal should be non-zero");
         let (audit, _audit_events) = MemoryAuditSink::failing_on(fail_on_first);
         let max_response_bytes = response_body_limit(1_024);
@@ -5507,6 +5524,16 @@ mod tests {
             first_downstream_item.is_err(),
             "audit failure should abort before another response chunk"
         );
+    }
+
+    #[tokio::test]
+    async fn response_stream_stops_after_another_request_audit_fails() {
+        assert_response_stream_stops_after_another_request_audit_fails().await;
+    }
+
+    #[tokio::test]
+    async fn proptests_response_stream_stops_after_another_request_audit_fails() {
+        assert_response_stream_stops_after_another_request_audit_fails().await;
     }
 
     #[tokio::test(flavor = "current_thread", start_paused = true)]

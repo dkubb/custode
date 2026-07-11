@@ -14,7 +14,7 @@ use ::http::{Error as HttpError, StatusCode};
 use core::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::{OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Notify, OwnedRwLockReadGuard, RwLock};
 
 /// Shared gateway state.
 #[derive(Clone, Debug)]
@@ -23,6 +23,8 @@ pub(crate) struct Gateway {
     audit: Arc<dyn AuditSink>,
     /// True after a required audit event failed to write.
     audit_failed: Arc<AtomicBool>,
+    /// Wakes active response streams after a required audit event fails.
+    audit_failure: Arc<Notify>,
     /// Audit timestamp source.
     clock: Arc<dyn Clock>,
     /// Parsed gateway configuration.
@@ -376,8 +378,9 @@ impl Gateway {
 
     /// Closes future upstream forwarding after a required audit failure.
     async fn close_forwarding(&self) {
-        let _guard = self.forwarding_gate.write().await;
         self.audit_failed.store(true, Ordering::SeqCst);
+        self.audit_failure.notify_waiters();
+        let _guard = self.forwarding_gate.write().await;
     }
 
     /// Returns the parsed configuration.
@@ -397,6 +400,7 @@ impl Gateway {
         Self {
             audit: Arc::new(audit),
             audit_failed: Arc::new(AtomicBool::new(false)),
+            audit_failure: Arc::new(Notify::new()),
             clock: Arc::new(clock),
             config: Arc::new(config),
             forwarding_gate: Arc::new(RwLock::new(())),
@@ -418,6 +422,17 @@ impl Gateway {
             Err(GatewayError::AuditUnavailable)
         } else {
             Ok(())
+        }
+    }
+
+    /// Waits until a required audit event fails.
+    pub(crate) async fn wait_for_audit_failure(&self) {
+        loop {
+            let notified = self.audit_failure.notified();
+            if self.audit_failed.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
         }
     }
 }
